@@ -180,12 +180,12 @@ database, not Storage).
 | `storage_setup.sql` | Creates the private `voice-messages` Storage bucket (bucket-as-code). |
 | **`PROVISION_NEW_COUPLE.md`** | **The setup runbook — start here.** |
 | `.env.example` | Template for the five function secrets (copy to `.env`). |
-| `deploy.ps1` / `predeploy-check.ps1` | Deploy spine: gate → CLI-from-disk deploy → health smoke. (Windows PowerShell.) |
-| `deploy.sh` / `predeploy-check.sh` | Same deploy spine, ported to bash (macOS/Linux). |
+| `.github/workflows/deploy.yml` | **Primary deploy path:** CI, manual (`workflow_dispatch`), gated deploy from GitHub. |
+| `.github/workflows/check.yml` | CI: runs the pre-deploy gate on every push/PR (never deploys). |
+| `deploy.ps1` / `predeploy-check.ps1` | Fallback deploy spine: gate → CLI-from-disk deploy → health smoke. (Windows PowerShell.) |
+| `deploy.sh` / `predeploy-check.sh` | Same fallback spine, ported to bash (macOS/Linux). |
 | `provision.sh` | Scripts the automatable provisioning glue (secrets, webhook, health). |
 | `deno.json` | Deno tasks (`check`, `lock`) + lockfile config for deterministic builds. |
-| `.github/workflows/check.yml` | CI: runs the pre-deploy gate on every push/PR (never deploys). |
-| `.github/workflows/deploy.yml` | CI: manual (`workflow_dispatch`) gated deploy from GitHub. |
 | `.devcontainer/` | Codespaces config (Deno + Supabase CLI) for laptop-free setup. |
 | `docs/` | Background & design history (deploy-safety + reproducibility handoffs). |
 | `CLAUDE.md` | Working guidance for Claude Code in this repo (hard rules, deploy discipline). |
@@ -250,6 +250,17 @@ for a menu. In brief:
 
 ## Deploying
 
+**Primary: deploy from GitHub Actions (no laptop needed).** **Actions → deploy → Run
+workflow** (type `deploy` to confirm) runs the gate, deploys the committed file, and
+smoke-tests the health route. It runs **only** on manual dispatch — never on push/PR — so
+it stays safe on a public repo. It needs two repo secrets (Settings → Secrets and
+variables → Actions): `SUPABASE_ACCESS_TOKEN` (from supabase.com/dashboard/account/tokens)
+and `SUPABASE_PROJECT_REF`. The bot's function secrets stay on Supabase — a code deploy
+never touches them. (The `setup.ts` wizard can set these two repo secrets for you if `gh`
+is installed.)
+
+### Fallback: deploy from your laptop (offline / first-time setup)
+
 **Windows:**
 ```powershell
 .\deploy.ps1 -ProjectRef <your-ref>
@@ -285,18 +296,8 @@ git tag vNN
 - The pre-deploy gate (`predeploy-check.ps1` / `predeploy-check.sh`) refuses to ship
   unless `deno check` passes, the file is well over its minimum line count, and key code
   anchors are present — a backstop against accidentally deploying a stub. The same gate
-  runs in CI (`.github/workflows/check.yml`) on every push/PR.
-
-### Deploy from GitHub (no laptop)
-
-You can deploy without a local machine: **Actions → deploy → Run workflow** (type
-`deploy` to confirm) runs the same gate, deploys the committed file, and smoke-tests the
-health route. It runs **only** on manual dispatch — never on push/PR — so it stays safe on
-a public repo. It needs two repo secrets (Settings → Secrets and variables → Actions):
-`SUPABASE_ACCESS_TOKEN` (from supabase.com/dashboard/account/tokens) and
-`SUPABASE_PROJECT_REF`. The bot's function secrets stay on Supabase — a code deploy never
-touches them. (The `setup.ts` wizard can set these two repo secrets for you if `gh` is
-installed.)
+  runs in `.github/workflows/check.yml` on every push/PR, and as step one of the primary
+  `deploy.yml` workflow.
 
 ## Reproducibility & determinism
 
@@ -314,7 +315,7 @@ A few things keep a fresh instance reproducible from the committed files alone:
 - **Versioned schema.** The database lives in `supabase/migrations/` as a single init
   migration. `supabase db push` reproduces a fresh DB exactly, and future schema changes
   are added as new, ordered migration files rather than re-dumping by hand.
-- **Cross-platform deploy spine.** `deploy.sh` / `predeploy-check.sh` mirror the
+- **Cross-platform fallback deploy spine.** `deploy.sh` / `predeploy-check.sh` mirror the
   PowerShell scripts so the gate-and-deploy flow runs on any OS.
 - **CI gate.** `.github/workflows/check.yml` runs the pre-deploy sanity gate on every
   push and PR. It **never deploys** — Capybara deploys are always human-run.

@@ -30,17 +30,19 @@ couple (not multi-tenant).
 | `storage_setup.sql` | Creates the private `voice-messages` Storage bucket. |
 | `PROVISION_NEW_COUPLE.md` | The setup runbook — start here for a new instance. |
 | `.env.example` | Template for the five function secrets (copy to `.env`). |
-| `deploy.ps1` / `predeploy-check.ps1` | Deploy spine (Windows PowerShell). |
-| `deploy.sh` / `predeploy-check.sh` / `provision.sh` | Deploy spine + provisioning glue (bash). |
-| `.github/workflows/` | CI gate (`check.yml`) + manual deploy (`deploy.yml`); `.devcontainer/` for Codespaces. |
+| `.github/workflows/` | CI gate (`check.yml`) + **primary deploy path** (`deploy.yml`, manual `workflow_dispatch`); `.devcontainer/` for Codespaces. |
+| `deploy.ps1` / `predeploy-check.ps1` | Fallback deploy spine for offline/local deploys (Windows PowerShell). |
+| `deploy.sh` / `predeploy-check.sh` / `provision.sh` | Same fallback spine, ported to bash, + provisioning glue. |
 | `docs/` | Background & design history (deploy-safety + reproducibility handoffs). |
 | `README.md` | Human-facing overview. |
 
 ## Hard rules
 
 - **Claude builds + commits only — never deploys.** The maintainer runs every deploy themselves. Past stub /
-  bad deploys took the live bot down. Do **not** run `deploy.ps1`, `supabase functions deploy`, or
-  any deploy step unless explicitly told to in that moment.
+  bad deploys took the live bot down. Do **not** run `deploy.ps1`/`deploy.sh`, `supabase functions deploy`,
+  **or trigger the `deploy.yml` GitHub Actions workflow** (its "type `deploy` to confirm" dispatch input
+  ships straight to prod) — by any means, including `gh workflow run` — unless explicitly told to in that
+  moment.
 - **Do not touch Supabase** (no migrations, SQL, function deploys, dashboard changes) without an
   explicit, in-the-moment request.
 - **Never fork `index.ts`.** One file deploys to every instance unchanged. Edit it in place.
@@ -57,7 +59,12 @@ couple (not multi-tenant).
    (side-effect-free; no DB/API/messaging).
 5. **`git tag vNN`** after a good deploy as the rollback point; redeploy a prior tag to roll back.
 
-Windows: `.\deploy.ps1 -ProjectRef <ref>`.
+**Primary (default): GitHub Actions.** Actions → **deploy** → **Run workflow**, type `deploy` to confirm.
+Runs the same gate → CLI-from-disk deploy → health smoke, no local machine needed. Requires repo secrets
+`SUPABASE_ACCESS_TOKEN` and `SUPABASE_PROJECT_REF` (see README "Deploying").
+
+**Fallback (offline / first deploy during setup): local scripts.** Windows: `.\deploy.ps1 -ProjectRef <ref>`.
+macOS/Linux: `./deploy.sh <ref>`.
 
 ## Secrets (set on the Supabase project, never in the repo)
 
@@ -66,6 +73,9 @@ Windows: `.\deploy.ps1 -ProjectRef <ref>`.
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are auto-injected by Supabase — don't set them.
 
 ## Environment notes (this laptop)
+
+These notes describe the maintainer's local setup — relevant for the **fallback** local-script deploy path
+and for running the pre-deploy gate during development.
 
 - **Windows + PowerShell.** `deploy.ps1` / `predeploy-check.ps1` are PowerShell.
 - **Stale-PATH gotcha:** CLIs may be installed but missing from the current shell's PATH. Known:
