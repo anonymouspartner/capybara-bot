@@ -179,6 +179,10 @@ Expect `"url"` set, `"pending_update_count"` small, and no `"last_error_message"
 
 1. **Health** (no Telegram): `GET https://<NEW_REF>.supabase.co/functions/v1/telegram-bot?health`
    → `{"status":"ok","version":"vNN","adminConfigured":true}`. Confirm `adminConfigured:true`.
+   Add **`&seed`** to also check seeding *after* Step 7:
+   `GET …/telegram-bot?health&seed` → adds `"userCount":2,"seeded":true`. If you see
+   `"seeded":false` (userCount 0), Step 7 never ran — go seed before testing further.
+   (Plain `?health` stays DB-free; `&seed` is the only variant that touches the DB.)
 2. **/help** — bot replies with the command list in your native language.
 3. **Translation both directions:**
    - English partner sends an English sentence → bot returns the Ukrainian translation.
@@ -222,7 +226,12 @@ registered. This is *not* a code, deploy, or webhook fault: the function can be 
 and the webhook delivering updates (you'll see `POST … /telegram-bot → 200` in the
 edge-function logs) and you'll still get this until the table is seeded.
 
-**Confirm** (Dashboard SQL editor, or `mcp__Supabase__execute_sql`):
+**Confirm** — either hit the health route with the seed check (no Dashboard needed):
+```
+GET https://<REF>.supabase.co/functions/v1/telegram-bot?health&seed
+→ {"status":"ok",…,"userCount":0,"seeded":false}   # 0 / false means the seed never ran
+```
+or query directly (Dashboard SQL editor, or `mcp__Supabase__execute_sql`):
 ```sql
 select count(*) from public.users;   -- 0 means the seed never ran
 ```

@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v44";
+const BUILD_VERSION = "v45";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -68,18 +68,39 @@ function scheduleBackgroundWork(label: string, work: Promise<unknown>) {
 Deno.serve(async (req) => {
   // Side-effect-free health probe. Must stay BEFORE the WEBHOOK_SECRET check:
   // monitors won't send Telegram's secret header. Telegram only sends POST,
-  // so a GET / ?health is safe to repurpose. Version + a config boolean only —
-  // no DB, API, or messaging. adminConfigured reports whether ADMIN_TELEGRAM_ID
-  // resolved to a real number at boot (true) or is missing/NaN (false); it does
-  // NOT expose the ID. Lets deploy.ps1's smoke check catch a missing admin secret.
+  // so a GET / ?health is safe to repurpose. By default: version + a config
+  // boolean only — no DB, API, or messaging, so the plain probe reports
+  // function-up regardless of DB state. adminConfigured reports whether
+  // ADMIN_TELEGRAM_ID resolved to a real number at boot (true) or is
+  // missing/NaN (false); it does NOT expose the ID. Lets deploy.ps1's smoke
+  // check catch a missing admin secret.
   const url = new URL(req.url);
   if (req.method === "GET" || url.searchParams.has("health")) {
+    const body: Record<string, unknown> = {
+      status: "ok",
+      version: BUILD_VERSION,
+      adminConfigured: !Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID),
+    };
+    // Opt-in seed check (?seed): a read-only users count so a post-deploy smoke
+    // test can catch an UNSEEDED instance — an empty users table makes every
+    // sender see "not registered" even though the function is healthy. Kept off
+    // the default probe so plain health stays DB-free and doesn't go red when
+    // the DB is briefly unreachable. seeded is null if the count couldn't run.
+    if (url.searchParams.has("seed")) {
+      try {
+        const { count, error } = await supabase
+          .from("users")
+          .select("*", { count: "exact", head: true });
+        if (error) throw error;
+        body.userCount = count ?? 0;
+        body.seeded = (count ?? 0) > 0;
+      } catch (e) {
+        body.seeded = null;
+        body.seedCheckError = (e as Error)?.message ?? String(e);
+      }
+    }
     return new Response(
-      JSON.stringify({
-        status: "ok",
-        version: BUILD_VERSION,
-        adminConfigured: !Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID),
-      }),
+      JSON.stringify(body),
       { status: 200, headers: { "content-type": "application/json" } },
     );
   }
