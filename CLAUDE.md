@@ -59,11 +59,22 @@ couple (not multi-tenant).
 
 Windows: `.\deploy.ps1 -ProjectRef <ref>`.
 
+The admin `/update` command is an alternate trigger for the **same** `deploy.yml` workflow —
+it just dispatches it from inside Telegram. The human stays in the loop (the admin taps the
+deploy button), and the workflow's predeploy gate + health smoke test still run. It does not
+bypass any of the discipline above. The feature is inert unless the optional `GITHUB_*` secrets
+below are set.
+
 ## Secrets (set on the Supabase project, never in the repo)
 
 `TELEGRAM_BOT_TOKEN`, `WEBHOOK_SECRET`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `ADMIN_TELEGRAM_ID` (the English-native partner's numeric Telegram ID).
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are auto-injected by Supabase — don't set them.
+
+Optional (enable the admin `/update` self-deploy command; the feature is inert if unset):
+`GITHUB_DEPLOY_TOKEN` (GitHub PAT with `Actions: write` — dispatches `deploy.yml`; without it
+`/update` only reports version status, no deploy button), `GITHUB_REPO` (`owner/name`),
+`GITHUB_DEPLOY_BRANCH` (defaults to `main`).
 
 ## Environment notes (this laptop)
 

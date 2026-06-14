@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v45";
+const BUILD_VERSION = "v46";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -16,6 +16,17 @@ const CLAUDE_MODEL = "claude-sonnet-4-6";
 const CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
 const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));
+
+// --- /update (self-deploy) config; all optional. The feature is INERT unless these
+// are set as function secrets: with none, /update is unavailable to deploy and only
+// reports version status. GITHUB_REPO alone enables the version check (a public repo's
+// raw file needs no token); a deploy button additionally needs GITHUB_DEPLOY_TOKEN.
+// GITHUB_DEPLOY_TOKEN is named to avoid colliding with Actions' built-in GITHUB_TOKEN.
+const GITHUB_DEPLOY_TOKEN = Deno.env.get("GITHUB_DEPLOY_TOKEN") ?? "";
+const GITHUB_REPO = Deno.env.get("GITHUB_REPO") ?? ""; // "owner/name"
+const GITHUB_DEPLOY_BRANCH = Deno.env.get("GITHUB_DEPLOY_BRANCH") ?? "main";
+const GITHUB_DEPLOY_WORKFLOW = "deploy.yml";
+
 const BACKFILL_BATCH_SIZE = 15;
 const BACKFILL_TRANSLATIONS_BATCH_SIZE = 25;
 const CYRILLIC_SKIP_THRESHOLD = 0.5;
@@ -124,6 +135,10 @@ Deno.serve(async (req) => {
 });
 
 async function handleUpdate(update: any) {
+  // Inline-button taps (e.g. the /update deploy button) arrive as callback_query,
+  // not message. Auth is by callback_query.from.id, so this is handled before the
+  // users-table lookup below.
+  if (update.callback_query) { await handleCallbackQuery(update.callback_query); return; }
   const msg = update.message;
   if (!msg) return;
   const user = await lookupUser(msg.from);
@@ -153,6 +168,7 @@ async function handleUpdate(update: any) {
   if (msg.text === "/backfill_translations") { await handleBackfillTranslations(msg, user); return; }
   if (msg.text === "/backfill") { await handleBackfill(msg, user); return; }
   if (msg.text === "/diag") { await handleDiag(msg, user); return; }
+  if (msg.text === "/update" || msg.text?.startsWith("/update@")) { await handleUpdateCommand(msg, user); return; }
   if (msg.text === "/reconcile" || msg.text?.startsWith("/reconcile@")) { await handleReconcile(msg, user); return; }
   if (msg.text === "/restore" || msg.text?.startsWith("/restore@")) { await handleRestore(msg, user); return; }
   if (msg.text === "/pin" || msg.text?.startsWith("/pin@")) { await handlePin(msg, user); return; }
@@ -588,9 +604,10 @@ async function annotateMessage(messageId: string, text: string, language: "uk" |
   }
 }
 
-async function sendMessage(chatId: number, text: string, parseMode?: string) {
+async function sendMessage(chatId: number, text: string, parseMode?: string, replyMarkup?: any) {
   const body: any = { chat_id: chatId, text };
   if (parseMode) body.parse_mode = parseMode;
+  if (replyMarkup) body.reply_markup = replyMarkup;
   const resp = await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -602,6 +619,30 @@ async function sendMessage(chatId: number, text: string, parseMode?: string) {
     const preview = text.length > 200 ? text.slice(0, 200) + "\u2026" : text;
     console.error(`sendMessage failed: chat=${chatId} status=${resp.status} body=${respBody} preview=${JSON.stringify(preview)}`);
   }
+}
+
+// Acknowledge an inline-button tap. Telegram shows the user a spinner until this
+// is called (within ~15s), so callers answer early. Optional text shows a toast.
+async function answerCallbackQuery(callbackQueryId: string, text?: string) {
+  const resp = await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
+  });
+  if (!resp.ok) console.error("answerCallbackQuery failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+// Edit a message's inline keyboard. Omitting replyMarkup removes the keyboard
+// entirely \u2014 used to retire the /update deploy button so it can't be tapped twice.
+async function editMessageReplyMarkup(chatId: number, messageId: number, replyMarkup?: any) {
+  const body: any = { chat_id: chatId, message_id: messageId };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  const resp = await fetch(`${TELEGRAM_API}/editMessageReplyMarkup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) console.error("editMessageReplyMarkup failed:", resp.status, await resp.text().catch(() => "<no body>"));
 }
 
 async function sendVoice(chatId: number, voiceFileId: string, caption?: string) {
@@ -851,6 +892,7 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
     lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
     lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
+    lines.push("\u2022 /update \u2014 Check GitHub for a newer build; deploy with one tap");
   }
   await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
 }
@@ -1404,6 +1446,136 @@ async function handleBackfillTranslations(msg: any, user: any) {
       ? `Send the command again to continue.`
       : `\ud83c\udf89 All done!`);
   await sendMessage(msg.chat.id, reply);
+}
+
+// --- /update: check GitHub for a newer build, and (admin) deploy it with one tap ---
+
+// The version a deploy would actually ship is the BUILD_VERSION literal in the
+// committed index.ts on the deploy branch (deploy.yml runs `supabase functions
+// deploy` on that file \u2014 there is no separate build artifact). So we read it
+// straight from raw.githubusercontent, mirroring deploy.yml's own sed extraction.
+// Git tags lag (created manually post-deploy), so they'd under-report. Returns the
+// version string, or null on any failure (network / non-200 / no regex match).
+async function fetchLatestVersion(): Promise<string | null> {
+  if (!GITHUB_REPO) return null;
+  // Cache-bust + no-store: raw.githubusercontent is CDN-cached up to a few minutes.
+  const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_DEPLOY_BRANCH}/supabase/functions/telegram-bot/index.ts?t=${Date.now()}`;
+  try {
+    const resp = await fetch(url, { cache: "no-store" });
+    if (!resp.ok) { console.error(`fetchLatestVersion HTTP ${resp.status}`); return null; }
+    const src = await resp.text();
+    const m = src.match(/const BUILD_VERSION = "([^"]+)"/);
+    return m ? m[1] : null;
+  } catch (e) {
+    console.error("fetchLatestVersion failed:", e);
+    return null;
+  }
+}
+
+// "v45" -> 45; anything not of the form vN returns null (caller falls back to
+// string comparison so a non-numeric scheme never offers a bogus deploy).
+function parseVersion(v: string): number | null {
+  const m = v.match(/^v(\d+)$/);
+  return m ? Number(m[1]) : null;
+}
+
+// Trigger the same gated deploy.yml workflow a human would run from the Actions
+// tab. The workflow's job gate requires inputs.confirm == "deploy". A successful
+// dispatch returns HTTP 204 (no content); anything else is a failure.
+async function triggerDeploy(): Promise<{ ok: boolean; status: number; body?: string }> {
+  const url = `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${GITHUB_DEPLOY_WORKFLOW}/dispatches`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${GITHUB_DEPLOY_TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "capybara-bot", // GitHub's REST API rejects requests without a User-Agent
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ ref: GITHUB_DEPLOY_BRANCH, inputs: { confirm: "deploy" } }),
+  });
+  if (resp.status === 204) return { ok: true, status: 204 };
+  const body = await resp.text().catch(() => "<no body>");
+  console.error(`triggerDeploy non-204: status=${resp.status} body=${body.slice(0, 300)}`);
+  return { ok: false, status: resp.status, body };
+}
+
+async function handleUpdateCommand(msg: any, user: any) {
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+
+  const running = BUILD_VERSION;
+  if (!GITHUB_REPO) {
+    await sendMessage(msg.chat.id, `Running ${running}. Update check isn't configured (GITHUB_REPO unset).`);
+    return;
+  }
+  const latest = await fetchLatestVersion();
+  if (latest === null) {
+    await sendMessage(msg.chat.id, `Running ${running}. Couldn't read the latest version from GitHub (network/parse error). Try again later.`);
+    return;
+  }
+
+  const runN = parseVersion(running);
+  const latN = parseVersion(latest);
+  const deployEnabled = !!(GITHUB_DEPLOY_TOKEN && GITHUB_REPO);
+
+  // Non-numeric on either side: we can't order them, so compare by exact string.
+  if (runN === null || latN === null) {
+    await sendMessage(msg.chat.id,
+      latest === running
+        ? `Up to date \u2014 running ${running}.`
+        : `Running ${running}; latest on GitHub is ${latest}. (Non-numeric versions \u2014 can't offer one-tap deploy.)`);
+    return;
+  }
+
+  if (latN <= runN) {
+    await sendMessage(msg.chat.id, `Up to date \u2014 running ${running}, latest is ${latest}.`);
+    return;
+  }
+
+  // A newer build exists on the branch.
+  const statusText = `\u2b06\ufe0f Update available: running ${running}, latest is ${latest}.`;
+  if (!deployEnabled) {
+    await sendMessage(msg.chat.id, `${statusText}\nDeploy isn't configured (GITHUB_DEPLOY_TOKEN unset) \u2014 deploy manually.`);
+    return;
+  }
+  const keyboard = { inline_keyboard: [[{ text: `Deploy ${latest}`, callback_data: `deploy:${latest}` }]] };
+  await sendMessage(msg.chat.id, `${statusText}\nTap to deploy:`, undefined, keyboard);
+}
+
+async function handleCallbackQuery(cq: any) {
+  // Auth by Telegram sender id, independent of the users table. The button is only
+  // ever shown in the admin's own chat, but we re-check here for defense in depth.
+  if (cq.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) {
+    await answerCallbackQuery(cq.id, "Not authorized.");
+    return;
+  }
+  const data: string = cq.data ?? "";
+  if (!data.startsWith("deploy:")) { await answerCallbackQuery(cq.id); return; }
+  const target = data.slice("deploy:".length);
+
+  const chatId = cq.message?.chat?.id;
+  const messageId = cq.message?.message_id;
+
+  if (!GITHUB_DEPLOY_TOKEN || !GITHUB_REPO) {
+    await answerCallbackQuery(cq.id, "Deploy not configured.");
+    return;
+  }
+
+  await answerCallbackQuery(cq.id, `Dispatching deploy ${target}\u2026`);
+  // Retire the button before dispatching so a slow request can't be double-tapped.
+  if (chatId && messageId) await editMessageReplyMarkup(chatId, messageId);
+
+  // The dispatch always ships branch HEAD (which is >= the button's target), so a
+  // stale button still deploys current code \u2014 acceptable.
+  const res = await triggerDeploy();
+  if (chatId) {
+    if (res.ok) {
+      await sendMessage(chatId, `\ud83d\ude80 Deploy ${target} dispatched. The GitHub Actions "deploy" workflow is running (predeploy gate + health smoke test); /update will report ${target} once it lands.`);
+    } else {
+      await sendMessage(chatId, `Deploy dispatch failed (HTTP ${res.status}). Check the GITHUB_DEPLOY_TOKEN scope (needs Actions: write) and try again, or deploy manually.`);
+    }
+  }
 }
 
 async function handleDiag(msg: any, user: any) {
