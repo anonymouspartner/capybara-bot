@@ -1,0 +1,16 @@
+{
+  "name": "Capybara setup",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers-contrib/features/deno:1": {}
+  },
+  "postCreateCommand": "npm install -g supabase",
+  "postAttachCommand": "echo 'Capybara: run  deno run -A setup.ts  to provision your instance.'",
+  "customizations": {
+    "vscode": {
+      "extensions": ["denoland.vscode-deno"]
+    }
+  }
+}

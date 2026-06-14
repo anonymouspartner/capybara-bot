@@ -1,0 +1,9 @@
+supabase/.temp/
+
+# setup.ts wizard progress (holds the project ref + step state; no secrets)
+.capybara-setup-state.json
+
+# Environment / secrets — never commit these
+.env
+.env.*
+!.env.example

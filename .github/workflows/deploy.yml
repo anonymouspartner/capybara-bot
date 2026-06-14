@@ -1,0 +1,56 @@
+name: deploy
+
+# Manual, gated deploy of the telegram-bot edge function FROM GitHub — so deploys need
+# no local machine while keeping a human in the loop (you click "Run workflow"). This
+# runs ONLY on manual dispatch — never on push/PR — so the access token is never exposed
+# to fork pull requests on a public repo. See CLAUDE.md (a human runs every deploy).
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   SUPABASE_ACCESS_TOKEN   — from https://supabase.com/dashboard/account/tokens
+#   SUPABASE_PROJECT_REF    — your project ref
+# The bot's five function secrets live on Supabase (set once by setup.ts) — a code
+# deploy never touches them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm you want to deploy to production.'
+        required: true
+        default: ""
+
+jobs:
+  deploy:
+    if: ${{ github.event.inputs.confirm == 'deploy' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Pre-deploy sanity gate
+        run: bash ./predeploy-check.sh
+
+      - name: Install the Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy the function (committed file only)
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: supabase functions deploy telegram-bot --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}" --no-verify-jwt
+
+      - name: Smoke-test the health route
+        run: |
+          set -euo pipefail
+          ref="${{ secrets.SUPABASE_PROJECT_REF }}"
+          ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' supabase/functions/telegram-bot/index.ts | head -1)
+          body=$(curl -fsS "https://${ref}.supabase.co/functions/v1/telegram-bot?health")
+          echo "health: $body"
+          echo "$body" | grep -q "\"version\":\"${ver}\"" || { echo "FAIL: live version != ${ver}"; exit 1; }
+          echo "$body" | grep -q '"adminConfigured":true'  || { echo "FAIL: adminConfigured not true"; exit 1; }
+          echo "Smoke test passed: version ${ver}, adminConfigured true."

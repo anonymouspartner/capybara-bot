@@ -1,0 +1,31 @@
+name: check
+
+# Cross-platform mirror of the pre-deploy gate. Runs on every push and PR so a
+# broken index.ts (won't type-check, shrank to a stub, or lost a required anchor)
+# is caught before anyone deploys. This workflow NEVER deploys — Capybara deploys
+# are always run by a human, one instance at a time. See CLAUDE.md.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  predeploy-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # predeploy-check.sh runs `deno check`, asserts the line-count floor, and
+      # asserts every required code anchor is present.
+      - name: Run pre-deploy sanity gate
+        run: bash ./predeploy-check.sh
+
+      # Type-check the setup wizard too, so a broken setup.ts is caught here.
+      - name: Type-check the setup wizard
+        run: deno check setup.ts
