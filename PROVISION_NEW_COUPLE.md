@@ -179,6 +179,10 @@ Expect `"url"` set, `"pending_update_count"` small, and no `"last_error_message"
 
 1. **Health** (no Telegram): `GET https://<NEW_REF>.supabase.co/functions/v1/telegram-bot?health`
    → `{"status":"ok","version":"vNN","adminConfigured":true}`. Confirm `adminConfigured:true`.
+   Add **`&seed`** to also check seeding *after* Step 7:
+   `GET …/telegram-bot?health&seed` → adds `"userCount":2,"seeded":true`. If you see
+   `"seeded":false` (userCount 0), Step 7 never ran — go seed before testing further.
+   (Plain `?health` stays DB-free; `&seed` is the only variant that touches the DB.)
 2. **/help** — bot replies with the command list in your native language.
 3. **Translation both directions:**
    - English partner sends an English sentence → bot returns the Ukrainian translation.
@@ -208,3 +212,37 @@ Expect `"url"` set, `"pending_update_count"` small, and no `"last_error_message"
   fork per couple.
 - **You run every deploy.** Build/commit happens on disk; you deploy and watch each
   instance yourself, one at a time, your own instance first.
+
+---
+
+## Troubleshooting
+
+### Both partners see "…your Telegram ID hasn't been registered yet"
+
+**Cause:** **Step 7 (seed) was never run**, so `public.users` is empty. With no rows,
+every message fails the `lookupUser` check in `index.ts` and the bot replies with the
+"not registered" notice for **everyone** — including the people who are supposed to be
+registered. This is *not* a code, deploy, or webhook fault: the function can be healthy
+and the webhook delivering updates (you'll see `POST … /telegram-bot → 200` in the
+edge-function logs) and you'll still get this until the table is seeded.
+
+**Confirm** — either hit the health route with the seed check (no Dashboard needed):
+```
+GET https://<REF>.supabase.co/functions/v1/telegram-bot?health&seed
+→ {"status":"ok",…,"userCount":0,"seeded":false}   # 0 / false means the seed never ran
+```
+or query directly (Dashboard SQL editor, or `mcp__Supabase__execute_sql`):
+```sql
+select count(*) from public.users;   -- 0 means the seed never ran
+```
+
+**Fix:** run **Step 7** — seed the two users from `seed_couple.sql` (or insert their
+real Telegram IDs + names directly), then have each partner message the bot once more.
+The trailing `SELECT` must show **exactly two rows** — one `en` native (admin) and one
+`uk` native.
+
+> **Still "not registered" for just one partner after seeding?** That row's
+> `telegram_id` doesn't match the number Telegram is actually sending — almost always a
+> typo. Compare the seeded value against the `Your Telegram user ID is: …` the bot
+> reports back, and re-seed (it's `ON CONFLICT DO NOTHING`, so correct the value or
+> delete the bad row first).
