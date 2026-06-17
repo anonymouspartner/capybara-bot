@@ -246,3 +246,38 @@ The trailing `SELECT` must show **exactly two rows** — one `en` native (admin)
 > typo. Compare the seeded value against the `Your Telegram user ID is: …` the bot
 > reports back, and re-seed (it's `ON CONFLICT DO NOTHING`, so correct the value or
 > delete the bad row first).
+
+### The bot gives **no response at all** (not even "not registered")
+
+Total silence is a **transport** problem (Telegram never reaches the function), not a
+data one. Work it in this order — the data layer (seeding) can't even be the cause yet,
+because an unseeded bot still *replies* with "not registered".
+
+1. **Is the bot token live?** `GET https://api.telegram.org/bot<TOKEN>/getMe` →
+   `{"ok":true,…}`. If it returns `{"ok":false,…,"description":"Unauthorized"}` the token
+   is **invalid** (a typo, a wrong paste, or a revoked bot). This is the #1 cause: a dead
+   token makes `setWebhook` fail *and* makes the function unable to send replies. Fix it
+   in `.env` (the live value from **@BotFather → `/mybots` → API Token**) and re-run setup.
+2. **Is the webhook set?** `GET https://api.telegram.org/bot<TOKEN>/getWebhookInfo` →
+   expect `"url"` pointing at `…/functions/v1/telegram-bot` with **no**
+   `last_error_message`. A blank `"url"` means it was never set; a
+   `"Wrong response from the webhook: 401 Unauthorized"` means the webhook's `secret_token`
+   ≠ the project's `WEBHOOK_SECRET`. Re-run Step 8 with matching values.
+3. **Is the function up?** `GET …/telegram-bot?health` → 200 + `adminConfigured:true`.
+
+> **Don't trust a "Setup complete" message or `.capybara-setup-state.json: "complete"`
+> on its own** — older wizard runs printed 🎉 and recorded `complete` even when the
+> webhook step failed. `getWebhookInfo` is the source of truth.
+
+### Codespaces / sandboxes: Step 8 (seed) will fall back to a manual paste — expect it
+
+`setup.ts` tries to seed the couple by connecting **straight to the Postgres database**.
+In a GitHub Codespace (and most sandboxed shells) that outbound DB connection is blocked
+(`Network is unreachable` / `Name or service not known`), so the automatic seed **always**
+fails there and the wizard prints the SQL with *"Press Enter once you've run both snippets
+in the SQL editor…"*. **That paste is the real step — actually run it in the Dashboard SQL
+editor (the wizard prints a direct project link), not just press Enter.** Skipping it
+leaves `public.users` empty, and every message comes back "not registered". Confirm with
+`GET …/telegram-bot?health&seed` → `"userCount":2,"seeded":true`. (The `supabase db push`
+in Step 7 still works from a Codespace because it goes through Supabase's API, not a direct
+DB socket — only the Step 8 direct connection is affected.)

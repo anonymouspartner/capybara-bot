@@ -297,9 +297,14 @@ type Seed = { adminId: string; adminName: string; partnerId: string; partnerName
 
 function fillSeedSql(template: string, s: Seed): string {
   const esc = (n: string) => n.replace(/'/g, "''");
+  // Replace ONLY the two telegram-id placeholders, which are the literal
+  // `000000000::bigint`. Anchoring on `::bigint` is deliberate: a bare
+  // /000000000/g also matches the run of zeros inside the default-conversation
+  // UUID (00000000-0000-0000-0000-000000000001) and would rewrite it to a bogus
+  // value, breaking the messages.conversation_id foreign key.
   let i = 0;
   return template
-    .replace(/000000000/g, () => (i++ === 0 ? s.adminId : s.partnerId))
+    .replace(/000000000::bigint/g, () => `${i++ === 0 ? s.adminId : s.partnerId}::bigint`)
     .replace("<English-native partner name>", esc(s.adminName))
     .replace("<Ukrainian-native partner name>", esc(s.partnerName));
 }
@@ -344,10 +349,10 @@ async function applyBucketAndSeedOverConnection(ref: string, dbpw: string, s: Se
   return false;
 }
 
-async function pasteFallback(s: Seed) {
+async function pasteFallback(ref: string, s: Seed) {
   warn("Couldn't apply the bucket + seed automatically. One quick manual step instead:");
   info("   1. Open your project's SQL editor:");
-  info(`      ${C.cyan}https://supabase.com/dashboard/project/_/sql/new${C.reset}`);
+  info(`      ${C.cyan}https://supabase.com/dashboard/project/${ref}/sql/new${C.reset}`);
   info("   2. Paste and run BOTH snippets below.\n");
   let storage = "";
   try {
@@ -374,6 +379,34 @@ const V = {
   openai: /^sk-/,
   ref: /^[a-z0-9]{20}$/,
 };
+
+// Verify a bot token is LIVE, not just well-formed. A dead or mistyped token
+// still passes V.token but makes setWebhook fail at the very last step, leaving
+// the bot silent -- so check getMe here, before any project work. Returns the
+// bot's @username on success, or null if Telegram rejects the token.
+async function verifyBotToken(token: string): Promise<string | null> {
+  try {
+    const b = await (await fetch(`https://api.telegram.org/bot${token}/getMe`)).json();
+    return b?.ok ? (b.result?.username ?? "your bot") : null;
+  } catch {
+    return null;
+  }
+}
+
+// Prompt for a bot token until Telegram confirms it's live; returns the token.
+async function askLiveBotToken(prompt: string): Promise<string> {
+  while (true) {
+    const token = await askValidated(
+      prompt, V.token, "It should look like digits, a colon, then ~35 characters.", true,
+    );
+    const username = await verifyBotToken(token);
+    if (username) {
+      ok(`Token verified — bot is @${username}.`);
+      return token;
+    }
+    err("Telegram rejected that token (getMe → Unauthorized). Re-copy it from @BotFather — it must be exact.");
+  }
+}
 
 // ---------------------------------------------------------------------------- --check mode
 async function runCheck() {
@@ -452,10 +485,17 @@ async function main() {
     info("In Telegram, message @BotFather, send /newbot, and follow the prompts.");
     info("It gives you a token that looks like 123456789:AAEx....");
     await maybeOpen("BotFather", "https://t.me/BotFather");
-    values.TELEGRAM_BOT_TOKEN = await askValidated(
-      "Paste the bot token:", V.token, "It should look like digits, a colon, then ~35 characters.", true,
-    );
-  } else ok("Bot token already set.");
+    values.TELEGRAM_BOT_TOKEN = await askLiveBotToken("Paste the bot token:");
+  } else {
+    // Re-verify a reused token too: a stale/invalid one in .env is exactly what
+    // leaves the bot silent, and it's cheap to catch now instead of at Step 11.
+    const username = await verifyBotToken(values.TELEGRAM_BOT_TOKEN);
+    if (username) ok(`Bot token already set and verified — @${username}.`);
+    else {
+      warn("The saved bot token is INVALID (Telegram getMe → Unauthorized) — let's re-enter it.");
+      values.TELEGRAM_BOT_TOKEN = await askLiveBotToken("Paste a valid bot token:");
+    }
+  }
 
   // Step 3 - partners' IDs + names
   step(3, "Who are the two partners?");
@@ -529,14 +569,14 @@ async function main() {
     warn("Couldn't apply the migration via the CLI.");
     info("   Paste the contents of this file into the SQL editor and run it:");
     info(`   ${MIGRATION}`);
-    info(`   ${C.cyan}https://supabase.com/dashboard/project/_/sql/new${C.reset}`);
+    info(`   ${C.cyan}https://supabase.com/dashboard/project/${ref}/sql/new${C.reset}`);
     await askLine("Press Enter once the schema migration has run...");
   }
 
   // Step 8 - bucket + seed
   step(8, "Create storage + add the couple");
   const applied = await applyBucketAndSeedOverConnection(ref, dbpw, seed);
-  if (!applied) await pasteFallback(seed);
+  if (!applied) await pasteFallback(ref, seed);
   state.done = [...new Set([...state.done, "seed"])];
   await saveState(state);
 
@@ -574,13 +614,47 @@ async function main() {
   const hookUrl = `https://${ref}.supabase.co/functions/v1/${FUNCTION}`;
   const set = `https://api.telegram.org/bot${values.TELEGRAM_BOT_TOKEN}/setWebhook` +
     `?url=${encodeURIComponent(hookUrl)}&secret_token=${encodeURIComponent(values.WEBHOOK_SECRET)}`;
+  let webhookOk = false;
   try {
     const r = await (await fetch(set)).json();
-    if (r.ok) ok("Telegram webhook set.");
-    else err(`Telegram rejected the webhook: ${r.description ?? "unknown"}`);
+    if (r.ok) {
+      ok("Telegram webhook set.");
+      webhookOk = true;
+    } else {
+      err(`Telegram rejected the webhook: ${r.description ?? "unknown"}`);
+    }
   } catch (e) {
     err(`Couldn't set the webhook: ${(e as Error).message}`);
   }
+
+  // A failed webhook is fatal: Telegram has nowhere to deliver updates, so the
+  // bot stays completely silent. Do NOT mark the run complete (that would be a
+  // false all-clear) -- stop loudly with the most likely cause and the fix.
+  if (!webhookOk) {
+    banner("⚠️  Setup did NOT finish — the Telegram webhook was not set.");
+    info("Until the webhook is set, Telegram can't deliver messages and the bot stays silent.");
+    info("The usual cause is an invalid TELEGRAM_BOT_TOKEN. Verify it with:");
+    info(`   ${C.cyan}curl -s "https://api.telegram.org/bot<your-token>/getMe"${C.reset}   # expect {"ok":true,...}`);
+    info("Fix TELEGRAM_BOT_TOKEN in .env if it's wrong, then re-run  deno run -A setup.ts");
+    await saveState(state); // 'complete' intentionally NOT recorded
+    Deno.exit(1);
+  }
+
+  // Confirm the couple actually got seeded. Step 8 silently falls back to a
+  // manual SQL paste that's easy to skip, leaving public.users empty -- which
+  // makes every message answer with "...your Telegram ID hasn't been registered
+  // yet". The seed health probe is read-only and side-effect-free.
+  try {
+    const b = await (await fetch(`${hookUrl}?health&seed`)).json();
+    if (b.seeded === false || b.userCount === 0) {
+      warn("The users table is EMPTY — the seed (Step 8) never ran.");
+      info("Both partners will get \"...your Telegram ID hasn't been registered yet\" until you seed.");
+      info("   Open the SQL editor and run seed_couple.sql (it was filled in for you above):");
+      info(`   ${C.cyan}https://supabase.com/dashboard/project/${ref}/sql/new${C.reset}`);
+    } else if (b.userCount) {
+      ok(`Seed verified: ${b.userCount} users registered.`);
+    }
+  } catch { /* best-effort: never block completion on the probe */ }
 
   banner("🎉  Setup complete — now test it in Telegram:");
   info("  • Both partners send /help — the bot replies in their language.");
