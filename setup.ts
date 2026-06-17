@@ -380,6 +380,34 @@ const V = {
   ref: /^[a-z0-9]{20}$/,
 };
 
+// Verify a bot token is LIVE, not just well-formed. A dead or mistyped token
+// still passes V.token but makes setWebhook fail at the very last step, leaving
+// the bot silent -- so check getMe here, before any project work. Returns the
+// bot's @username on success, or null if Telegram rejects the token.
+async function verifyBotToken(token: string): Promise<string | null> {
+  try {
+    const b = await (await fetch(`https://api.telegram.org/bot${token}/getMe`)).json();
+    return b?.ok ? (b.result?.username ?? "your bot") : null;
+  } catch {
+    return null;
+  }
+}
+
+// Prompt for a bot token until Telegram confirms it's live; returns the token.
+async function askLiveBotToken(prompt: string): Promise<string> {
+  while (true) {
+    const token = await askValidated(
+      prompt, V.token, "It should look like digits, a colon, then ~35 characters.", true,
+    );
+    const username = await verifyBotToken(token);
+    if (username) {
+      ok(`Token verified — bot is @${username}.`);
+      return token;
+    }
+    err("Telegram rejected that token (getMe → Unauthorized). Re-copy it from @BotFather — it must be exact.");
+  }
+}
+
 // ---------------------------------------------------------------------------- --check mode
 async function runCheck() {
   banner("Capybara setup — read-only check (--check)");
@@ -457,10 +485,17 @@ async function main() {
     info("In Telegram, message @BotFather, send /newbot, and follow the prompts.");
     info("It gives you a token that looks like 123456789:AAEx....");
     await maybeOpen("BotFather", "https://t.me/BotFather");
-    values.TELEGRAM_BOT_TOKEN = await askValidated(
-      "Paste the bot token:", V.token, "It should look like digits, a colon, then ~35 characters.", true,
-    );
-  } else ok("Bot token already set.");
+    values.TELEGRAM_BOT_TOKEN = await askLiveBotToken("Paste the bot token:");
+  } else {
+    // Re-verify a reused token too: a stale/invalid one in .env is exactly what
+    // leaves the bot silent, and it's cheap to catch now instead of at Step 11.
+    const username = await verifyBotToken(values.TELEGRAM_BOT_TOKEN);
+    if (username) ok(`Bot token already set and verified — @${username}.`);
+    else {
+      warn("The saved bot token is INVALID (Telegram getMe → Unauthorized) — let's re-enter it.");
+      values.TELEGRAM_BOT_TOKEN = await askLiveBotToken("Paste a valid bot token:");
+    }
+  }
 
   // Step 3 - partners' IDs + names
   step(3, "Who are the two partners?");
