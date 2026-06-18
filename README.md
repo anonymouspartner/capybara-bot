@@ -298,6 +298,41 @@ a public repo. It needs two repo secrets (Settings → Secrets and variables →
 touches them. (The `setup.ts` wizard can set these two repo secrets for you if `gh` is
 installed.)
 
+### Self-deploy from Telegram (`/update`)
+
+The admin can check for and ship new builds **from inside Telegram** with **`/update`**:
+it reads the latest `BUILD_VERSION` from this repo on GitHub, compares it to the running
+build, and — if the live bot is behind — offers a one-tap **Deploy** button that dispatches
+the same `deploy.yml` workflow above. You stay in the loop (you tap the button) and the
+predeploy gate + health smoke test still run. The feature is **inert** unless configured.
+
+It relies on **two separate secret buckets** — mixing these up is the #1 source of trouble:
+
+| Bucket | Where | Keys | Used by |
+|---|---|---|---|
+| **Supabase function secrets** | Supabase → Edge Functions → Secrets | `GITHUB_DEPLOY_TOKEN`, `GITHUB_REPO`, `GITHUB_DEPLOY_BRANCH` | the **bot** (to read the latest version + dispatch the deploy) |
+| **GitHub Actions repo secrets** | repo Settings → Secrets and variables → Actions | `SUPABASE_ACCESS_TOKEN`, `SUPABASE_PROJECT_REF` | the **workflow** (to authenticate to Supabase and deploy) |
+
+The three function secrets:
+- `GITHUB_DEPLOY_TOKEN` — a GitHub PAT, fine-grained with **Actions: write** on this repo
+  (or a classic token with the `workflow` scope). Without it, `/update` only reports version
+  status — no deploy button. Named to avoid colliding with Actions' built-in `GITHUB_TOKEN`.
+- `GITHUB_REPO` — exactly `owner/name` (e.g. `anonymouspartner/capybara-bot`). No `https://`,
+  no trailing slash, no spaces.
+- `GITHUB_DEPLOY_BRANCH` — the deploy branch whose `BUILD_VERSION` is "latest" (default `main`).
+
+**Gotchas (learned the hard way):**
+- The bot fetches
+  `https://raw.githubusercontent.com/<GITHUB_REPO>/<GITHUB_DEPLOY_BRANCH>/supabase/functions/telegram-bot/index.ts`.
+  If `GITHUB_REPO` or `GITHUB_DEPLOY_BRANCH` is even slightly off (wrong owner, a stale/deleted
+  branch, a stray trailing space) the fetch 404s and `/update` replies *"Couldn't read the
+  latest version from GitHub."* Correct the value and redeploy.
+- Function secrets are read **at boot**, so after changing any of them you must **redeploy**
+  for the running bot to pick them up — updating the secret alone does nothing until the next deploy.
+- Verify end-to-end by sending **`/update`**: a correct setup replies
+  **"Up to date — running vNN, latest is vNN."** Once `main` moves ahead of what's live, the
+  same command shows **"Update available …"** plus the one-tap **Deploy** button.
+
 ## Reproducibility & determinism
 
 A few things keep a fresh instance reproducible from the committed files alone:
