@@ -212,6 +212,18 @@ Expect `"url"` set, `"pending_update_count"` small, and no `"last_error_message"
   fork per couple.
 - **You run every deploy.** Build/commit happens on disk; you deploy and watch each
   instance yourself, one at a time, your own instance first.
+- **`/update` self-deploy is off by default.** The admin `/update` command is **inert**
+  for a new couple — the five secrets above don't include the `GITHUB_*` ones, so it
+  just replies *"Update check isn't configured."* To enable it you'd additionally set
+  the function secrets `GITHUB_DEPLOY_TOKEN` / `GITHUB_REPO` / `GITHUB_DEPLOY_BRANCH`
+  **and** the repo Actions secrets `SUPABASE_ACCESS_TOKEN` / `SUPABASE_PROJECT_REF`
+  (see the README's *Self-deploy from Telegram* section). **Caveat for multiple
+  couples:** `deploy.yml` lives in **one** repo and deploys to whatever single
+  `SUPABASE_PROJECT_REF` that repo's Actions secrets point at — so the one-tap **Deploy**
+  button is only safe on an instance whose repo you control (e.g. your own / a per-couple
+  fork). Pointing several couples' `GITHUB_REPO` at the same shared repo would have every
+  Deploy tap target the *same* project, not their own. The read-only version *check*
+  (needs only `GITHUB_REPO`) is fine to share; the deploy button is not.
 
 ---
 
