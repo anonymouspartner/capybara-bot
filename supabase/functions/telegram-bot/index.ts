@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v47";
+const BUILD_VERSION = "v48";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -524,7 +524,7 @@ function buildAnnotationPrompt(language: "uk" | "en"): string {
     `- "vocabulary": array of {lemma, part_of_speech, english_gloss, lemma_translation} for content words only.\n` +
     `  * lemma MUST be the dictionary form (nominative singular for nouns, infinitive for verbs, base form for adjectives).\n` +
     `  * part_of_speech MUST be one of: "noun", "verb", "adjective", "adverb", "phrase".\n` +
-    `  * english_gloss is 1-4 words, no articles. For ${langName} vocabulary, the gloss should be the most common/literal meaning in English.\n` +
+    `  * english_gloss is 1-4 words, no articles. For ${langName} vocabulary, the gloss should disambiguate the word's specific sense, not just give the most generic/literal meaning — e.g. завезти should gloss as "deliver by car/vehicle", not just "bring", when the word specifically implies transport by vehicle.\n` +
     `  * lemma_translation is the single most common dictionary form of the word in ${otherLangName} (the OPPOSITE language). For ${langName} lemmas, return the ${otherLangName} translation; this becomes the "answer" on a flashcard.\n` +
     `    - For ${otherLangName === "Ukrainian" ? "Ukrainian" : "English"} translations, give the dictionary form (infinitive for verbs, nominative singular for nouns).\n` +
     `    - One word only when possible; a short phrase if the language has no single-word equivalent.\n` +
