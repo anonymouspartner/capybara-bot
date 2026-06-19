@@ -154,7 +154,7 @@ async function handleUpdate(update: any) {
     await sendMessage(msg.chat.id,
       `Hi ${user.display_name}! Send me text or voice messages in ${user.native_language === "en" ? "English" : "Ukrainian"}, ` +
       `and I'll translate them to ${user.learning_language === "en" ? "English" : "Ukrainian"}.\n\n` +
-      `You can also send videos — I'll forward them straight to your partner.\n\n` +
+      `You can also send photos and videos — I'll forward them straight to your partner.\n\n` +
       `Everything is saved as a study corpus.\n\n` +
       `Type /help to see what I can do.`
     );
@@ -179,8 +179,9 @@ async function handleUpdate(update: any) {
   if (msg.text === "/recap" || msg.text?.startsWith("/recap ") || msg.text?.startsWith("/recap@")) { await handleRecap(msg, user); return; }
   if (msg.voice) { await handleVoiceMessage(msg, user); }
   else if (msg.video || msg.video_note) { await handleVideoMessage(msg, user); }
+  else if (msg.photo) { await handlePhotoMessage(msg, user); }
   else if (msg.text) { await handleTextMessage(msg, user); }
-  else { await sendMessage(msg.chat.id, "I can handle text, voice, and video messages. Other types aren't supported yet."); }
+  else { await sendMessage(msg.chat.id, "I can handle text, voice, photo, and video messages. Other types aren't supported yet."); }
 }
 
 async function lookupUser(tgUser: any) {
@@ -662,6 +663,15 @@ async function sendVideo(chatId: number, videoFileId: string, caption?: string) 
   if (!resp.ok) console.error("sendVideo failed:", resp.status, await resp.text().catch(() => "<no body>"));
 }
 
+async function sendPhoto(chatId: number, photoFileId: string, caption?: string) {
+  const resp = await fetch(`${TELEGRAM_API}/sendPhoto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, photo: photoFileId, caption }),
+  });
+  if (!resp.ok) console.error("sendPhoto failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
 // Round "video note" messages (recorded in Telegram) — the API takes no caption,
 // so any attribution must be sent as a separate text message.
 async function sendVideoNote(chatId: number, videoNoteFileId: string) {
@@ -725,6 +735,23 @@ async function handleVideoMessage(msg: any, user: any) {
   const partnerCaption = caption ? `\ud83c\udfa5 ${senderName}: ${caption}` : `\ud83c\udfa5 ${senderName} sent a video.`;
   await sendVideo(partner.telegram_id, msg.video.file_id, partnerCaption);
   await sendMessage(msg.chat.id, "\ud83c\udfa5 Video forwarded to your partner.");
+}
+
+// Photos are forwarded as-is by Telegram file_id (no download/translation step),
+// the same approach as handleVideoMessage. Telegram sends msg.photo as an array of
+// the same image at increasing resolutions, so the largest is the last entry.
+async function handlePhotoMessage(msg: any, user: any) {
+  const partner = await lookupPartner(user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, "🖼️ Got your photo, but there's no partner to forward it to yet.");
+    return;
+  }
+  const senderName = user.display_name;
+  const largest = msg.photo[msg.photo.length - 1];
+  const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
+  const partnerCaption = caption ? `🖼️ ${senderName}: ${caption}` : `🖼️ ${senderName} sent a photo.`;
+  await sendPhoto(partner.telegram_id, largest.file_id, partnerCaption);
+  await sendMessage(msg.chat.id, "🖼️ Photo forwarded to your partner.");
 }
 
 function csvEscape(value: string | null | undefined): string {
@@ -843,7 +870,7 @@ async function handleHelp(msg: any, user: any) {
       "\u0414\u0432\u0456 \u043a\u043e\u043b\u043e\u0434\u0438: \ud83c\uddfa\ud83c\udde6 \u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0456 \ud83c\uddec\ud83c\udde7 \u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430.",
       "",
       "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0456 \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
-      "\u2022 \u041d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0432\u0456\u0434\u0435\u043e \u2014 \u044f \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u0439\u043e\u0433\u043e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
+      "\u2022 \u041d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0444\u043e\u0442\u043e \u0430\u0431\u043e \u0432\u0456\u0434\u0435\u043e \u2014 \u044f \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u0439\u043e\u0433\u043e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
       "\u2022 /vocab \u2014 \u041d\u0430\u0439\u0447\u0430\u0441\u0442\u0456\u0448\u0456 \u0441\u043b\u043e\u0432\u0430, \u0449\u0435 \u043d\u0435 \u0432\u0438\u0432\u0447\u0435\u043d\u0456",
       "\u2022 /learn <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0414\u043e\u0434\u0430\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0434\u043e \u043a\u043e\u043b\u043e\u0434\u0438",
       "\u2022 /learn top N \u2014 \u041e\u043f\u0442\u043e\u043c \u0434\u043e\u0434\u0430\u0442\u0438 N \u0441\u043b\u0456\u0432",
@@ -867,7 +894,7 @@ async function handleHelp(msg: any, user: any) {
       "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
       "",
       "\u2022 Just type or send a voice message \u2014 I translate it and forward to your partner",
-      "\u2022 Send a video \u2014 I forward it straight to your partner",
+      "\u2022 Send a photo or video \u2014 I forward it straight to your partner",
       "\u2022 /vocab \u2014 Top words still unlearned in each deck",
       "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
       "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",
