@@ -20,7 +20,10 @@ Files this runbook uses (all already committed, deploy them unchanged):
 - `deploy.ps1` / `predeploy-check.ps1` — the deploy spine (gate + CLI-from-disk + health smoke).
 
 > **Only Step 6 (deploy) needs the Supabase CLI on your laptop.** Everything else is
-> Dashboard, Telegram, or a single HTTP call, and can be done from anywhere.
+> Dashboard, Telegram, or a single HTTP call, and can be done from anywhere. (After this
+> first deploy, future deploys can use the **GitHub Actions** workflow instead — see
+> README "Deploying" — once `SUPABASE_ACCESS_TOKEN` / `SUPABASE_PROJECT_REF` repo secrets
+> are set for this couple's repo.)
 
 ---
 
@@ -148,6 +151,11 @@ From the repo root, against the new project:
 on-disk committed file** (never an inline string), then smoke-tests the health route
 and asserts **200 + the BUILD_VERSION baked in `index.ts` + `adminConfigured: true`**.
 On success it prints a `git tag` reminder.
+
+> **Going forward:** once this couple's repo has its own `SUPABASE_ACCESS_TOKEN` /
+> `SUPABASE_PROJECT_REF` repo secrets (Settings → Secrets and variables → Actions, or let
+> `setup.ts` set them via `gh`), future deploys can use **Actions → deploy → Run
+> workflow** instead of repeating this command — see README "Deploying".
 
 > Unlike the primary's very first health-route deploy, a **new** instance ships the
 > health route in the canonical file already, so this first deploy **is** auto-checked.
