@@ -10,7 +10,8 @@
 // Supabase project, get API keys) and automates everything else: generates WEBHOOK_SECRET,
 // writes .env, applies the DB migration, creates the storage bucket, seeds the couple,
 // sets the function secrets, runs the deploy gate + deploys, sets the Telegram webhook,
-// and smoke-tests the health route.
+// and smoke-tests the health route. It also optionally wires up one-tap /update
+// self-deploy from Telegram (GitHub Actions secrets + the bot's deploy token).
 //
 // Secrets are written only to the gitignored .env (never printed, never committed).
 // Safe to re-run: every step is idempotent and progress is tracked in
@@ -27,7 +28,7 @@ const STATE_FILE = ".capybara-setup-state.json";
 const MIGRATION = "supabase/migrations/20260601000000_init_schema.sql";
 const PG_MOD = "https://deno.land/x/postgres@v0.19.3/mod.ts";
 const CONV_UUID = "00000000-0000-0000-0000-000000000001";
-const TOTAL = 11;
+const TOTAL = 12;
 
 const SECRET_KEYS = [
   "TELEGRAM_BOT_TOKEN",
@@ -148,6 +149,22 @@ async function run(cmd: string, args: string[], env?: Record<string, string>): P
     const p = new Deno.Command(cmd, {
       args, env, stdin: "inherit", stdout: "inherit", stderr: "inherit",
     }).spawn();
+    return (await p.status).success;
+  } catch {
+    return false;
+  }
+}
+
+// Like run(), but feeds `input` on stdin instead of inheriting the terminal — used to
+// hand a secret to `gh secret set` without ever putting it on the argv (process list).
+async function runIn(cmd: string, args: string[], input: string): Promise<boolean> {
+  try {
+    const p = new Deno.Command(cmd, {
+      args, stdin: "piped", stdout: "inherit", stderr: "inherit",
+    }).spawn();
+    const w = p.stdin.getWriter();
+    await w.write(enc(input));
+    await w.close();
     return (await p.status).success;
   } catch {
     return false;
@@ -488,7 +505,7 @@ async function main() {
     values.TELEGRAM_BOT_TOKEN = await askLiveBotToken("Paste the bot token:");
   } else {
     // Re-verify a reused token too: a stale/invalid one in .env is exactly what
-    // leaves the bot silent, and it's cheap to catch now instead of at Step 11.
+    // leaves the bot silent, and it's cheap to catch now instead of at Step 12.
     const username = await verifyBotToken(values.TELEGRAM_BOT_TOKEN);
     if (username) ok(`Bot token already set and verified — @${username}.`);
     else {
@@ -590,8 +607,75 @@ async function main() {
   state.done = [...new Set([...state.done, "secrets"])];
   await saveState(state);
 
-  // Step 10 - gate + deploy + smoke
-  step(10, "Deploy the bot");
+  // Step 10 - optional: one-tap /update self-deploy from Telegram.
+  // Done BEFORE the deploy below on purpose: the bot reads its function secrets at boot,
+  // so wiring /update after a deploy wouldn't take effect until the next one.
+  step(10, "One-tap updates from Telegram (/update) — optional");
+  info("Lets the admin ship future builds from Telegram: /update checks GitHub for a newer");
+  info("BUILD_VERSION and deploys it with one tap (the gate + smoke test still run). Optional —");
+  info("skip it and you can always deploy from the repo's Actions tab or the CLI.");
+  if (await confirmYes("Set up /update self-deploy now?")) {
+    if (!await have("gh")) {
+      warn("GitHub CLI (gh) not found — skipping. Install it (https://cli.github.com), run");
+      info("   `gh auth login`, then re-run setup to enable /update.");
+    } else if (!(await capture("gh", ["auth", "status"])).ok) {
+      warn("gh isn't logged in — run `gh auth login`, then re-run setup to enable /update.");
+    } else {
+      const rv = await capture("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
+      const repo = rv.ok ? rv.out.trim() : "";
+      if (!repo) {
+        warn("Couldn't determine the GitHub repo from this checkout — skipping /update setup.");
+      } else {
+        ok(`Deploy source: ${repo} (branch main).`);
+        let allSet = true;
+
+        // (a) Repo Actions secrets — deploy.yml uses these to authenticate to Supabase and
+        //     to pick the default project. The access token is piped via stdin, never argv.
+        if ((await capture("gh", ["secret", "list", "--repo", repo])).out.includes("SUPABASE_ACCESS_TOKEN")) {
+          ok("SUPABASE_ACCESS_TOKEN already set on the repo — leaving it.");
+        } else {
+          info("A Supabase access token lets the deploy workflow push to your project.");
+          await maybeOpen("Supabase access tokens", "https://supabase.com/dashboard/account/tokens");
+          const sbToken = await askSecret("Paste a Supabase access token:");
+          if (!await runIn("gh", ["secret", "set", "SUPABASE_ACCESS_TOKEN", "--repo", repo], sbToken)) allSet = false;
+        }
+        if (!await run("gh", ["secret", "set", "SUPABASE_PROJECT_REF", "--repo", repo, "--body", ref])) allSet = false;
+
+        // (b) Optional allowlist — pin the workflow to this project. Don't clobber an existing
+        //     list (a shared repo serving several couples sets DEPLOY_ALLOWED_REFS deliberately).
+        if ((await capture("gh", ["variable", "list", "--repo", repo])).out.includes("DEPLOY_ALLOWED_REFS")) {
+          info("DEPLOY_ALLOWED_REFS already exists — add this ref to it by hand if you allowlist targets.");
+        } else {
+          await run("gh", ["variable", "set", "DEPLOY_ALLOWED_REFS", "--repo", repo, "--body", ref]);
+        }
+
+        // (c) Bot function secrets — read at boot, so they go into .env (0600) and get pushed
+        //     here, before the deploy step. The PAT lives only in .env, never on the argv.
+        info("Finally, a GitHub token lets the BOT dispatch the deploy: a fine-grained PAT");
+        info("   on THIS repo with Actions: Read and write.");
+        await maybeOpen("New fine-grained token", "https://github.com/settings/personal-access-tokens/new");
+        const ghToken = await askSecret("Paste the GitHub deploy token (Actions: read+write):");
+        values.GITHUB_REPO = repo;
+        values.GITHUB_DEPLOY_BRANCH = "main";
+        values.GITHUB_DEPLOY_TOKEN = ghToken;
+        await writeEnv(values);
+        if (!await run("supabase", ["secrets", "set", "--env-file", ENV_FILE, "--project-ref", ref])) allSet = false;
+
+        if (allSet) {
+          ok("/update configured — the deploy below will boot the bot with it enabled.");
+          state.done = [...new Set([...state.done, "update"])];
+          await saveState(state);
+        } else {
+          warn("Some /update settings didn't apply — see the errors above; re-run setup to retry.");
+        }
+      }
+    }
+  } else {
+    dim("Skipped /update. You can enable it later — see the README's “Self-deploy from Telegram” section.");
+  }
+
+  // Step 11 - gate + deploy + smoke
+  step(11, "Deploy the bot");
   if (!await gate()) {
     err("Pre-deploy gate failed — not deploying. See the errors above.");
     Deno.exit(1);
@@ -609,8 +693,8 @@ async function main() {
   }
   dim(`Tip: tag this build as a rollback point — git tag ${ver ?? "vNN"}`);
 
-  // Step 11 - webhook + manual test
-  step(11, "Connect Telegram + final test");
+  // Step 12 - webhook + manual test
+  step(12, "Connect Telegram + final test");
   const hookUrl = `https://${ref}.supabase.co/functions/v1/${FUNCTION}`;
   const set = `https://api.telegram.org/bot${values.TELEGRAM_BOT_TOKEN}/setWebhook` +
     `?url=${encodeURIComponent(hookUrl)}&secret_token=${encodeURIComponent(values.WEBHOOK_SECRET)}`;
