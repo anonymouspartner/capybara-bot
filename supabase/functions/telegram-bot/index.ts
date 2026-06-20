@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v51";
+const BUILD_VERSION = "v52";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -37,8 +37,8 @@ const SELF_PROJECT_REF = (() => {
 // /backfill runs as a time-boxed background grind: each tap annotates pending sides in
 // small concurrent waves until the backlog is empty or the budget is hit (kept under the
 // edge function's wall-clock limit so the final report still sends). Re-tap to continue.
-const BACKFILL_BUDGET_MS = 90_000;
-const BACKFILL_CONCURRENCY = 5;
+const BACKFILL_BUDGET_MS = 120_000;
+const BACKFILL_CONCURRENCY = 10;
 const BACKFILL_TRANSLATIONS_BATCH_SIZE = 25;
 const CYRILLIC_SKIP_THRESHOLD = 0.5;
 
