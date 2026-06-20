@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v48";
+const BUILD_VERSION = "v49";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -26,6 +26,13 @@ const GITHUB_DEPLOY_TOKEN = Deno.env.get("GITHUB_DEPLOY_TOKEN") ?? "";
 const GITHUB_REPO = Deno.env.get("GITHUB_REPO") ?? ""; // "owner/name"
 const GITHUB_DEPLOY_BRANCH = Deno.env.get("GITHUB_DEPLOY_BRANCH") ?? "main";
 const GITHUB_DEPLOY_WORKFLOW = "deploy.yml";
+// This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
+// (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
+// deploys to THIS couple's project — not whatever single project the repo's default
+// SUPABASE_PROJECT_REF secret points at. Lets several couples share one repo + token.
+const SELF_PROJECT_REF = (() => {
+  try { return new URL(SUPABASE_URL).hostname.split(".")[0]; } catch { return ""; }
+})();
 
 const BACKFILL_BATCH_SIZE = 15;
 const BACKFILL_TRANSLATIONS_BATCH_SIZE = 25;
@@ -1520,7 +1527,12 @@ async function triggerDeploy(): Promise<{ ok: boolean; status: number; body?: st
       "User-Agent": "capybara-bot", // GitHub's REST API rejects requests without a User-Agent
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ ref: GITHUB_DEPLOY_BRANCH, inputs: { confirm: "deploy" } }),
+    body: JSON.stringify({
+      ref: GITHUB_DEPLOY_BRANCH,
+      // Target THIS instance's project; omit when unparseable so the workflow falls
+      // back to its default SUPABASE_PROJECT_REF secret (prior single-project behavior).
+      inputs: { confirm: "deploy", ...(SELF_PROJECT_REF ? { project_ref: SELF_PROJECT_REF } : {}) },
+    }),
   });
   if (resp.status === 204) return { ok: true, status: 204 };
   const body = await resp.text().catch(() => "<no body>");
