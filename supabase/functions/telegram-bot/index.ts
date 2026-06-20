@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v50";
+const BUILD_VERSION = "v51";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -34,7 +34,11 @@ const SELF_PROJECT_REF = (() => {
   try { return new URL(SUPABASE_URL).hostname.split(".")[0]; } catch { return ""; }
 })();
 
-const BACKFILL_BATCH_SIZE = 15;
+// /backfill runs as a time-boxed background grind: each tap annotates pending sides in
+// small concurrent waves until the backlog is empty or the budget is hit (kept under the
+// edge function's wall-clock limit so the final report still sends). Re-tap to continue.
+const BACKFILL_BUDGET_MS = 90_000;
+const BACKFILL_CONCURRENCY = 5;
 const BACKFILL_TRANSLATIONS_BATCH_SIZE = 25;
 const CYRILLIC_SKIP_THRESHOLD = 0.5;
 
@@ -1300,45 +1304,59 @@ async function handleForget(msg: any, user: any) {
 
 async function handleBackfill(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
-  // Fetch pending sides via DB anti-join \u2014 avoids loading full tables into memory.
-  // Probe one extra row to know whether more work remains beyond this batch.
-  const PROBE = BACKFILL_BATCH_SIZE + 1;
-  const { data: pendingRows, error: pendingErr } = await supabase
-    .rpc("backfill_pending_sides", { p_batch_size: PROBE });
-  if (pendingErr) {
-    console.error("backfill_pending_sides error:", pendingErr);
+  // 1-row probe so an empty backlog replies instantly without kicking off a background run.
+  const { data: probe, error: probeErr } = await supabase.rpc("backfill_pending_sides", { p_batch_size: 1 });
+  if (probeErr) {
+    console.error("backfill_pending_sides error:", probeErr);
     await sendMessage(msg.chat.id, "Backfill query failed. Check logs.");
     return;
   }
-  if (!pendingRows || pendingRows.length === 0) {
+  if (!probe || probe.length === 0) {
     await sendMessage(msg.chat.id, "\u2705 Backfill complete. 0 sides remaining.");
     return;
   }
-  const hasMore = pendingRows.length > BACKFILL_BATCH_SIZE;
-  const batch = (pendingRows as Array<{ message_id: string; text: string; language: "uk" | "en" }>)
-    .slice(0, BACKFILL_BATCH_SIZE);
-  await sendMessage(msg.chat.id, `\u23f3 Processing ${batch.length}${hasMore ? "+" : " of " + pendingRows.length} remaining sides...`);
-  let succeeded = 0; let failed = 0; let skippedWrongScript = 0;
-  for (const work of batch) {
-    const { cyrillicRatio, letters } = detectScriptRatios(work.text);
-    const wrongScript = letters === 0 ||
-      (work.language === "en" && cyrillicRatio > CYRILLIC_SKIP_THRESHOLD) ||
-      (work.language === "uk" && cyrillicRatio < (1 - CYRILLIC_SKIP_THRESHOLD));
-    if (wrongScript) { skippedWrongScript++; await writeFallbackAnnotation(work.message_id); continue; }
-    try { await annotateMessage(work.message_id, work.text, work.language); succeeded++; }
-    catch (e) { console.error("backfill annotateMessage failed for", work.message_id, work.language, e); failed++; }
+  // Grind in the background so Telegram isn't kept waiting (a slow synchronous handler
+  // would time out the webhook and get retried -> duplicate runs). One tap clears as much
+  // as the time budget allows; the run reports done / re-tap-to-continue at the end.
+  await sendMessage(msg.chat.id, "\u23f3 Backfilling in the background \u2014 I'll report when this run finishes. (Avoid tapping again until then.)");
+  scheduleBackgroundWork("backfillGrind", backfillGrind(msg.chat.id));
+}
+
+// Time-boxed background grind. backfill_pending_sides already returns only annotatable
+// sides (wrong-script/letterless ones are filtered in SQL), so each wave is annotated
+// directly in small concurrent batches. Idempotent across runs \u2014 annotated sides drop out
+// of the pending set \u2014 so a partial/killed run is safely resumed by another /backfill.
+async function backfillGrind(chatId: number) {
+  const startedAt = Date.now();
+  let succeeded = 0; let failed = 0;
+  try {
+    while (Date.now() - startedAt < BACKFILL_BUDGET_MS) {
+      const { data: rows, error } = await supabase
+        .rpc("backfill_pending_sides", { p_batch_size: BACKFILL_CONCURRENCY });
+      if (error) {
+        console.error("backfill_pending_sides error mid-run:", error);
+        await sendMessage(chatId, `Backfill query failed mid-run. Annotated ${succeeded} (${failed} failed) before stopping. Check logs.`);
+        return;
+      }
+      if (!rows || rows.length === 0) break;
+      const results = await Promise.allSettled(
+        (rows as Array<{ message_id: string; text: string; language: "uk" | "en" }>)
+          .map((w) => annotateMessage(w.message_id, w.text, w.language)),
+      );
+      for (const r of results) {
+        if (r.status === "fulfilled") succeeded++;
+        else { failed++; console.error("backfill annotate failed:", r.reason); }
+      }
+    }
+  } catch (e) {
+    console.error("backfillGrind crashed:", e);
   }
-  // Quick remaining check via the same DB function (1-row probe).
-  const { data: stillRows } = await supabase.rpc("backfill_pending_sides", { p_batch_size: 1 });
-  const stillPending = stillRows && stillRows.length > 0;
-  const reply =
-    `\u2705 Batch done.\n` +
-    `Succeeded: ${succeeded}\n` +
-    (skippedWrongScript > 0 ? `Skipped (wrong script): ${skippedWrongScript}\n` : "") +
-    `Failed: ${failed}\n` +
-    `Remaining: ${stillPending ? "yes" : "none"}\n\n` +
-    (stillPending ? `Send the command again to continue. (Avoid tapping the linkified text.)` : `\ud83c\udf89 All done!`);
-  await sendMessage(msg.chat.id, reply);
+  const { data: still } = await supabase.rpc("backfill_pending_sides", { p_batch_size: 1 });
+  const done = !still || still.length === 0;
+  const tail = failed > 0 ? ` (${failed} failed \u2014 check logs)` : "";
+  await sendMessage(chatId, done
+    ? `\ud83c\udf89 Backfill complete! Annotated ${succeeded} side${succeeded === 1 ? "" : "s"} this run${tail}.`
+    : `\u2705 Annotated ${succeeded} side${succeeded === 1 ? "" : "s"} this run${tail}. More remaining \u2014 send /backfill again to continue.`);
 }
 
 async function translateLemmasBatch(
