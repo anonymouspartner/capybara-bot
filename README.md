@@ -307,6 +307,12 @@ build, and — if the live bot is behind — offers a one-tap **Deploy** button 
 the same `deploy.yml` workflow above. You stay in the loop (you tap the button) and the
 predeploy gate + health smoke test still run. The feature is **inert** unless configured.
 
+Each bot passes the workflow its **own** Supabase project ref (read from the injected
+`SUPABASE_URL`), so one repo and one deploy token can serve several instances — every
+`/update` deploys to *that* bot's project, never a shared default. Older builds that don't
+send a ref fall back to the repo's `SUPABASE_PROJECT_REF` secret (the original
+single-project behavior).
+
 It relies on **two separate secret buckets** — mixing these up is the #1 source of trouble:
 
 | Bucket | Where | Keys | Used by |
@@ -333,6 +339,18 @@ The three function secrets:
 - Verify end-to-end by sending **`/update`**: a correct setup replies
   **"Up to date — running vNN, latest is vNN."** Once `main` moves ahead of what's live, the
   same command shows **"Update available …"** plus the one-tap **Deploy** button.
+
+**Running several instances from one repo.** Because each bot passes its own project ref,
+multiple deployments can share this single repo and one `GITHUB_DEPLOY_TOKEN`:
+
+- The repo's `SUPABASE_ACCESS_TOKEN` must be **account-level** — able to reach every target
+  project's org. Projects in *different* orgs are fine, as long as one token covers them all.
+- Optionally set the repo **variable** `DEPLOY_ALLOWED_REFS` (Settings → Secrets and variables
+  → Actions → Variables) to a comma-separated allowlist of permitted project refs. The workflow
+  then refuses any target outside the list, so a leaked deploy token can't push to another
+  project. Leave it unset to allow any ref the access token can reach.
+- The read-only version *check* needs only `GITHUB_REPO` (a public repo's raw file needs no
+  token), so it is always safe to share; only the **Deploy** button needs `GITHUB_DEPLOY_TOKEN`.
 
 ## Reproducibility & determinism
 
