@@ -225,13 +225,16 @@ Expect `"url"` set, `"pending_update_count"` small, and no `"last_error_message"
   just replies *"Update check isn't configured."* To enable it you'd additionally set
   the function secrets `GITHUB_DEPLOY_TOKEN` / `GITHUB_REPO` / `GITHUB_DEPLOY_BRANCH`
   **and** the repo Actions secrets `SUPABASE_ACCESS_TOKEN` / `SUPABASE_PROJECT_REF`
-  (see the README's *Self-deploy from Telegram* section). **Caveat for multiple
-  couples:** `deploy.yml` lives in **one** repo and deploys to whatever single
-  `SUPABASE_PROJECT_REF` that repo's Actions secrets point at — so the one-tap **Deploy**
-  button is only safe on an instance whose repo you control (e.g. your own / a per-couple
-  fork). Pointing several couples' `GITHUB_REPO` at the same shared repo would have every
-  Deploy tap target the *same* project, not their own. The read-only version *check*
-  (needs only `GITHUB_REPO`) is fine to share; the deploy button is not.
+  (see the README's *Self-deploy from Telegram* section). **Multiple couples on one
+  repo:** each bot now passes its **own** project ref (parsed from its `SUPABASE_URL`)
+  to `deploy.yml`, which deploys to that ref and only falls back to the
+  `SUPABASE_PROJECT_REF` secret when no ref is passed. So several couples can share one
+  repo + one deploy token and each Deploy tap still targets its *own* project — provided
+  the repo's `SUPABASE_ACCESS_TOKEN` is an account-level token that covers every target
+  project's org. To harden this, set the repo **variable** `DEPLOY_ALLOWED_REFS` (a
+  comma-separated allowlist of permitted refs); the workflow then refuses any other
+  target, so a leaked deploy token can't push to an arbitrary project. The read-only
+  version *check* needs only `GITHUB_REPO` and never deploys.
 
 ---
 

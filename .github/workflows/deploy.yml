@@ -18,6 +18,10 @@ on:
         description: 'Type "deploy" to confirm you want to deploy to production.'
         required: true
         default: ""
+      project_ref:
+        description: 'Target Supabase project ref (optional; defaults to the SUPABASE_PROJECT_REF repo secret). Lets one bot per couple self-deploy to its own project.'
+        required: false
+        default: ""
 
 jobs:
   deploy:
@@ -39,15 +43,39 @@ jobs:
         with:
           version: latest
 
+      # Resolve the deploy target: the dispatch input (a couple's bot passes its own
+      # ref) or, when empty, the repo's default SUPABASE_PROJECT_REF secret (unchanged
+      # single-project behavior). If the DEPLOY_ALLOWED_REFS repo variable is set
+      # (comma-separated), the target must be a member — a guard so a leaked deploy
+      # token can't dispatch a deploy to an arbitrary project. Unset => no allowlist.
+      - name: Resolve target project ref
+        env:
+          INPUT_REF: ${{ github.event.inputs.project_ref }}
+          DEFAULT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          ALLOWED_REFS: ${{ vars.DEPLOY_ALLOWED_REFS }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-$DEFAULT_REF}"
+          if [ -z "$ref" ]; then echo "FAIL: no target ref (input empty and SUPABASE_PROJECT_REF unset)"; exit 1; fi
+          if [ -n "${ALLOWED_REFS:-}" ]; then
+            case ",${ALLOWED_REFS//[[:space:]]/}," in
+              *",$ref,"*) : ;;
+              *) echo "FAIL: target ref is not in DEPLOY_ALLOWED_REFS"; exit 1 ;;
+            esac
+          fi
+          # Don't echo the ref itself (parity with the masked secret); the deploy step prints the dashboard URL.
+          echo "TARGET_REF=$ref" >> "$GITHUB_ENV"
+          echo "Resolved deploy target."
+
       - name: Deploy the function (committed file only)
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-        run: supabase functions deploy telegram-bot --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}" --no-verify-jwt
+        run: supabase functions deploy telegram-bot --project-ref "$TARGET_REF" --no-verify-jwt
 
       - name: Smoke-test the health route
         run: |
           set -euo pipefail
-          ref="${{ secrets.SUPABASE_PROJECT_REF }}"
+          ref="$TARGET_REF"
           ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' supabase/functions/telegram-bot/index.ts | head -1)
           body=$(curl -fsS "https://${ref}.supabase.co/functions/v1/telegram-bot?health")
           echo "health: $body"
