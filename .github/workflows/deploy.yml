@@ -67,6 +67,23 @@ jobs:
           echo "TARGET_REF=$ref" >> "$GITHUB_ENV"
           echo "Resolved deploy target."
 
+      - name: Verify BUILD_VERSION was bumped
+        run: |
+          set -euo pipefail
+          file_ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' supabase/functions/telegram-bot/index.ts | head -1)
+          if [ -z "$file_ver" ]; then echo "FAIL: could not find BUILD_VERSION in index.ts"; exit 1; fi
+          # Fetch live version from health endpoint (gracefully skipped on first deploy)
+          live_json=$(curl -fsS "https://${TARGET_REF}.supabase.co/functions/v1/telegram-bot?health" 2>/dev/null || echo '{}')
+          live_ver=$(echo "$live_json" | grep -o '"version":"[^"]*"' | head -1 | sed 's/"version":"//;s/"//')
+          if [ -z "$live_ver" ]; then
+            echo "Health endpoint unreachable (first deploy?). Skipping version bump check."
+          elif [ "$file_ver" = "$live_ver" ]; then
+            echo "FAIL: BUILD_VERSION ('$file_ver') matches the live version. Bump BUILD_VERSION before deploying."
+            exit 1
+          else
+            echo "Version check passed: deploying '$file_ver' (live is '$live_ver')."
+          fi
+
       - name: Deploy the function (committed file only)
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
