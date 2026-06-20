@@ -1,5 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
-import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.30.0";
+import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.33.1";
 
 const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v49";
+const BUILD_VERSION = "v50";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -157,33 +157,37 @@ async function handleUpdate(update: any) {
     );
     return;
   }
-  if (msg.text === "/start") {
-    await sendMessage(msg.chat.id,
-      `Hi ${user.display_name}! Send me text or voice messages in ${user.native_language === "en" ? "English" : "Ukrainian"}, ` +
-      `and I'll translate them to ${user.learning_language === "en" ? "English" : "Ukrainian"}.\n\n` +
-      `You can also send photos and videos — I'll forward them straight to your partner.\n\n` +
-      `Everything is saved as a study corpus.\n\n` +
-      `Type /help to see what I can do.`
-    );
-    return;
+  // Command dispatch table — to add a command, append one entry here.
+  type Cmd = { match: (t: string) => boolean; handle: (m: any, u: any) => Promise<void> };
+  const COMMANDS: Cmd[] = [
+    { match: t => t === "/start", handle: async (m, u) => { await sendMessage(m.chat.id,
+        `Hi ${u.display_name}! Send me text or voice messages in ${u.native_language === "en" ? "English" : "Ukrainian"}, ` +
+        `and I'll translate them to ${u.learning_language === "en" ? "English" : "Ukrainian"}.\n\n` +
+        `You can also send photos and videos — I'll forward them straight to your partner.\n\n` +
+        `Everything is saved as a study corpus.\n\nType /help to see what I can do.`); } },
+    { match: t => t === "/help",                                                        handle: handleHelp },
+    { match: t => t === "/vocab",                                                       handle: handleVocab },
+    { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
+    { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
+    { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
+    { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
+    { match: t => t === "/backfill",                                                     handle: handleBackfill },
+    { match: t => t === "/diag",                                                         handle: handleDiag },
+    { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
+    { match: t => t === "/reconcile" || t.startsWith("/reconcile@"),                    handle: handleReconcile },
+    { match: t => t === "/restore" || t.startsWith("/restore@"),                        handle: handleRestore },
+    { match: t => t === "/pin" || t.startsWith("/pin@"),                                handle: handlePin },
+    { match: t => t === "/unpin" || t.startsWith("/unpin@"),                            handle: handleUnpin },
+    { match: t => t === "/pinned" || t.startsWith("/pinned@"),                          handle: handlePinned },
+    { match: t => t === "/remember" || t.startsWith("/remember ") || t.startsWith("/remember@"), handle: handleRemember },
+    { match: t => t === "/recap_backfill" || t.startsWith("/recap_backfill@"),          handle: handleRecapBackfill },
+    { match: t => t === "/recap" || t.startsWith("/recap ") || t.startsWith("/recap@"),  handle: handleRecap },
+  ];
+  if (msg.text) {
+    for (const cmd of COMMANDS) {
+      if (cmd.match(msg.text)) { await cmd.handle(msg, user); return; }
+    }
   }
-  if (msg.text === "/help") { await handleHelp(msg, user); return; }
-  if (msg.text === "/vocab") { await handleVocab(msg, user); return; }
-  if (msg.text === "/learn" || msg.text?.startsWith("/learn ") || msg.text?.startsWith("/learn@")) { await handleLearn(msg, user); return; }
-  if (msg.text === "/forget" || msg.text?.startsWith("/forget ") || msg.text?.startsWith("/forget@")) { await handleForget(msg, user); return; }
-  if (msg.text === "/export" || msg.text?.startsWith("/export@")) { await handleExport(msg, user); return; }
-  if (msg.text === "/backfill_translations") { await handleBackfillTranslations(msg, user); return; }
-  if (msg.text === "/backfill") { await handleBackfill(msg, user); return; }
-  if (msg.text === "/diag") { await handleDiag(msg, user); return; }
-  if (msg.text === "/update" || msg.text?.startsWith("/update@")) { await handleUpdateCommand(msg, user); return; }
-  if (msg.text === "/reconcile" || msg.text?.startsWith("/reconcile@")) { await handleReconcile(msg, user); return; }
-  if (msg.text === "/restore" || msg.text?.startsWith("/restore@")) { await handleRestore(msg, user); return; }
-  if (msg.text === "/pin" || msg.text?.startsWith("/pin@")) { await handlePin(msg, user); return; }
-  if (msg.text === "/unpin" || msg.text?.startsWith("/unpin@")) { await handleUnpin(msg, user); return; }
-  if (msg.text === "/pinned" || msg.text?.startsWith("/pinned@")) { await handlePinned(msg, user); return; }
-  if (msg.text === "/remember" || msg.text?.startsWith("/remember ") || msg.text?.startsWith("/remember@")) { await handleRemember(msg, user); return; }
-  if (msg.text === "/recap_backfill" || msg.text?.startsWith("/recap_backfill@")) { await handleRecapBackfill(msg, user); return; }
-  if (msg.text === "/recap" || msg.text?.startsWith("/recap ") || msg.text?.startsWith("/recap@")) { await handleRecap(msg, user); return; }
   if (msg.voice) { await handleVoiceMessage(msg, user); }
   else if (msg.video || msg.video_note) { await handleVideoMessage(msg, user); }
   else if (msg.photo) { await handlePhotoMessage(msg, user); }
@@ -198,7 +202,11 @@ async function lookupUser(tgUser: any) {
 }
 
 async function lookupPartner(userId: string) {
-  const { data, error } = await supabase.from("users").select("*").neq("id", userId).maybeSingle();
+  // Use complementary native_language instead of .neq("id") so a stray 3rd row never breaks things.
+  const { data: self } = await supabase.from("users").select("native_language").eq("id", userId).single();
+  if (!self) return null;
+  const partnerLang = self.native_language === "en" ? "uk" : "en";
+  const { data, error } = await supabase.from("users").select("*").eq("native_language", partnerLang).maybeSingle();
   if (error) { console.error("lookupPartner failed:", error); return null; }
   return data;
 }
@@ -322,7 +330,7 @@ async function handleTextMessage(msg: any, user: any) {
     await sendMessage(msg.chat.id, `\ud83d\udd24 Translation (${translationTargetLang}):\n${translated}`, "Markdown");
     await forwardToPartner(user, originalText, translated!, originalLang, translationTargetLang);
   } else {
-    await sendMessage(msg.chat.id, `\u26a0\ufe0f Translation failed (upstream error). Your message was saved; try again in a moment.\n\n_Details:_ ${LAST_TRANSLATE_ERROR ?? "unknown"}`, "Markdown");
+    await sendMessage(msg.chat.id, `\u26a0\ufe0f Translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} Your message was saved.`);
   }
 
   if (inserted) {
@@ -394,7 +402,7 @@ async function handleVoiceMessage(msg: any, user: any) {
     await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${transcript}\n\n\ud83d\udd24 Translation (${targetLang}):\n${translated}`, "Markdown");
     await forwardVoiceToPartner(user, voice.file_id, transcript, translated!, originalLang, targetLang);
   } else {
-    await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${transcript}\n\n\u26a0\ufe0f Translation failed (upstream error). The transcript was saved.\n\n_Details:_ ${LAST_TRANSLATE_ERROR ?? "unknown"}`, "Markdown");
+    await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${transcript}\n\n\u26a0\ufe0f Translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The transcript was saved.`);
   }
 
   if (inserted) {
@@ -407,6 +415,36 @@ async function handleVoiceMessage(msg: any, user: any) {
 }
 
 let LAST_TRANSLATE_ERROR: string | null = null;
+
+// Maps raw SDK error strings to human-readable messages — never exposes class names to users.
+function friendlyTranslateError(raw: string | null): string {
+  if (!raw) return "upstream error — please try again.";
+  if (raw.includes("529")) return "The AI service is temporarily overloaded; it should recover shortly.";
+  if (raw.includes("429")) return "The AI service is rate-limited; please wait a moment.";
+  if (raw.includes("401") || raw.includes("403")) return "API authentication error.";
+  if (raw.includes("500") || raw.includes("502") || raw.includes("503") || raw.includes("504"))
+    return "The AI service is temporarily unavailable; try again in a minute.";
+  return "upstream error — please try again (details in logs).";
+}
+
+// Retries an async call up to maxAttempts times with exponential backoff.
+// Propagates immediately on non-retryable 4xx errors (excluding 429).
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try { return await fn(); }
+    catch (e) {
+      lastErr = e;
+      const status = (e as any)?.status ?? (e as any)?.statusCode;
+      if (status && status >= 400 && status !== 429 && status < 500) throw e;
+      if (attempt < maxAttempts) {
+        const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr;
+}
 
 async function translate(
   text: string, fromLang: string, toLang: string,
@@ -425,12 +463,12 @@ async function translate(
     : "";
   let result;
   try {
-    result = await anthropic.messages.create({
+    result = await withRetry(() => anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 1024,
       system: `You are a translator between ${langName(fromLang)} and ${langName(toLang)}. Translate the user's message naturally, preserving tone and register. Output ONLY the translation, no preamble or commentary. If the input contains slang, idioms, or culturally-specific phrases, render an equivalent natural expression in the target language.\n\nCRITICAL LANGUAGE RULES:\n- Never produce Russian. The Cyrillic-script language used in this conversation is ALWAYS Ukrainian, never Russian.\n- If the input appears to be Russian, or is ambiguous between Russian and Ukrainian, treat it as Ukrainian and translate accordingly.\n- When the target language is Ukrainian, output standard literary Ukrainian only. Do not use Russian words, Russian spellings, or Russified Ukrainian forms (\u0441\u0443\u0440\u0436\u0438\u043a). Prefer authentically Ukrainian vocabulary over Russian-influenced equivalents.\n- If you are uncertain whether a Cyrillic word is Russian or Ukrainian, assume Ukrainian.${genderClause}`,
       messages: [{ role: "user", content: text }],
-    });
+    }));
   } catch (e) {
     LAST_TRANSLATE_ERROR = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
     console.error("translate API call failed:", e);
@@ -555,12 +593,12 @@ async function annotateMessage(messageId: string, text: string, language: "uk" |
   };
   let result;
   try {
-    result = await anthropic.messages.create({
+    result = await withRetry(() => anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 4096,
       system: buildAnnotationPrompt(language),
       messages: [{ role: "user", content: text }],
-    });
+    }));
   } catch (e) {
     console.error("anthropic API call failed for", messageId, e);
     await writeFallbackRow();
@@ -999,12 +1037,12 @@ async function lemmatize(word: string, language: "uk" | "en"): Promise<string | 
   const langName = language === "uk" ? "Ukrainian" : "English";
   let result;
   try {
-    result = await anthropic.messages.create({
+    result = await withRetry(() => anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 64,
       system: `Return the dictionary (lemma) form of the given ${langName} word.\n- For nouns: nominative singular\n- For verbs: infinitive\n- For adjectives: masculine singular\n\nOutput ONLY raw JSON in the format: {"lemma": "<word>"}\nIf the input is not a recognizable ${langName} word, output: {"lemma": null}\nIf the input is a word in a different language (not ${langName}), also output: {"lemma": null}\nDo NOT wrap in markdown code fences. Do NOT include any preamble.`,
       messages: [{ role: "user", content: word }],
-    });
+    }));
   } catch (e) { console.error("lemmatize API call failed:", e); return null; }
   const block = result.content[0];
   if (block.type !== "text") return null;
@@ -1260,97 +1298,46 @@ async function handleForget(msg: any, user: any) {
   await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${note}`, "Markdown");
 }
 
-async function fetchAnnotatedSidesSet(): Promise<Set<string>> {
-  const result = new Set<string>();
-  const PAGE = 1000;
-  let from = 0;
-  while (true) {
-    const { data, error } = await supabase.from("message_annotations").select("message_id, details").range(from, from + PAGE - 1);
-    if (error) throw error;
-    if (!data || data.length === 0) break;
-    for (const row of data) {
-      const lang = (row.details && (row.details as any).language) || "uk";
-      result.add(`${row.message_id}:${lang}`);
-    }
-    if (data.length < PAGE) break;
-    from += PAGE;
-  }
-  return result;
-}
-
-async function fetchAllAnnotateableMessages(): Promise<any[]> {
-  const out: any[] = [];
-  const PAGE = 1000;
-  let from = 0;
-  while (true) {
-    const { data, error } = await supabase.from("messages")
-      .select("id, original_text, original_language, translated_text, translated_language, created_at")
-      .order("created_at", { ascending: true })
-      .range(from, from + PAGE - 1);
-    if (error) throw error;
-    if (!data || data.length === 0) break;
-    out.push(...data);
-    if (data.length < PAGE) break;
-    from += PAGE;
-  }
-  return out;
-}
-
-function enumerateAnnotationSides(row: any): Array<{ text: string; language: "uk" | "en" }> {
-  const out: Array<{ text: string; language: "uk" | "en" }> = [];
-  if ((row.original_language === "uk" || row.original_language === "en") && row.original_text) {
-    out.push({ text: row.original_text, language: row.original_language });
-  }
-  if ((row.translated_language === "uk" || row.translated_language === "en") && row.translated_text) {
-    out.push({ text: row.translated_text, language: row.translated_language });
-  }
-  return out;
-}
-
 async function handleBackfill(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
-  let candidates: any[];
-  try { candidates = await fetchAllAnnotateableMessages(); }
-  catch (e) { console.error("fetchAllAnnotateableMessages error:", e); await sendMessage(msg.chat.id, "Backfill query failed. Check logs."); return; }
-  let annotatedSides: Set<string>;
-  try { annotatedSides = await fetchAnnotatedSidesSet(); }
-  catch (e) { console.error("fetchAnnotatedSidesSet error:", e); await sendMessage(msg.chat.id, "Could not load annotation index. Check logs."); return; }
-  type Work = { messageId: string; text: string; language: "uk" | "en" };
-  const pending: Work[] = [];
-  for (const row of candidates) {
-    for (const side of enumerateAnnotationSides(row)) {
-      const key = `${row.id}:${side.language}`;
-      if (!annotatedSides.has(key)) pending.push({ messageId: row.id, text: side.text, language: side.language });
-    }
+  // Fetch pending sides via DB anti-join \u2014 avoids loading full tables into memory.
+  // Probe one extra row to know whether more work remains beyond this batch.
+  const PROBE = BACKFILL_BATCH_SIZE + 1;
+  const { data: pendingRows, error: pendingErr } = await supabase
+    .rpc("backfill_pending_sides", { p_batch_size: PROBE });
+  if (pendingErr) {
+    console.error("backfill_pending_sides error:", pendingErr);
+    await sendMessage(msg.chat.id, "Backfill query failed. Check logs.");
+    return;
   }
-  const totalRemaining = pending.length;
-  if (totalRemaining === 0) { await sendMessage(msg.chat.id, "\u2705 Backfill complete. 0 sides remaining."); return; }
-  const batch = pending.slice(0, BACKFILL_BATCH_SIZE);
-  await sendMessage(msg.chat.id, `\u23f3 Processing ${batch.length} of ${totalRemaining} remaining (across both languages)...`);
+  if (!pendingRows || pendingRows.length === 0) {
+    await sendMessage(msg.chat.id, "\u2705 Backfill complete. 0 sides remaining.");
+    return;
+  }
+  const hasMore = pendingRows.length > BACKFILL_BATCH_SIZE;
+  const batch = (pendingRows as Array<{ message_id: string; text: string; language: "uk" | "en" }>)
+    .slice(0, BACKFILL_BATCH_SIZE);
+  await sendMessage(msg.chat.id, `\u23f3 Processing ${batch.length}${hasMore ? "+" : " of " + pendingRows.length} remaining sides...`);
   let succeeded = 0; let failed = 0; let skippedWrongScript = 0;
   for (const work of batch) {
     const { cyrillicRatio, letters } = detectScriptRatios(work.text);
     const wrongScript = letters === 0 ||
       (work.language === "en" && cyrillicRatio > CYRILLIC_SKIP_THRESHOLD) ||
       (work.language === "uk" && cyrillicRatio < (1 - CYRILLIC_SKIP_THRESHOLD));
-    if (wrongScript) { skippedWrongScript++; await writeFallbackAnnotation(work.messageId); continue; }
-    try { await annotateMessage(work.messageId, work.text, work.language); succeeded++; }
-    catch (e) { console.error("backfill annotateMessage failed for", work.messageId, work.language, e); failed++; }
+    if (wrongScript) { skippedWrongScript++; await writeFallbackAnnotation(work.message_id); continue; }
+    try { await annotateMessage(work.message_id, work.text, work.language); succeeded++; }
+    catch (e) { console.error("backfill annotateMessage failed for", work.message_id, work.language, e); failed++; }
   }
-  const annotatedAfter = await fetchAnnotatedSidesSet();
-  let stillPending = 0;
-  for (const row of candidates) {
-    for (const side of enumerateAnnotationSides(row)) {
-      if (!annotatedAfter.has(`${row.id}:${side.language}`)) stillPending++;
-    }
-  }
+  // Quick remaining check via the same DB function (1-row probe).
+  const { data: stillRows } = await supabase.rpc("backfill_pending_sides", { p_batch_size: 1 });
+  const stillPending = stillRows && stillRows.length > 0;
   const reply =
     `\u2705 Batch done.\n` +
     `Succeeded: ${succeeded}\n` +
     (skippedWrongScript > 0 ? `Skipped (wrong script): ${skippedWrongScript}\n` : "") +
     `Failed: ${failed}\n` +
-    `Verified remaining: ${stillPending}\n\n` +
-    (stillPending > 0 ? `Send the command again to continue. (Avoid tapping the linkified text.)` : `\ud83c\udf89 All done!`);
+    `Remaining: ${stillPending ? "yes" : "none"}\n\n` +
+    (stillPending ? `Send the command again to continue. (Avoid tapping the linkified text.)` : `\ud83c\udf89 All done!`);
   await sendMessage(msg.chat.id, reply);
 }
 
@@ -1415,19 +1402,6 @@ async function translateLemmasBatch(
 
 async function handleBackfillTranslations(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
-  const { count: totalRemaining, error: countErr } = await supabase
-    .from("vocabulary")
-    .select("id", { count: "exact", head: true })
-    .is("lemma_translation", null);
-  if (countErr) {
-    console.error("backfill_translations count failed:", countErr);
-    await sendMessage(msg.chat.id, "Couldn't count remaining vocabulary rows. Check logs.");
-    return;
-  }
-  if (!totalRemaining || totalRemaining === 0) {
-    await sendMessage(msg.chat.id, "\u2705 All vocabulary rows already have a lemma_translation. Nothing to do.");
-    return;
-  }
   const { data: rows, error } = await supabase
     .from("vocabulary")
     .select("id, lemma, part_of_speech, language")
@@ -1443,7 +1417,7 @@ async function handleBackfillTranslations(msg: any, user: any) {
     await sendMessage(msg.chat.id, "\u2705 No more rows to backfill.");
     return;
   }
-  await sendMessage(msg.chat.id, `\u23f3 Translating ${rows.length} of ${totalRemaining} remaining...`);
+  await sendMessage(msg.chat.id, `\u23f3 Translating ${rows.length} rows...`);
   const ukItems = rows.filter((r: any) => r.language === "uk");
   const enItems = rows.filter((r: any) => r.language === "en");
   const [ukMap, enMap] = await Promise.all([
@@ -1453,16 +1427,16 @@ async function handleBackfillTranslations(msg: any, user: any) {
   const updates = [...ukMap.entries(), ...enMap.entries()];
   let succeeded = 0;
   let failed = 0;
-  for (const [id, translation] of updates) {
-    const { error: updErr } = await supabase
+  if (updates.length > 0) {
+    const upsertRows = updates.map(([id, translation]) => ({ id, lemma_translation: translation }));
+    const { error: upsertErr } = await supabase
       .from("vocabulary")
-      .update({ lemma_translation: translation })
-      .eq("id", id);
-    if (updErr) {
-      console.error("backfill_translations update failed for id", id, updErr);
-      failed++;
+      .upsert(upsertRows, { onConflict: "id" });
+    if (upsertErr) {
+      console.error("backfill_translations upsert failed:", upsertErr);
+      failed = updates.length;
     } else {
-      succeeded++;
+      succeeded = updates.length;
     }
   }
   const untranslated = rows.length - (ukMap.size + enMap.size);
@@ -1623,11 +1597,8 @@ async function handleDiag(msg: any, user: any) {
 
   const anthropicStart = Date.now();
   try {
-    await anthropic.messages.create({
-      model: CLAUDE_MODEL,
-      max_tokens: 1,
-      messages: [{ role: "user", content: "hi" }],
-    });
+    // models.list() is a free API call \u2014 no tokens spent, same connectivity check.
+    await anthropic.models.list();
     lines.push(`\u2705 Anthropic OK (${Date.now() - anthropicStart}ms)`);
   } catch (e) {
     lines.push(`\u274c Anthropic FAIL: ${e instanceof Error ? e.message : String(e)}`);
@@ -1691,60 +1662,64 @@ async function handleDiag(msg: any, user: any) {
 }
 
 async function embedText(text: string): Promise<number[] | null> {
-  let resp: Response;
-  try {
-    resp = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
-    });
-  } catch (e) {
-    console.error("embedText transport failed:", e);
-    return null;
+  const MAX = 3;
+  for (let attempt = 1; attempt <= MAX; attempt++) {
+    let resp: Response;
+    try {
+      resp = await fetch("https://api.openai.com/v1/embeddings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_KEY}` },
+        body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
+      });
+    } catch (e) {
+      if (attempt < MAX) { await new Promise((r) => setTimeout(r, 1000 * attempt)); continue; }
+      console.error("embedText transport failed:", e); return null;
+    }
+    if (resp.status === 429 || resp.status >= 500) {
+      if (attempt < MAX) { await new Promise((r) => setTimeout(r, 1000 * attempt)); continue; }
+      console.error("embedText HTTP", resp.status, await resp.text().catch(() => "")); return null;
+    }
+    if (!resp.ok) { console.error("embedText HTTP", resp.status, await resp.text().catch(() => "")); return null; }
+    const data = await resp.json().catch(() => null);
+    const emb = data?.data?.[0]?.embedding;
+    if (!Array.isArray(emb) || emb.length !== EMBEDDING_DIM) { console.error("embedText: malformed response"); return null; }
+    return emb as number[];
   }
-  if (!resp.ok) {
-    console.error("embedText HTTP", resp.status, await resp.text().catch(() => ""));
-    return null;
-  }
-  const data = await resp.json().catch(() => null);
-  const emb = data?.data?.[0]?.embedding;
-  if (!Array.isArray(emb) || emb.length !== EMBEDDING_DIM) {
-    console.error("embedText: malformed response");
-    return null;
-  }
-  return emb as number[];
+  return null;
 }
 
 async function embedTextsBatch(texts: string[]): Promise<(number[] | null)[]> {
   if (texts.length === 0) return [];
-  let resp: Response;
-  try {
-    resp = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts }),
-    });
-  } catch (e) {
-    console.error("embedTextsBatch transport failed:", e);
-    return texts.map(() => null);
-  }
-  if (!resp.ok) {
-    console.error("embedTextsBatch HTTP", resp.status, await resp.text().catch(() => ""));
-    return texts.map(() => null);
-  }
-  const data = await resp.json().catch(() => null);
-  const items = data?.data;
-  if (!Array.isArray(items)) {
-    console.error("embedTextsBatch: malformed response");
-    return texts.map(() => null);
-  }
-  const out: (number[] | null)[] = texts.map(() => null);
-  for (const item of items) {
-    if (typeof item?.index === "number" && Array.isArray(item.embedding) && item.embedding.length === EMBEDDING_DIM) {
-      out[item.index] = item.embedding as number[];
+  const MAX = 3;
+  for (let attempt = 1; attempt <= MAX; attempt++) {
+    let resp: Response;
+    try {
+      resp = await fetch("https://api.openai.com/v1/embeddings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_KEY}` },
+        body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts }),
+      });
+    } catch (e) {
+      if (attempt < MAX) { await new Promise((r) => setTimeout(r, 1000 * attempt)); continue; }
+      console.error("embedTextsBatch transport failed:", e); return texts.map(() => null);
     }
+    if (resp.status === 429 || resp.status >= 500) {
+      if (attempt < MAX) { await new Promise((r) => setTimeout(r, 1000 * attempt)); continue; }
+      console.error("embedTextsBatch HTTP", resp.status, await resp.text().catch(() => "")); return texts.map(() => null);
+    }
+    if (!resp.ok) { console.error("embedTextsBatch HTTP", resp.status, await resp.text().catch(() => "")); return texts.map(() => null); }
+    const data = await resp.json().catch(() => null);
+    const items = data?.data;
+    if (!Array.isArray(items)) { console.error("embedTextsBatch: malformed response"); return texts.map(() => null); }
+    const out: (number[] | null)[] = texts.map(() => null);
+    for (const item of items) {
+      if (typeof item?.index === "number" && Array.isArray(item.embedding) && item.embedding.length === EMBEDDING_DIM) {
+        out[item.index] = item.embedding as number[];
+      }
+    }
+    return out;
   }
-  return out;
+  return texts.map(() => null);
 }
 
 function vectorLiteral(emb: number[]): string {

@@ -32,6 +32,7 @@
     "https://esm.sh/@anthropic-ai/sdk@0.30.0/denonext/streaming.mjs": "ba5475fba81a1caba06e93a94674e65c8e65a8e2c97235f7c37acf549eda8c1c",
     "https://esm.sh/@anthropic-ai/sdk@0.30.0/denonext/uploads.mjs": "e3e1fd90875fa81c1d6a0fb9de51dd1050249866394240c89a1a181e1cfead46",
     "https://esm.sh/@anthropic-ai/sdk@0.30.0/denonext/version.mjs": "13b15bbd5ce64e1217bbde3b982de25a3db369fd793cf482129c3bd0a74cfad2",
+    "https://esm.sh/@anthropic-ai/sdk@0.33.1": "e0d36680ffb1eb02473e965ad43dc97b54397ea09698e161abf7d1b3008afe84",
     "https://esm.sh/@supabase/auth-js@2.108.1/denonext/auth-js.mjs": "7444f8b83853c22f4547fe8e385d3c1ff7b646ad07af0e268efc4a45c2b0767c",
     "https://esm.sh/@supabase/functions-js@2.108.1/denonext/functions-js.mjs": "8281d7c05253d84450217f5b76c0b2076705a5388429aa4b582c0aa6cd4c9d27",
     "https://esm.sh/@supabase/phoenix@0.4.2/denonext/phoenix.mjs": "8099a9b1277ec1776f0d0ae15e35be72b87b541a3f787b5477a11b546c8d62a9",
