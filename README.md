@@ -215,8 +215,8 @@ deno run -A setup.ts
 It walks you through the whole setup one question at a time: it guides the steps that must
 be done in a browser/app (create the bot, create the Supabase project, get API keys) and
 automates the rest (generates `WEBHOOK_SECRET`, writes `.env`, applies the migration,
-creates the bucket, seeds the couple, sets secrets, deploys, sets the webhook, smoke-tests).
-It's idempotent and resumable.
+creates the bucket, seeds the couple, sets secrets, **optionally wires up one-tap `/update`
+self-deploy**, deploys, sets the webhook, smoke-tests). It's idempotent and resumable.
 
 **Prefer a local machine?** Install **Deno** + the **Supabase CLI** and run the same
 `deno run -A setup.ts`. Or do it by hand — follow
@@ -233,6 +233,8 @@ for a menu. In brief:
 8. Seed with **`seed_couple.sql`**.
 9. Set the Telegram webhook to the function URL with `secret_token = WEBHOOK_SECRET`.
 10. Smoke-test (`/help`, a translation each way, `/remember` → `/recap`, `/pin`/`/pinned`).
+11. _(Optional)_ Enable one-tap **`/update`** self-deploy from Telegram — see the
+    **Self-deploy from Telegram (`/update`)** section below.
 
 > New couples start with an **empty corpus**, so the `/backfill*` commands don't apply.
 
@@ -256,8 +258,8 @@ smoke-tests the health route. It runs **only** on manual dispatch — never on p
 it stays safe on a public repo. It needs two repo secrets (Settings → Secrets and
 variables → Actions): `SUPABASE_ACCESS_TOKEN` (from supabase.com/dashboard/account/tokens)
 and `SUPABASE_PROJECT_REF`. The bot's function secrets stay on Supabase — a code deploy
-never touches them. (The `setup.ts` wizard can set these two repo secrets for you if `gh`
-is installed.)
+never touches them. (The `setup.ts` wizard can set these two repo secrets — and the rest of
+`/update` self-deploy — for you when `gh` is installed; it's an optional step in the wizard.)
 
 ### Fallback: deploy from your laptop (offline / first-time setup)
 

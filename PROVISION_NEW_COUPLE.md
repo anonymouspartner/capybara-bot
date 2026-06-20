@@ -222,10 +222,12 @@ Expect `"url"` set, `"pending_update_count"` small, and no `"last_error_message"
   instance yourself, one at a time, your own instance first.
 - **`/update` self-deploy is off by default.** The admin `/update` command is **inert**
   for a new couple — the five secrets above don't include the `GITHUB_*` ones, so it
-  just replies *"Update check isn't configured."* To enable it you'd additionally set
-  the function secrets `GITHUB_DEPLOY_TOKEN` / `GITHUB_REPO` / `GITHUB_DEPLOY_BRANCH`
-  **and** the repo Actions secrets `SUPABASE_ACCESS_TOKEN` / `SUPABASE_PROJECT_REF`
-  (see the README's *Self-deploy from Telegram* section). **Multiple couples on one
+  just replies *"Update check isn't configured."* The **`setup.ts` wizard offers to set
+  this up for you** (an optional step, run before the deploy so the bot boots with it
+  enabled). To do it by hand instead, set the function secrets `GITHUB_DEPLOY_TOKEN` /
+  `GITHUB_REPO` / `GITHUB_DEPLOY_BRANCH` **and** the repo Actions secrets
+  `SUPABASE_ACCESS_TOKEN` / `SUPABASE_PROJECT_REF` (see the README's *Self-deploy from
+  Telegram* section) — then **redeploy**, since `GITHUB_*` are read at boot. **Multiple couples on one
   repo:** each bot now passes its **own** project ref (parsed from its `SUPABASE_URL`)
   to `deploy.yml`, which deploys to that ref and only falls back to the
   `SUPABASE_PROJECT_REF` secret when no ref is passed. So several couples can share one
