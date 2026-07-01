@@ -8,11 +8,20 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v52";
+const BUILD_VERSION = "v53";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
-const CLAUDE_MODEL = "claude-sonnet-4-6";
+// CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
+// vocabulary annotation, and dictionary-form translation. Opus 4.8 is the strongest
+// current model for nuanced EN<->UK work (register, Ukrainian gender agreement,
+// literary-Ukrainian / no-Russian discipline) and grounded /recap synthesis; at this
+// bot's one-couple volume its cost is negligible. It replaces the prior claude-sonnet-4-6,
+// which is a generation behind. CLAUDE_HAIKU_MODEL stays on the cheap/fast tier for the
+// trivial /recap query parser (structured-JSON classification) -- Haiku 4.5 is already
+// optimal there and, unlike Sonnet 5, has no adaptive-thinking-by-default that would
+// prepend a thinking block ahead of the JSON the parser expects.
+const CLAUDE_MODEL = "claude-opus-4-8";
 const CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
 const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));
@@ -599,7 +608,7 @@ async function annotateMessage(messageId: string, text: string, language: "uk" |
   try {
     result = await withRetry(() => anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 4096,
+      max_tokens: 8192,
       system: buildAnnotationPrompt(language),
       messages: [{ role: "user", content: text }],
     }));
@@ -1043,7 +1052,7 @@ async function lemmatize(word: string, language: "uk" | "en"): Promise<string | 
   try {
     result = await withRetry(() => anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 64,
+      max_tokens: 128,
       system: `Return the dictionary (lemma) form of the given ${langName} word.\n- For nouns: nominative singular\n- For verbs: infinitive\n- For adjectives: masculine singular\n\nOutput ONLY raw JSON in the format: {"lemma": "<word>"}\nIf the input is not a recognizable ${langName} word, output: {"lemma": null}\nIf the input is a word in a different language (not ${langName}), also output: {"lemma": null}\nDo NOT wrap in markdown code fences. Do NOT include any preamble.`,
       messages: [{ role: "user", content: word }],
     }));
@@ -1388,7 +1397,7 @@ async function translateLemmasBatch(
   try {
     result = await anthropic.messages.create({
       model: CLAUDE_MODEL,
-      max_tokens: 4096,
+      max_tokens: 8192,
       system,
       messages: [{ role: "user", content: lines }],
     });
