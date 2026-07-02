@@ -1,5 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
-import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.33.1";
+import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.39.0";
 
 const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
@@ -8,20 +8,22 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v53";
+const BUILD_VERSION = "v54";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
-// vocabulary annotation, and dictionary-form translation. Opus 4.8 is the strongest
-// current model for nuanced EN<->UK work (register, Ukrainian gender agreement,
-// literary-Ukrainian / no-Russian discipline) and grounded /recap synthesis; at this
-// bot's one-couple volume its cost is negligible. It replaces the prior claude-sonnet-4-6,
-// which is a generation behind. CLAUDE_HAIKU_MODEL stays on the cheap/fast tier for the
-// trivial /recap query parser (structured-JSON classification) -- Haiku 4.5 is already
-// optimal there and, unlike Sonnet 5, has no adaptive-thinking-by-default that would
-// prepend a thinking block ahead of the JSON the parser expects.
-const CLAUDE_MODEL = "claude-opus-4-8";
+// vocabulary annotation, and dictionary-form translation. Sonnet 5 replaces Opus 4.8
+// after a live benchmark on this bot's real call shapes (scripts/model_latency_bench.py):
+// ~1.2x faster at median latency, with the /backfill annotate path (1.3x) the win that
+// matters most. Sonnet 5 enables adaptive thinking BY DEFAULT, which would prepend a
+// thinking block ahead of the text/JSON the parsers expect -- so every CLAUDE_MODEL
+// call sends thinking: {type: "disabled"}, and every response reader finds the first
+// text block instead of assuming content[0]. If translation quality (register, gender
+// agreement, no-Russian discipline) regresses vs Opus 4.8, this is the constant to
+// revert. CLAUDE_HAIKU_MODEL stays on the cheap/fast tier for the trivial /recap
+// query parser (structured-JSON classification).
+const CLAUDE_MODEL = "claude-sonnet-5";
 const CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
 const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));
@@ -479,6 +481,7 @@ async function translate(
     result = await withRetry(() => anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 1024,
+      thinking: { type: "disabled" },
       system: `You are a translator between ${langName(fromLang)} and ${langName(toLang)}. Translate the user's message naturally, preserving tone and register. Output ONLY the translation, no preamble or commentary. If the input contains slang, idioms, or culturally-specific phrases, render an equivalent natural expression in the target language.\n\nCRITICAL LANGUAGE RULES:\n- Never produce Russian. The Cyrillic-script language used in this conversation is ALWAYS Ukrainian, never Russian.\n- If the input appears to be Russian, or is ambiguous between Russian and Ukrainian, treat it as Ukrainian and translate accordingly.\n- When the target language is Ukrainian, output standard literary Ukrainian only. Do not use Russian words, Russian spellings, or Russified Ukrainian forms (\u0441\u0443\u0440\u0436\u0438\u043a). Prefer authentically Ukrainian vocabulary over Russian-influenced equivalents.\n- If you are uncertain whether a Cyrillic word is Russian or Ukrainian, assume Ukrainian.${genderClause}`,
       messages: [{ role: "user", content: text }],
     }));
@@ -487,9 +490,9 @@ async function translate(
     console.error("translate API call failed:", e);
     return null;
   }
-  const block = result.content[0];
-  if (block.type === "text") { LAST_TRANSLATE_ERROR = null; return block.text.trim(); }
-  LAST_TRANSLATE_ERROR = `unexpected content block type: ${block.type}`;
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type === "text") { LAST_TRANSLATE_ERROR = null; return block.text.trim(); }
+  LAST_TRANSLATE_ERROR = `no text block in response (got: ${result.content.map((b) => b.type).join(", ")})`;
   return null;
 }
 
@@ -583,7 +586,7 @@ function buildAnnotationPrompt(language: "uk" | "en"): string {
     `  * lemma MUST be the dictionary form (nominative singular for nouns, infinitive for verbs, base form for adjectives).\n` +
     `  * part_of_speech MUST be one of: "noun", "verb", "adjective", "adverb", "phrase".\n` +
     `  * english_gloss is 1-4 words, no articles. For ${langName} vocabulary, the gloss should disambiguate the word's specific sense, not just give the most generic/literal meaning — e.g. завезти should gloss as "deliver by car/vehicle", not just "bring", when the word specifically implies transport by vehicle.\n` +
-    `  * lemma_translation is the single most common dictionary form of the word in ${otherLangName} (the OPPOSITE language). For ${langName} lemmas, return the ${otherLangName} translation; this becomes the "answer" on a flashcard.\n` +
+    `  * lemma_translation is the dictionary form of the word in ${otherLangName} (the OPPOSITE language), translated IN THE SAME SENSE the word is used in this text — it MUST agree with english_gloss (e.g. English "hard" used to mean difficult → "важкий", NOT "твердий"). For ${langName} lemmas, return the ${otherLangName} translation; this becomes the "answer" on a flashcard whose example sentence is this text, so a wrong-sense translation makes a wrong card.\n` +
     `    - For ${otherLangName === "Ukrainian" ? "Ukrainian" : "English"} translations, give the dictionary form (infinitive for verbs, nominative singular for nouns).\n` +
     `    - One word only when possible; a short phrase if the language has no single-word equivalent.\n` +
     `    - This may overlap with english_gloss when the lemma is English. That's fine \u2014 return both.\n` +
@@ -609,6 +612,7 @@ async function annotateMessage(messageId: string, text: string, language: "uk" |
     result = await withRetry(() => anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 8192,
+      thinking: { type: "disabled" },
       system: buildAnnotationPrompt(language),
       messages: [{ role: "user", content: text }],
     }));
@@ -617,8 +621,8 @@ async function annotateMessage(messageId: string, text: string, language: "uk" |
     await writeFallbackRow();
     return;
   }
-  const block = result.content[0];
-  if (block.type !== "text") { await writeFallbackRow(); return; }
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") { await writeFallbackRow(); return; }
   if (result.stop_reason === "max_tokens") {
     console.warn(`annotateMessage: max_tokens hit on ${messageId} (lang=${language}, input length=${text.length}); annotations may be incomplete.`);
   }
@@ -1053,12 +1057,13 @@ async function lemmatize(word: string, language: "uk" | "en"): Promise<string | 
     result = await withRetry(() => anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 128,
+      thinking: { type: "disabled" },
       system: `Return the dictionary (lemma) form of the given ${langName} word.\n- For nouns: nominative singular\n- For verbs: infinitive\n- For adjectives: masculine singular\n\nOutput ONLY raw JSON in the format: {"lemma": "<word>"}\nIf the input is not a recognizable ${langName} word, output: {"lemma": null}\nIf the input is a word in a different language (not ${langName}), also output: {"lemma": null}\nDo NOT wrap in markdown code fences. Do NOT include any preamble.`,
       messages: [{ role: "user", content: word }],
     }));
   } catch (e) { console.error("lemmatize API call failed:", e); return null; }
-  const block = result.content[0];
-  if (block.type !== "text") return null;
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") return null;
   try {
     const cleaned = block.text.trim().replace(/^\u0060\u0060\u0060(?:json)?\s*/i, "").replace(/\s*\u0060\u0060\u0060$/, "");
     const parsed = JSON.parse(cleaned);
@@ -1369,7 +1374,7 @@ async function backfillGrind(chatId: number) {
 }
 
 async function translateLemmasBatch(
-  items: Array<{ id: string; lemma: string; part_of_speech: string | null }>,
+  items: Array<{ id: string; lemma: string; part_of_speech: string | null; gloss: string | null }>,
   sourceLang: "uk" | "en",
 ): Promise<Map<string, string>> {
   const out = new Map<string, string>();
@@ -1378,15 +1383,17 @@ async function translateLemmasBatch(
   const targetName = sourceLang === "uk" ? "English" : "Ukrainian";
   const lines = items.map((it, i) => {
     const pos = it.part_of_speech ?? "unknown";
-    return `${i + 1}. ${it.lemma} (${pos})`;
+    return it.gloss
+      ? `${i + 1}. ${it.lemma} (${pos}; meaning: ${it.gloss})`
+      : `${i + 1}. ${it.lemma} (${pos})`;
   }).join("\n");
   const system =
     `You are translating ${sourceName} dictionary words into ${targetName}.\n` +
-    `For each numbered item, return the single most common dictionary-form ${targetName} translation.\n` +
+    `For each numbered item, return the dictionary-form ${targetName} translation that matches the given meaning.\n` +
     `Rules:\n` +
     `- Output the dictionary form (infinitive for verbs, nominative singular for nouns, masculine singular for adjectives).\n` +
     `- One word when possible; a short phrase only if the language has no single-word equivalent.\n` +
-    `- Use the part_of_speech in parentheses to disambiguate homographs.\n` +
+    `- Use the part_of_speech and the "meaning" gloss in parentheses to disambiguate polysemous words — translate THAT sense, not the word's most common sense (e.g. "hard (adjective; meaning: difficult)" must NOT be translated as if it meant firm/solid). When no meaning is given, use the most common sense.\n` +
     `- If a word is untranslatable (e.g. it's actually a proper noun, foreign word, or gibberish), return null for that item.\n` +
     `- Output ONLY a raw JSON array of objects with this shape: [{"n": 1, "translation": "..."}, {"n": 2, "translation": null}, ...]\n` +
     `- Do NOT wrap in markdown code fences. Do NOT include any preamble.\n` +
@@ -1398,6 +1405,7 @@ async function translateLemmasBatch(
     result = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 8192,
+      thinking: { type: "disabled" },
       system,
       messages: [{ role: "user", content: lines }],
     });
@@ -1405,8 +1413,8 @@ async function translateLemmasBatch(
     console.error("translateLemmasBatch API call failed:", e);
     return out;
   }
-  const block = result.content[0];
-  if (block.type !== "text") return out;
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") return out;
   let parsed: any;
   try {
     const cleaned = block.text.trim().replace(/^\u0060\u0060\u0060(?:json)?\s*/i, "").replace(/\s*\u0060\u0060\u0060$/, "");
@@ -1431,7 +1439,7 @@ async function handleBackfillTranslations(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   const { data: rows, error } = await supabase
     .from("vocabulary")
-    .select("id, lemma, part_of_speech, language")
+    .select("id, lemma, part_of_speech, gloss, language")
     .is("lemma_translation", null)
     .order("created_at", { ascending: true })
     .limit(BACKFILL_TRANSLATIONS_BATCH_SIZE);
@@ -2001,8 +2009,8 @@ async function parseQuestion(question: string, fallbackLang: "en" | "uk"): Promi
     console.error("parseQuestion API call failed:", e);
     return defaultParse(fallbackLang);
   }
-  const block = result.content[0];
-  if (block.type !== "text") return defaultParse(fallbackLang);
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") return defaultParse(fallbackLang);
   let parsed: any;
   try {
     const cleaned = block.text.trim().replace(/^\u0060\u0060\u0060(?:json)?\s*/i, "").replace(/\s*\u0060\u0060\u0060$/, "");
@@ -2151,6 +2159,7 @@ async function synthesizeAnswer(
     result = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 1024,
+      thinking: { type: "disabled" },
       system: systemPrompt,
       messages: [{ role: "user", content: question }],
     });
@@ -2158,8 +2167,8 @@ async function synthesizeAnswer(
     console.error("synthesizeAnswer API call failed:", e);
     return null;
   }
-  const block = result.content[0];
-  if (block.type !== "text") return null;
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") return null;
   return block.text.trim();
 }
 
