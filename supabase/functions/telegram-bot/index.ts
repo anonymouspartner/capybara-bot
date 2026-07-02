@@ -8,22 +8,24 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v54";
+const BUILD_VERSION = "v55";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
-// vocabulary annotation, and dictionary-form translation. Sonnet 5 replaces Opus 4.8
-// after a live benchmark on this bot's real call shapes (scripts/model_latency_bench.py):
-// ~1.2x faster at median latency, with the /backfill annotate path (1.3x) the win that
-// matters most. Sonnet 5 enables adaptive thinking BY DEFAULT, which would prepend a
-// thinking block ahead of the text/JSON the parsers expect -- so every CLAUDE_MODEL
-// call sends thinking: {type: "disabled"}, and every response reader finds the first
-// text block instead of assuming content[0]. If translation quality (register, gender
-// agreement, no-Russian discipline) regresses vs Opus 4.8, this is the constant to
-// revert. CLAUDE_HAIKU_MODEL stays on the cheap/fast tier for the trivial /recap
-// query parser (structured-JSON classification).
-const CLAUDE_MODEL = "claude-sonnet-5";
+// vocabulary annotation, and dictionary-form translation. Opus 4.8 is the pick for
+// nuanced EN<->UK work (register, Ukrainian gender agreement, literary-Ukrainian /
+// no-Russian discipline, flashcard word-sense selection); at one-couple volume its
+// cost is negligible. Sonnet 5 was trialed in v54 (~1.2x faster at median latency,
+// see scripts/model_latency_bench.py) and reverted the same day: ~0.5s per message
+// is imperceptible in chat, and translation quality is the product. The v54
+// hardening stays regardless of model: every CLAUDE_MODEL call sends
+// thinking: {type: "disabled"} (Sonnet 5 enables adaptive thinking by default and
+// would prepend a thinking block ahead of the text/JSON the parsers expect), and
+// every reader takes the first text block via content.find(), never content[0].
+// CLAUDE_HAIKU_MODEL stays on the cheap/fast tier for the trivial /recap query
+// parser (structured-JSON classification).
+const CLAUDE_MODEL = "claude-opus-4-8";
 const CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
 const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));
