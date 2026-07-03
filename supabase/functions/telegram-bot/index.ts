@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v55";
+const BUILD_VERSION = "v56";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -316,7 +316,7 @@ function scheduleAnnotation(messageId: string, text: string, language: "uk" | "e
 async function writeFallbackAnnotation(messageId: string) {
   const { error } = await supabase.from("message_annotations").upsert(
     [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral" }],
-    { onConflict: "message_id,annotation_type,annotation_value", ignoreDuplicates: true });
+    { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
   if (error) console.error("fallback row insert failed:", error);
 }
 
@@ -606,7 +606,7 @@ async function annotateMessage(messageId: string, text: string, language: "uk" |
   const writeFallbackRow = async () => {
     const { error } = await supabase.from("message_annotations").upsert(
       [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral" }],
-      { onConflict: "message_id,annotation_type,annotation_value", ignoreDuplicates: true });
+      { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
     if (error) console.error("fallback row insert failed:", error);
   };
   let result;
@@ -665,7 +665,7 @@ async function annotateMessage(messageId: string, text: string, language: "uk" |
     annotations.push({ message_id: messageId, annotation_type: "register", annotation_value: parsed.register, details: { language } });
   }
   if (annotations.length > 0) {
-    await supabase.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value", ignoreDuplicates: true });
+    await supabase.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
   }
 }
 
