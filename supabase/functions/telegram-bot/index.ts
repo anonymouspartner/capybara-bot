@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v56";
+const BUILD_VERSION = "v57";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -213,9 +213,26 @@ async function handleUpdate(update: any) {
 }
 
 async function lookupUser(tgUser: any) {
-  const { data: existing } = await supabase.from("users").select("*").eq("telegram_id", tgUser.id).maybeSingle();
-  if (existing) return existing;
-  return null;
+  // Distinguish "no such user" (a clean read that returns no row) from a transient
+  // read failure. Swallowing the error here made a *registered* user see the
+  // "not registered" message whenever this users read blipped (pooler hiccup,
+  // cold-start race, dropped connection) -- the caller treats any null as
+  // unregistered. Capture the error (like lookupPartner / lookupLearnerOfLanguage
+  // below), retry, and if the read keeps failing THROW so the caller aborts
+  // silently instead of misinforming the user. The "not registered" branch must
+  // fire only on a genuine, error-free absence.
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const { data, error } = await supabase.from("users").select("*")
+      .eq("telegram_id", tgUser.id).maybeSingle();
+    if (!error) return data ?? null;
+    lastErr = error;
+    console.error(`lookupUser read failed (attempt ${attempt}):`, error);
+    if (attempt < 3) await new Promise((r) => setTimeout(r, 200 * attempt));
+  }
+  throw new Error(
+    `lookupUser: users read failed after retries: ${(lastErr as { message?: string })?.message ?? String(lastErr)}`,
+  );
 }
 
 async function lookupPartner(userId: string) {
