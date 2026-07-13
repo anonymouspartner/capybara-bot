@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v58";
+const BUILD_VERSION = "v59";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -159,6 +159,8 @@ Deno.serve(async (req) => {
 });
 
 async function handleUpdate(update: any) {
+  // Populate the "/" command menu on first use per warm instance (background, idempotent).
+  scheduleBackgroundWork("ensureCommandsRegistered", ensureCommandsRegistered());
   // Inline-button taps (e.g. the /update deploy button) arrive as callback_query,
   // not message. Auth is by callback_query.from.id, so this is handled before the
   // users-table lookup below.
@@ -180,7 +182,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/start", handle: async (m, u) => { await sendMessage(m.chat.id,
         `Hi ${u.display_name}! Send me text or voice messages in ${u.native_language === "en" ? "English" : "Ukrainian"}, ` +
         `and I'll translate them to ${u.learning_language === "en" ? "English" : "Ukrainian"}.\n\n` +
-        `You can also send photos, videos, and files — I'll forward them straight to your partner.\n\n` +
+        `You can also send photos, videos, files, stickers, GIFs, audio, locations, and contacts — I'll forward them to your partner, and translate any caption.\n\n` +
         `Everything is saved as a study corpus.\n\nType /help to see what I can do.`); } },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
@@ -207,10 +209,16 @@ async function handleUpdate(update: any) {
   }
   if (msg.voice) { await handleVoiceMessage(msg, user); }
   else if (msg.video || msg.video_note) { await handleVideoMessage(msg, user); }
+  // animation (GIF) and audio also populate msg.document, so they must be checked before it.
+  else if (msg.animation) { await handleAnimationMessage(msg, user); }
+  else if (msg.audio) { await handleAudioMessage(msg, user); }
+  else if (msg.sticker) { await handleStickerMessage(msg, user); }
   else if (msg.photo) { await handlePhotoMessage(msg, user); }
   else if (msg.document) { await handleDocumentMessage(msg, user); }
+  else if (msg.venue || msg.location) { await handleLocationMessage(msg, user); }
+  else if (msg.contact) { await handleContactMessage(msg, user); }
   else if (msg.text) { await handleTextMessage(msg, user); }
-  else { await sendMessage(msg.chat.id, "I can handle text, voice, photo, video, and file messages. Other types aren't supported yet."); }
+  else { await sendMessage(msg.chat.id, "I can handle text, voice, photos, videos, files, stickers, GIFs, audio, locations, and contacts. Other types aren't supported yet."); }
 }
 
 async function lookupUser(tgUser: any) {
@@ -786,6 +794,114 @@ async function sendDocumentByFileId(chatId: number, documentFileId: string, capt
   if (!resp.ok) console.error("sendDocumentByFileId failed:", resp.status, await resp.text().catch(() => "<no body>"));
 }
 
+async function sendSticker(chatId: number, stickerFileId: string) {
+  const resp = await fetch(`${TELEGRAM_API}/sendSticker`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, sticker: stickerFileId }),
+  });
+  if (!resp.ok) console.error("sendSticker failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+async function sendAudio(chatId: number, audioFileId: string, caption?: string) {
+  const resp = await fetch(`${TELEGRAM_API}/sendAudio`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, audio: audioFileId, caption }),
+  });
+  if (!resp.ok) console.error("sendAudio failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+async function sendAnimation(chatId: number, animationFileId: string, caption?: string) {
+  const resp = await fetch(`${TELEGRAM_API}/sendAnimation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, animation: animationFileId, caption }),
+  });
+  if (!resp.ok) console.error("sendAnimation failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+async function sendLocation(chatId: number, latitude: number, longitude: number) {
+  const resp = await fetch(`${TELEGRAM_API}/sendLocation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, latitude, longitude }),
+  });
+  if (!resp.ok) console.error("sendLocation failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+async function sendVenue(chatId: number, latitude: number, longitude: number, title: string, address: string) {
+  const resp = await fetch(`${TELEGRAM_API}/sendVenue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, latitude, longitude, title, address }),
+  });
+  if (!resp.ok) console.error("sendVenue failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+async function sendContact(chatId: number, phoneNumber: string, firstName: string, lastName?: string, vcard?: string) {
+  const resp = await fetch(`${TELEGRAM_API}/sendContact`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, phone_number: phoneNumber, first_name: firstName, last_name: lastName, vcard }),
+  });
+  if (!resp.ok) console.error("sendContact failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+// --- Command menu (setMyCommands) -------------------------------------------
+// Populates Telegram's "/" menu so the bot's commands are discoverable. Scoped:
+// both partners see PUBLIC_COMMANDS (default scope); the admin ALSO sees the admin
+// commands, in their own chat only.
+const PUBLIC_COMMANDS: { command: string; description: string }[] = [
+  { command: "start", description: "What the bot does" },
+  { command: "help", description: "Show all commands" },
+  { command: "vocab", description: "Top unlearned words in each deck" },
+  { command: "learn", description: "Add a word to study (or: top N)" },
+  { command: "forget", description: "Remove a word from a deck" },
+  { command: "export", description: "Download both decks as CSV for Anki" },
+  { command: "recap", description: "Ask your shared relationship memory" },
+  { command: "remember", description: "Save a private note to memory" },
+  { command: "pin", description: "Pin a message to memory" },
+  { command: "unpin", description: "Unpin a message" },
+  { command: "pinned", description: "List pinned messages" },
+];
+const ADMIN_COMMANDS: { command: string; description: string }[] = [
+  ...PUBLIC_COMMANDS,
+  { command: "diag", description: "Admin: ping upstream APIs + DB" },
+  { command: "update", description: "Admin: check/deploy a new build" },
+  { command: "backfill", description: "Admin: backfill annotations" },
+  { command: "backfill_translations", description: "Admin: backfill translations" },
+  { command: "reconcile", description: "Admin: reconcile forwarded media" },
+  { command: "restore", description: "Admin: restore a message" },
+  { command: "recap_backfill", description: "Admin: backfill recap embeddings" },
+];
+
+async function setMyCommands(commands: { command: string; description: string }[], scope?: unknown): Promise<boolean> {
+  const body: Record<string, unknown> = { commands };
+  if (scope) body.scope = scope;
+  const resp = await fetch(`${TELEGRAM_API}/setMyCommands`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) { console.error("setMyCommands failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
+  return true;
+}
+
+let commandsRegistered = false;
+// Register the "/" menu once per warm instance (self-heals on each cold start /
+// deploy, picking up any command changes). The flag flips only after success, so a
+// transient failure retries on the next request rather than waiting for a cold start.
+async function ensureCommandsRegistered(): Promise<void> {
+  if (commandsRegistered) return;
+  const okPublic = await setMyCommands(PUBLIC_COMMANDS);
+  let okAdmin = true;
+  if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
+    okAdmin = await setMyCommands(ADMIN_COMMANDS, { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
+  }
+  if (okPublic && okAdmin) commandsRegistered = true;
+}
+
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
   const partner = await lookupPartner(sender.id);
   if (!partner) return;
@@ -840,12 +956,9 @@ async function handlePhotoMessage(msg: any, user: any) {
     await sendMessage(msg.chat.id, "🖼️ Got your photo, but there's no partner to forward it to yet.");
     return;
   }
-  const senderName = user.display_name;
   const largest = msg.photo[msg.photo.length - 1];
-  const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
-  const partnerCaption = caption ? `🖼️ ${senderName}: ${caption}` : `🖼️ ${senderName} sent a photo.`;
-  await sendPhoto(partner.telegram_id, largest.file_id, partnerCaption);
-  await sendMessage(msg.chat.id, "🖼️ Photo forwarded to your partner.");
+  await sendPhoto(partner.telegram_id, largest.file_id);
+  await finishMediaForward(msg, user, partner, `🖼️ ${user.display_name} sent a photo.`, "🖼️ Photo forwarded to your partner.");
 }
 
 // Files/documents (PDFs, docs, or images sent "as a file" — which arrive as
@@ -857,13 +970,134 @@ async function handleDocumentMessage(msg: any, user: any) {
     await sendMessage(msg.chat.id, "📎 Got your file, but there's no partner to forward it to yet.");
     return;
   }
-  const senderName = user.display_name;
   const doc = msg.document;
   const fileName = (typeof doc.file_name === "string" && doc.file_name) ? doc.file_name : "a file";
+  await sendDocumentByFileId(partner.telegram_id, doc.file_id);
+  await finishMediaForward(msg, user, partner, `📎 ${user.display_name} sent ${fileName}.`, "📎 File forwarded to your partner.");
+}
+
+// Translate + corpus a media caption, mirroring handleTextMessage: forward a bilingual
+// note to the partner, show the sender the translation, and store the caption as a
+// study-corpus message. input_type is "text" — the messages CHECK allows only
+// text/voice, and a caption IS text; vocabulary/embeddings key off the text + language,
+// not the label. The media itself is forwarded (captionless) by the caller.
+async function translateAndForwardCaption(msg: any, user: any, caption: string) {
+  const detectedLang = detectLanguageFromScript(caption);
+  const originalLang: "en" | "uk" = detectedLang ?? (user.native_language as "en" | "uk");
+  const translationTargetLang: "en" | "uk" = originalLang === "uk" ? "en" : "uk";
+  const persons = buildPersonMap(user, await lookupPartner(user.id));
+  const speaker = persons[originalLang];
+  const addressee = persons[translationTargetLang];
+  const translated = await translate(caption, originalLang, translationTargetLang, speaker, addressee);
+  const translationOk = translated !== null;
+
+  const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
+    conversation_id: DEFAULT_CONVERSATION_ID,
+    sender_id: user.id,
+    telegram_message_id: msg.message_id,
+    original_text: caption,
+    original_language: originalLang,
+    translated_text: translated,
+    translated_language: translationOk ? translationTargetLang : null,
+    input_type: "text",
+  }).select().single();
+  if (insertErr) console.error("messages insert (caption) failed:", insertErr);
+
+  if (translationOk) {
+    await sendMessage(msg.chat.id, `🔤 Caption translation (${translationTargetLang}):\n${translated}`, "Markdown");
+    await forwardToPartner(user, caption, translated!, originalLang, translationTargetLang);
+  } else {
+    await sendMessage(msg.chat.id, `⚠️ Caption translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The media was still forwarded.`);
+  }
+
+  if (inserted) {
+    scheduleAnnotation(inserted.id, caption, originalLang, "caption-original");
+    if (translationOk) scheduleAnnotation(inserted.id, translated!, translationTargetLang, "caption-translation");
+    scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, caption, originalLang));
+  }
+}
+
+// Shared tail for captioned media (photo/document/audio/GIF): if a caption is present,
+// translate + corpus it; otherwise send the partner a plain attribution. Then confirm
+// to the sender. The media itself was already forwarded (captionless) by the caller.
+// NOT used for video (verbatim caption, no translation, per requirement) or stickers
+// (never captioned).
+async function finishMediaForward(msg: any, user: any, partner: any, noCaptionAttribution: string, senderConfirmation: string) {
   const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
-  const partnerCaption = caption ? `📎 ${senderName}: ${caption}` : `📎 ${senderName} sent ${fileName}.`;
-  await sendDocumentByFileId(partner.telegram_id, doc.file_id, partnerCaption);
-  await sendMessage(msg.chat.id, "📎 File forwarded to your partner.");
+  if (caption) {
+    await translateAndForwardCaption(msg, user, caption);
+  } else {
+    await sendMessage(partner.telegram_id, noCaptionAttribution);
+  }
+  await sendMessage(msg.chat.id, senderConfirmation);
+}
+
+// Audio files (music / non-voice audio). Caption translated + corpus'd like a photo.
+async function handleAudioMessage(msg: any, user: any) {
+  const partner = await lookupPartner(user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, "🎵 Got your audio, but there's no partner to forward it to yet.");
+    return;
+  }
+  await sendAudio(partner.telegram_id, msg.audio.file_id);
+  await finishMediaForward(msg, user, partner, `🎵 ${user.display_name} sent an audio file.`, "🎵 Audio forwarded to your partner.");
+}
+
+// Animations / GIFs. Telegram also sets msg.document on an animation, so the dispatch
+// checks msg.animation BEFORE msg.document.
+async function handleAnimationMessage(msg: any, user: any) {
+  const partner = await lookupPartner(user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, "🎞️ Got your GIF, but there's no partner to forward it to yet.");
+    return;
+  }
+  await sendAnimation(partner.telegram_id, msg.animation.file_id);
+  await finishMediaForward(msg, user, partner, `🎞️ ${user.display_name} sent a GIF.`, "🎞️ GIF forwarded to your partner.");
+}
+
+// Stickers are forwarded as-is; they never carry a caption, so there is no translation.
+async function handleStickerMessage(msg: any, user: any) {
+  const partner = await lookupPartner(user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, "🎭 Got your sticker, but there's no partner to forward it to yet.");
+    return;
+  }
+  await sendSticker(partner.telegram_id, msg.sticker.file_id);
+  await sendMessage(partner.telegram_id, `🎭 ${user.display_name} sent a sticker.`);
+  await sendMessage(msg.chat.id, "🎭 Sticker forwarded to your partner.");
+}
+
+// Location or venue. A venue message ALSO carries msg.location, so the dispatch and
+// this handler check venue first, else the title/address would be dropped. No translation.
+async function handleLocationMessage(msg: any, user: any) {
+  const partner = await lookupPartner(user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, "📍 Got your location, but there's no partner to forward it to yet.");
+    return;
+  }
+  const senderName = user.display_name;
+  if (msg.venue) {
+    const v = msg.venue;
+    await sendVenue(partner.telegram_id, v.location.latitude, v.location.longitude, v.title ?? "", v.address ?? "");
+    await sendMessage(partner.telegram_id, `📍 ${senderName} shared a place.`);
+  } else {
+    await sendLocation(partner.telegram_id, msg.location.latitude, msg.location.longitude);
+    await sendMessage(partner.telegram_id, `📍 ${senderName} shared a location.`);
+  }
+  await sendMessage(msg.chat.id, "📍 Location forwarded to your partner.");
+}
+
+// Shared contact card. No translation.
+async function handleContactMessage(msg: any, user: any) {
+  const partner = await lookupPartner(user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, "👤 Got your contact, but there's no partner to forward it to yet.");
+    return;
+  }
+  const c = msg.contact;
+  await sendContact(partner.telegram_id, c.phone_number, c.first_name ?? "", c.last_name, c.vcard);
+  await sendMessage(partner.telegram_id, `👤 ${user.display_name} shared a contact.`);
+  await sendMessage(msg.chat.id, "👤 Contact forwarded to your partner.");
 }
 
 function csvEscape(value: string | null | undefined): string {
@@ -1006,7 +1240,8 @@ async function handleHelp(msg: any, user: any) {
       "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
       "",
       "\u2022 Just type or send a voice message \u2014 I translate it and forward to your partner",
-      "\u2022 Send a photo, video, or file \u2014 I forward it straight to your partner",
+      "\u2022 Send a photo, video, file, sticker, GIF, audio, location, or contact \u2014 I forward it to your partner",
+      "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it and add it to your study corpus",
       "\u2022 /vocab \u2014 Top words still unlearned in each deck",
       "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
       "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",
