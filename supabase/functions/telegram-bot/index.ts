@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v59";
+const BUILD_VERSION = "v60";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -207,7 +207,9 @@ async function handleUpdate(update: any) {
       if (cmd.match(msg.text)) { await cmd.handle(msg, user); return; }
     }
   }
-  if (msg.voice) { await handleVoiceMessage(msg, user); }
+  // Album items (media groups) arrive as separate webhooks — buffer + regroup them first.
+  if (msg.media_group_id) { await handleMediaGroupItem(msg, user); }
+  else if (msg.voice) { await handleVoiceMessage(msg, user); }
   else if (msg.video || msg.video_note) { await handleVideoMessage(msg, user); }
   // animation (GIF) and audio also populate msg.document, so they must be checked before it.
   else if (msg.animation) { await handleAnimationMessage(msg, user); }
@@ -982,19 +984,25 @@ async function handleDocumentMessage(msg: any, user: any) {
 // text/voice, and a caption IS text; vocabulary/embeddings key off the text + language,
 // not the label. The media itself is forwarded (captionless) by the caller.
 async function translateAndForwardCaption(msg: any, user: any, caption: string) {
+  await translateCaptionToPartner(user, msg.chat.id, caption, msg.message_id);
+}
+
+// Core caption translate + corpus, usable without a full `msg` (the album flush runs
+// from DB rows and passes a null telegram_message_id). Detects language, translates with
+// gender agreement, shows the sender the translation, forwards a bilingual note to the
+// partner, and stores the caption as a study-corpus message (input_type "text").
+async function translateCaptionToPartner(user: any, senderChatId: number, caption: string, telegramMessageId: number | null) {
   const detectedLang = detectLanguageFromScript(caption);
   const originalLang: "en" | "uk" = detectedLang ?? (user.native_language as "en" | "uk");
   const translationTargetLang: "en" | "uk" = originalLang === "uk" ? "en" : "uk";
   const persons = buildPersonMap(user, await lookupPartner(user.id));
-  const speaker = persons[originalLang];
-  const addressee = persons[translationTargetLang];
-  const translated = await translate(caption, originalLang, translationTargetLang, speaker, addressee);
+  const translated = await translate(caption, originalLang, translationTargetLang, persons[originalLang], persons[translationTargetLang]);
   const translationOk = translated !== null;
 
   const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
     conversation_id: DEFAULT_CONVERSATION_ID,
     sender_id: user.id,
-    telegram_message_id: msg.message_id,
+    telegram_message_id: telegramMessageId,
     original_text: caption,
     original_language: originalLang,
     translated_text: translated,
@@ -1004,10 +1012,10 @@ async function translateAndForwardCaption(msg: any, user: any, caption: string) 
   if (insertErr) console.error("messages insert (caption) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(msg.chat.id, `🔤 Caption translation (${translationTargetLang}):\n${translated}`, "Markdown");
+    await sendMessage(senderChatId, `🔤 Caption translation (${translationTargetLang}):\n${translated}`, "Markdown");
     await forwardToPartner(user, caption, translated!, originalLang, translationTargetLang);
   } else {
-    await sendMessage(msg.chat.id, `⚠️ Caption translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The media was still forwarded.`);
+    await sendMessage(senderChatId, `⚠️ Caption translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The media was still forwarded.`);
   }
 
   if (inserted) {
@@ -1098,6 +1106,114 @@ async function handleContactMessage(msg: any, user: any) {
   await sendContact(partner.telegram_id, c.phone_number, c.first_name ?? "", c.last_name, c.vcard);
   await sendMessage(partner.telegram_id, `👤 ${user.display_name} shared a contact.`);
   await sendMessage(msg.chat.id, "👤 Contact forwarded to your partner.");
+}
+
+// --- Album (media group) forwarding -----------------------------------------
+// Telegram splits an album into one webhook per item (separate function invocations), so
+// re-assembling it into one sendMediaGroup needs cross-invocation state: each item is
+// buffered in pending_media_group, and a debounced flush drains the group and re-sends it.
+const ALBUM_DEBOUNCE_MS = 2000;
+const ALBUM_STALE_MS = 5 * 60 * 1000;
+
+async function sendMediaGroup(chatId: number, media: unknown[]) {
+  const resp = await fetch(`${TELEGRAM_API}/sendMediaGroup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, media }),
+  });
+  if (!resp.ok) console.error("sendMediaGroup failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+function mediaGroupItemOf(msg: any): { type: string; file_id: string } | null {
+  if (msg.photo) return { type: "photo", file_id: msg.photo[msg.photo.length - 1].file_id };
+  if (msg.video) return { type: "video", file_id: msg.video.file_id };
+  if (msg.document) return { type: "document", file_id: msg.document.file_id };
+  if (msg.audio) return { type: "audio", file_id: msg.audio.file_id };
+  return null;
+}
+
+async function sendSingleMediaItem(chatId: number, item: { type: string; file_id: string }) {
+  if (item.type === "photo") { await sendPhoto(chatId, item.file_id); return; }
+  if (item.type === "video") { await sendVideo(chatId, item.file_id); return; }
+  if (item.type === "audio") { await sendAudio(chatId, item.file_id); return; }
+  await sendDocumentByFileId(chatId, item.file_id);
+}
+
+// Forward a lone album item the normal per-type way — used when the buffer table is
+// missing or an insert fails, so an un-migrated deploy still delivers albums (as singles).
+async function forwardMediaGroupFallback(msg: any, user: any) {
+  if (msg.photo) { await handlePhotoMessage(msg, user); return; }
+  if (msg.video || msg.video_note) { await handleVideoMessage(msg, user); return; }
+  if (msg.animation) { await handleAnimationMessage(msg, user); return; }
+  if (msg.audio) { await handleAudioMessage(msg, user); return; }
+  if (msg.document) { await handleDocumentMessage(msg, user); return; }
+}
+
+async function handleMediaGroupItem(msg: any, user: any) {
+  const item = mediaGroupItemOf(msg);
+  if (!item) { await forwardMediaGroupFallback(msg, user); return; }
+  const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
+  const { error } = await supabase.from("pending_media_group").insert({
+    media_group_id: String(msg.media_group_id),
+    sender_id: user.id,
+    chat_id: msg.chat.id,
+    item,
+    caption: caption || null,
+  });
+  if (error) {
+    console.error("pending_media_group insert failed (forwarding item individually):", error);
+    await forwardMediaGroupFallback(msg, user);
+    return;
+  }
+  scheduleBackgroundWork(`albumFlush (${msg.media_group_id})`, debouncedAlbumFlush(String(msg.media_group_id), user));
+}
+
+async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
+  await new Promise((r) => setTimeout(r, ALBUM_DEBOUNCE_MS));
+  // Atomic single-flush claim: the first flusher's DELETE drains the group; concurrent
+  // flushers get 0 rows and return. The same DELETE also sweeps rows older than
+  // ALBUM_STALE_MS (orphans from an instance that died mid-debounce) so nothing lingers.
+  const staleCutoff = new Date(Date.now() - ALBUM_STALE_MS).toISOString();
+  const { data: rows, error } = await supabase
+    .from("pending_media_group")
+    .delete()
+    .or(`media_group_id.eq.${mediaGroupId},created_at.lt.${staleCutoff}`)
+    .select();
+  if (error) { console.error("album flush delete failed:", error); return; }
+  const groupRows = (rows ?? []).filter((r: any) => r.media_group_id === mediaGroupId);
+  if (groupRows.length === 0) return; // already flushed by another invocation
+  groupRows.sort((a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+
+  const senderChatId = groupRows[0].chat_id;
+  const partner = await lookupPartner(user.id);
+  if (!partner) {
+    await sendMessage(senderChatId, "🖼️ Got your album, but there's no partner to forward it to yet.");
+    return;
+  }
+
+  const items = groupRows.slice(0, 10); // sendMediaGroup accepts 2–10 items
+  if (items.length === 1) {
+    // A lone late orphan — sendMediaGroup needs >= 2, so send it as a single item.
+    await sendSingleMediaItem(partner.telegram_id, items[0].item);
+    await sendMessage(partner.telegram_id, `🖼️ ${user.display_name} sent an item.`);
+  } else {
+    const media = items.map((r: any) => ({ type: r.item.type, media: r.item.file_id }));
+    await sendMediaGroup(partner.telegram_id, media);
+    await sendMessage(partner.telegram_id, `🖼️ ${user.display_name} sent an album of ${items.length}.`);
+  }
+  await sendMessage(senderChatId, `🖼️ Album forwarded to your partner (${items.length} item${items.length === 1 ? "" : "s"}).`);
+
+  // The album caption (Telegram attaches it to one item) — translate + corpus, unless the
+  // album is entirely videos (no video-caption translation, per requirement).
+  const caption = (groupRows.find((r: any) => r.caption)?.caption ?? "").trim();
+  if (caption) {
+    const allVideo = groupRows.every((r: any) => r.item.type === "video");
+    if (allVideo) {
+      await sendMessage(partner.telegram_id, `🎥 ${user.display_name}: ${caption}`);
+    } else {
+      await translateCaptionToPartner(user, senderChatId, caption, null);
+    }
+  }
 }
 
 function csvEscape(value: string | null | undefined): string {
