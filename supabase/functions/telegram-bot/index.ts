@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v57";
+const BUILD_VERSION = "v58";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -180,7 +180,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/start", handle: async (m, u) => { await sendMessage(m.chat.id,
         `Hi ${u.display_name}! Send me text or voice messages in ${u.native_language === "en" ? "English" : "Ukrainian"}, ` +
         `and I'll translate them to ${u.learning_language === "en" ? "English" : "Ukrainian"}.\n\n` +
-        `You can also send photos and videos — I'll forward them straight to your partner.\n\n` +
+        `You can also send photos, videos, and files — I'll forward them straight to your partner.\n\n` +
         `Everything is saved as a study corpus.\n\nType /help to see what I can do.`); } },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
@@ -208,8 +208,9 @@ async function handleUpdate(update: any) {
   if (msg.voice) { await handleVoiceMessage(msg, user); }
   else if (msg.video || msg.video_note) { await handleVideoMessage(msg, user); }
   else if (msg.photo) { await handlePhotoMessage(msg, user); }
+  else if (msg.document) { await handleDocumentMessage(msg, user); }
   else if (msg.text) { await handleTextMessage(msg, user); }
-  else { await sendMessage(msg.chat.id, "I can handle text, voice, photo, and video messages. Other types aren't supported yet."); }
+  else { await sendMessage(msg.chat.id, "I can handle text, voice, photo, video, and file messages. Other types aren't supported yet."); }
 }
 
 async function lookupUser(tgUser: any) {
@@ -773,6 +774,18 @@ async function sendDocument(chatId: number, fileName: string, content: string, m
   if (!resp.ok) console.error("sendDocument failed:", await resp.text());
 }
 
+// Forward a document the bot RECEIVED, by its Telegram file_id (parallels
+// sendPhoto/sendVideo). Distinct from sendDocument above, which uploads generated
+// string content (e.g. the /export CSV). Works at any file size — no download step.
+async function sendDocumentByFileId(chatId: number, documentFileId: string, caption?: string) {
+  const resp = await fetch(`${TELEGRAM_API}/sendDocument`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, document: documentFileId, caption }),
+  });
+  if (!resp.ok) console.error("sendDocumentByFileId failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
   const partner = await lookupPartner(sender.id);
   if (!partner) return;
@@ -833,6 +846,24 @@ async function handlePhotoMessage(msg: any, user: any) {
   const partnerCaption = caption ? `🖼️ ${senderName}: ${caption}` : `🖼️ ${senderName} sent a photo.`;
   await sendPhoto(partner.telegram_id, largest.file_id, partnerCaption);
   await sendMessage(msg.chat.id, "🖼️ Photo forwarded to your partner.");
+}
+
+// Files/documents (PDFs, docs, or images sent "as a file" — which arrive as
+// msg.document, not msg.photo) are forwarded as-is by file_id, the same approach as
+// handlePhotoMessage / handleVideoMessage: no download, translation, or corpus storage.
+async function handleDocumentMessage(msg: any, user: any) {
+  const partner = await lookupPartner(user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, "📎 Got your file, but there's no partner to forward it to yet.");
+    return;
+  }
+  const senderName = user.display_name;
+  const doc = msg.document;
+  const fileName = (typeof doc.file_name === "string" && doc.file_name) ? doc.file_name : "a file";
+  const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
+  const partnerCaption = caption ? `📎 ${senderName}: ${caption}` : `📎 ${senderName} sent ${fileName}.`;
+  await sendDocumentByFileId(partner.telegram_id, doc.file_id, partnerCaption);
+  await sendMessage(msg.chat.id, "📎 File forwarded to your partner.");
 }
 
 function csvEscape(value: string | null | undefined): string {
@@ -975,7 +1006,7 @@ async function handleHelp(msg: any, user: any) {
       "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
       "",
       "\u2022 Just type or send a voice message \u2014 I translate it and forward to your partner",
-      "\u2022 Send a photo or video \u2014 I forward it straight to your partner",
+      "\u2022 Send a photo, video, or file \u2014 I forward it straight to your partner",
       "\u2022 /vocab \u2014 Top words still unlearned in each deck",
       "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
       "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",
