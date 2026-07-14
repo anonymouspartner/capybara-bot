@@ -6,8 +6,9 @@ tool (`/recap`).
 
 Send the bot a text or voice message and it replies with the translation and forwards
 it to your partner — while quietly logging everything as study material (vocabulary,
-flashcards) and as a searchable shared memory. Send a video and it forwards that to your
-partner too.
+flashcards) and as a searchable shared memory. It also relays photos, videos, files,
+stickers, GIFs, audio, locations, and contacts (and whole photo albums) to your partner,
+translating any caption along the way.
 
 > **Status:** in daily use. Self-hosted, one instance per couple, deployed by hand
 > behind a deliberately strict deploy gate.
@@ -56,11 +57,17 @@ them in a single turn.
   a neighbouring Slavic language.
 - **Forwards to your partner.** Each translation (and the original) is relayed to the
   other partner automatically, so the bot doubles as the chat channel itself.
-- **Videos pass straight through.** Regular videos and round "video notes" are forwarded
-  to your partner by Telegram `file_id` — no size limit, no transcription.
+- **Any attachment passes through.** Photos, videos and round "video notes",
+  files/documents, stickers, GIFs, audio, locations/venues, and contacts are all
+  forwarded to your partner by Telegram `file_id` — no size limit, no download. A
+  multi-photo **album** is regrouped and delivered as a single album, not a burst of
+  separate messages.
+- **Captions are translated too.** A caption on a photo/file/GIF/audio is translated for
+  your partner and folded into the study corpus, exactly like a text message. (Video
+  captions are left as-is.)
 
 **2. Language-study corpus.**
-- Every message is **annotated in the background** (Claude) into **vocabulary**
+- Every message — and every media **caption** — is **annotated in the background** (Claude) into **vocabulary**
   (lemma + part of speech + gloss + cross-language translation), **grammar features**,
   **idioms**, and **register**.
 - **Two decks of equal weight** — a 🇺🇦 Ukrainian deck and a 🇬🇧 English deck — built
@@ -81,11 +88,11 @@ them in a single turn.
 
 ```
 Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supabase)
-                                                            +  Anthropic  (translation, annotation, /recap; Claude Sonnet & Haiku)
+                                                            +  Anthropic  (translation, annotation, /recap; Claude Opus & Haiku)
                                                             +  OpenAI     (Whisper voice transcription + embeddings)
 ```
 
-- **One canonical file.** The entire bot is a single ~2,000-line
+- **One canonical file.** The entire bot is a single ~2,700-line
   `supabase/functions/telegram-bot/index.ts`. It is **couple-agnostic** — nothing about
   a specific couple is in the code; identity lives in secrets and seed data. **Never
   fork it.**
@@ -119,7 +126,7 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
    - **Note privacy** — notes are only visible to their author.
    - **Pin boost** — pinned messages get a small score bump.
    - **Reconciled messages are excluded** entirely.
-5. **Synthesize** (Claude Sonnet) a grounded answer: quotes appear in their original
+5. **Synthesize** (Claude Opus) a grounded answer: quotes appear in their original
    language, messages and notes are cited distinctly, and the model is instructed never
    to guess beyond the retrieved context or to play advisor/predictor/judge.
 
@@ -138,15 +145,16 @@ data. **Never fork `index.ts`** — one file deploys to every instance unchanged
 ## Data model
 
 The initial migration (`supabase/migrations/20260601000000_init_schema.sql`) builds the
-whole database from zero — **10 tables, 7 application functions**, and the required
-extensions (`vector`, `pg_trgm`, `uuid-ossp`). Row-level security is enabled on every
-table; the bot connects as the service role.
+core of the database from zero — **10 tables, 7 application functions**, and the required
+extensions (`vector`, `pg_trgm`, `uuid-ossp`); later migrations add a few more (including
+`pending_media_group`, below). Row-level security is enabled on every table; the bot
+connects as the service role.
 
 | Table | Holds |
 |---|---|
 | `users` | The two partners — Telegram ID, display name, native + learning language. |
 | `conversations` | The single default conversation every message is filed under. |
-| `messages` | Every text/voice message: original + translation, languages, input type, voice metadata. |
+| `messages` | Every text/voice message and media caption: original + translation, languages, input type, voice metadata. |
 | `message_annotations` | Per-message vocabulary / grammar / idiom / register findings. |
 | `vocabulary` | Deduplicated lemmas with gloss, part of speech, cross-language translation, occurrence count. |
 | `flashcards` | A user's chosen study cards (vocabulary + example message). |
@@ -154,6 +162,7 @@ table; the bot connects as the service role.
 | `message_pins` | Pinned (meaningful) messages. |
 | `message_reconciles` | Messages excluded from `/recap`. |
 | `recap_embeddings` | Vector + text content for messages and notes, powering `/recap`. |
+| `pending_media_group` | Short-lived buffer that regroups the items of a photo album before forwarding (added by a later migration). |
 
 | Function | Purpose |
 |---|---|
@@ -380,12 +389,13 @@ A few things keep a fresh instance reproducible from the committed files alone:
 
 ## Bot commands
 
-Send **`/help`** in the bot for the full, language-aware list. Highlights:
+Send **`/help`** in the bot for the full, language-aware list — the everyday commands
+also appear in Telegram's **`/` menu** (admin commands show only to the admin). Highlights:
 
 | Command | Does |
 |---|---|
 | *(any text/voice)* | Translate EN↔UK and forward to your partner |
-| *(any video / video note)* | Forward straight to your partner (no translation) |
+| *(photo / video / file / sticker / GIF / audio / location / contact / album)* | Forward to your partner; a caption is translated and added to your corpus (video captions kept as-is) |
 | `/recap <question>` | Ask your shared conversation history (private to you) |
 | `/remember <note>` | Add a private note that `/recap` can find |
 | `/pin` · `/pinned` · `/unpin` | Mark / list / unmark meaningful messages (reply to one) |
@@ -461,7 +471,7 @@ deploy-safety and reproducibility handoffs that shaped them.
 
 - **Runtime:** Deno (Supabase Edge Functions).
 - **Database:** Postgres (Supabase) with `pgvector`, `pg_trgm`, `uuid-ossp`.
-- **AI:** Anthropic Claude (Sonnet for translation/annotation/recap synthesis, Haiku for
+- **AI:** Anthropic Claude (Opus for translation/annotation/recap synthesis, Haiku for
   query parsing); OpenAI Whisper (voice) and `text-embedding-3-small` (embeddings).
 - **Messaging:** Telegram Bot API (webhook).
 - **Tooling:** Supabase CLI, PowerShell deploy spine, Git.
