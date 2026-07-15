@@ -8,24 +8,26 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v60";
+const BUILD_VERSION = "v61";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
-// vocabulary annotation, and dictionary-form translation. Opus 4.8 is the pick for
-// nuanced EN<->UK work (register, Ukrainian gender agreement, literary-Ukrainian /
-// no-Russian discipline, flashcard word-sense selection); at one-couple volume its
-// cost is negligible. Sonnet 5 was trialed in v54 (~1.2x faster at median latency,
-// see scripts/model_latency_bench.py) and reverted the same day: ~0.5s per message
-// is imperceptible in chat, and translation quality is the product. The v54
-// hardening stays regardless of model: every CLAUDE_MODEL call sends
+// vocabulary annotation, and dictionary-form translation on nuanced EN<->UK text
+// (register, Ukrainian gender agreement, literary-Ukrainian / no-Russian discipline,
+// flashcard word-sense selection). Sonnet 5 is the pick: it shares Opus 4.8's
+// tokenizer, so moving off Opus is a pure per-token price cut (~40% cheaper at
+// standard $3/$15, ~60% at Sonnet's intro $2/$10) with no token-count change, and at
+// one-couple volume the maintainer saw no quality regression versus Opus. (An earlier
+// v54 Sonnet trial was reverted on quality grounds; that call was revisited and
+// reversed once the day-to-day output proved indistinguishable.) The hardening that
+// makes Sonnet safe here is load-bearing: every CLAUDE_MODEL call sends
 // thinking: {type: "disabled"} (Sonnet 5 enables adaptive thinking by default and
 // would prepend a thinking block ahead of the text/JSON the parsers expect), and
 // every reader takes the first text block via content.find(), never content[0].
 // CLAUDE_HAIKU_MODEL stays on the cheap/fast tier for the trivial /recap query
 // parser (structured-JSON classification).
-const CLAUDE_MODEL = "claude-opus-4-8";
+const CLAUDE_MODEL = "claude-sonnet-5";
 const CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
 const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));

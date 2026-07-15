@@ -88,7 +88,7 @@ them in a single turn.
 
 ```
 Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supabase)
-                                                            +  Anthropic  (translation, annotation, /recap; Claude Opus & Haiku)
+                                                            +  Anthropic  (translation, annotation, /recap; Claude Sonnet & Haiku)
                                                             +  OpenAI     (Whisper voice transcription + embeddings)
 ```
 
@@ -126,7 +126,7 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
    - **Note privacy** — notes are only visible to their author.
    - **Pin boost** — pinned messages get a small score bump.
    - **Reconciled messages are excluded** entirely.
-5. **Synthesize** (Claude Opus) a grounded answer: quotes appear in their original
+5. **Synthesize** (Claude Sonnet) a grounded answer: quotes appear in their original
    language, messages and notes are cited distinctly, and the model is instructed never
    to guess beyond the retrieved context or to play advisor/predictor/judge.
 
@@ -471,7 +471,7 @@ deploy-safety and reproducibility handoffs that shaped them.
 
 - **Runtime:** Deno (Supabase Edge Functions).
 - **Database:** Postgres (Supabase) with `pgvector`, `pg_trgm`, `uuid-ossp`.
-- **AI:** Anthropic Claude (Opus for translation/annotation/recap synthesis, Haiku for
+- **AI:** Anthropic Claude (Sonnet for translation/annotation/recap synthesis, Haiku for
   query parsing); OpenAI Whisper (voice) and `text-embedding-3-small` (embeddings).
 - **Messaging:** Telegram Bot API (webhook).
 - **Tooling:** Supabase CLI, PowerShell deploy spine, Git.
