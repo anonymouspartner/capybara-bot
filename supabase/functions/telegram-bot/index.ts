@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v61";
+const BUILD_VERSION = "v62";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -329,7 +329,7 @@ function exampleScriptMatchesLanguage(text: string, language: "uk" | "en"): bool
   return cyrillicRatio <= (1 - CYRILLIC_SKIP_THRESHOLD);
 }
 
-function scheduleAnnotation(messageId: string, text: string, language: "uk" | "en", source: string) {
+function scheduleAnnotation(messageId: string, text: string, language: "uk" | "en", source: string, parallelText?: string) {
   if (!text) return;
   const { cyrillicRatio, letters } = detectScriptRatios(text);
   const wrongScript = letters === 0 ||
@@ -340,7 +340,7 @@ function scheduleAnnotation(messageId: string, text: string, language: "uk" | "e
     scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(messageId));
     return;
   }
-  scheduleBackgroundWork(`annotateMessage (${source}, ${messageId})`, annotateMessage(messageId, text, language));
+  scheduleBackgroundWork(`annotateMessage (${source}, ${messageId})`, annotateMessage(messageId, text, language, parallelText));
 }
 
 async function writeFallbackAnnotation(messageId: string) {
@@ -381,8 +381,8 @@ async function handleTextMessage(msg: any, user: any) {
   }
 
   if (inserted) {
-    if (originalLang === "uk" || originalLang === "en") scheduleAnnotation(inserted.id, originalText, originalLang, "text-original");
-    if (translationOk && (translationTargetLang === "uk" || translationTargetLang === "en")) scheduleAnnotation(inserted.id, translated!, translationTargetLang, "text-translation");
+    if (originalLang === "uk" || originalLang === "en") scheduleAnnotation(inserted.id, originalText, originalLang, "text-original", translationOk ? translated! : undefined);
+    if (translationOk && (translationTargetLang === "uk" || translationTargetLang === "en")) scheduleAnnotation(inserted.id, translated!, translationTargetLang, "text-translation", originalText);
     if (originalLang === "uk" || originalLang === "en") {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, originalText, originalLang));
     }
@@ -453,8 +453,8 @@ async function handleVoiceMessage(msg: any, user: any) {
   }
 
   if (inserted) {
-    if (originalLang === "uk" || originalLang === "en") scheduleAnnotation(inserted.id, transcript, originalLang, "voice-original");
-    if (translationOk && (targetLang === "uk" || targetLang === "en")) scheduleAnnotation(inserted.id, translated!, targetLang, "voice-translation");
+    if (originalLang === "uk" || originalLang === "en") scheduleAnnotation(inserted.id, transcript, originalLang, "voice-original", translationOk ? translated! : undefined);
+    if (translationOk && (targetLang === "uk" || targetLang === "en")) scheduleAnnotation(inserted.id, translated!, targetLang, "voice-translation", transcript);
     if (originalLang === "uk" || originalLang === "en") {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, transcript, originalLang));
     }
@@ -603,9 +603,20 @@ async function transcribeWithWhisper(audioBlob: Blob): Promise<WhisperResult> {
   return retry.ok ? { ok: true, text: retry.text } : { ok: true, text: first.text };
 }
 
-function buildAnnotationPrompt(language: "uk" | "en"): string {
+function buildAnnotationPrompt(language: "uk" | "en", parallelText?: string): string {
   const langName = language === "uk" ? "Ukrainian" : "English";
   const otherLangName = language === "uk" ? "English" : "Ukrainian";
+  // Sense anchor: annotation is a separate model call from translate(), so without
+  // this it re-picks a word sense on its own and can contradict the translation the
+  // bot already produced (e.g. glossing "afraid" as наляканий/"scared" when the
+  // sentence was translated with боятися/"боїшся"). Feeding it the accepted
+  // translation forces each lemma_translation to match the sense actually used.
+  const senseAnchor = parallelText
+    ? `\n\nSENSE ANCHOR — the accepted ${otherLangName} translation of this exact text is:\n"${parallelText}"\n` +
+      `Each lemma_translation MUST match the sense in which that word actually appears in this translation. ` +
+      `Use the dictionary form of the word as it is rendered there; do not substitute a different sense ` +
+      `(e.g. if "afraid" is rendered as a form of "боятися", lemma_translation is "боятися", never "наляканий").`
+    : "";
   const oppositeScript = language === "uk"
     ? `If the MAJORITY of letter characters in the input are Latin-script (English), return {"vocabulary":[],"grammar":[],"idioms":[],"register":"neutral"}.`
     : `If the MAJORITY of letter characters in the input are Cyrillic-script (Ukrainian), return {"vocabulary":[],"grammar":[],"idioms":[],"register":"neutral"}.`;
@@ -627,12 +638,12 @@ function buildAnnotationPrompt(language: "uk" | "en"): string {
     `- "grammar": array of grammatical features used (e.g., ${grammarExamples})\n` +
     `- "idioms": array of any idiomatic expressions\n` +
     `- "register": one of "formal", "informal", "neutral"\n\n` +
-    `${oppositeScript}\n` +
+    `${oppositeScript}${senseAnchor}\n` +
     `Output ONLY raw JSON. Do NOT wrap in markdown code fences. Do NOT include any preamble or commentary.`
   );
 }
 
-async function annotateMessage(messageId: string, text: string, language: "uk" | "en") {
+async function annotateMessage(messageId: string, text: string, language: "uk" | "en", parallelText?: string) {
   const writeFallbackRow = async () => {
     const { error } = await supabase.from("message_annotations").upsert(
       [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral" }],
@@ -645,7 +656,7 @@ async function annotateMessage(messageId: string, text: string, language: "uk" |
       model: CLAUDE_MODEL,
       max_tokens: 8192,
       thinking: { type: "disabled" },
-      system: buildAnnotationPrompt(language),
+      system: buildAnnotationPrompt(language, parallelText),
       messages: [{ role: "user", content: text }],
     }));
   } catch (e) {
