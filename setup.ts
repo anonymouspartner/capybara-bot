@@ -310,7 +310,10 @@ async function ensureSupabaseAuth(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------- SQL: bucket + seed
-type Seed = { adminId: string; adminName: string; partnerId: string; partnerName: string };
+type Seed = {
+  adminId: string; adminName: string; adminNative: string; adminLearning: string; adminGender: string;
+  partnerId: string; partnerName: string; partnerGender: string;
+};
 
 function fillSeedSql(template: string, s: Seed): string {
   const esc = (n: string) => n.replace(/'/g, "''");
@@ -322,8 +325,8 @@ function fillSeedSql(template: string, s: Seed): string {
   let i = 0;
   return template
     .replace(/000000000::bigint/g, () => `${i++ === 0 ? s.adminId : s.partnerId}::bigint`)
-    .replace("<English-native partner name>", esc(s.adminName))
-    .replace("<Ukrainian-native partner name>", esc(s.partnerName));
+    .replace("<admin partner name>", esc(s.adminName))
+    .replace("<partner name>", esc(s.partnerName));
 }
 
 async function applyBucketAndSeedOverConnection(ref: string, dbpw: string, s: Seed): Promise<boolean> {
@@ -347,8 +350,8 @@ async function applyBucketAndSeedOverConnection(ref: string, dbpw: string, s: Se
         await client.queryArray(
           "insert into storage.buckets (id, name, public) values ('voice-messages','voice-messages',false) on conflict (id) do nothing",
         );
-        await client.queryArray`insert into public.users (telegram_id, display_name, native_language, learning_language) values (${s.adminId}, ${s.adminName}, 'en', 'uk') on conflict (telegram_id) do nothing`;
-        await client.queryArray`insert into public.users (telegram_id, display_name, native_language, learning_language) values (${s.partnerId}, ${s.partnerName}, 'uk', 'en') on conflict (telegram_id) do nothing`;
+        await client.queryArray`insert into public.users (telegram_id, display_name, native_language, learning_language, gender) values (${s.adminId}, ${s.adminName}, ${s.adminNative}, ${s.adminLearning}, ${s.adminGender}) on conflict (telegram_id) do nothing`;
+        await client.queryArray`insert into public.users (telegram_id, display_name, native_language, learning_language, gender) values (${s.partnerId}, ${s.partnerName}, ${s.adminLearning}, ${s.adminNative}, ${s.partnerGender}) on conflict (telegram_id) do nothing`;
         await client.queryArray(
           `insert into public.conversations (id, title) values ('${CONV_UUID}','Default conversation') on conflict (id) do nothing`,
         );
@@ -529,7 +532,14 @@ async function main() {
   }
   const partnerName = await askValidated("Ukrainian-native partner's display name:", V.name, "1–64 chars, no < or >.");
   values.ADMIN_TELEGRAM_ID = adminId;
-  const seed: Seed = { adminId, adminName, partnerId, partnerName };
+  // The guided wizard provisions the historical English↔Ukrainian pair (admin native
+  // en, partner native uk) and stores each partner's gender. For any other language
+  // pair or gender combination, edit and run seed_couple.sql directly — it takes each
+  // partner's language code and gender.
+  const seed: Seed = {
+    adminId, adminName, adminNative: "en", adminLearning: "uk", adminGender: "male",
+    partnerId, partnerName, partnerGender: "female",
+  };
 
   // Step 4 - API keys
   step(4, "Your AI keys");
