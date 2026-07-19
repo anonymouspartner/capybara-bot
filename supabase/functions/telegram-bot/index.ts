@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v63";
+const BUILD_VERSION = "v64";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -56,6 +56,45 @@ const BACKFILL_BUDGET_MS = 120_000;
 const BACKFILL_CONCURRENCY = 10;
 const BACKFILL_TRANSLATIONS_BATCH_SIZE = 25;
 const CYRILLIC_SKIP_THRESHOLD = 0.5;
+
+// ---------------------------------------------------------------------------- Language registry
+// Every language the bot can be provisioned for. The instance's actual pair is the
+// two seeded users' native_language values (resolved via lookupPartner); this
+// registry supplies the per-language metadata that used to live in hardcoded en/uk
+// ternaries. To support a new language, add an entry here. Unknown codes are a
+// provisioning error, never a runtime path. Prompt-heavy fields (translationNotes,
+// grammarExamples, helpText) are filled in by later phases as those paths generalize.
+type LangCode = string;
+type Script = "latin" | "cyrillic";
+type LangMeta = {
+  code: LangCode;
+  englishName: string;
+  nativeName: string;
+  flag: string;
+  script: Script;
+  whisperName: string;         // language name as OpenAI Whisper reports it (lowercase)
+  whisperCode: string;         // ISO-639-1 code for Whisper's language hint
+  marksSpeakerGender: boolean; // marks the speaker's gender on verbs/adjectives -- drives translate()'s agreement clause
+  synonyms: string[];          // extra tokens parseLangArg accepts besides the code, lowercased
+  translationNotes?: string;
+  grammarExamples?: string;
+  helpText?: string;
+};
+const LANGUAGES: Record<string, LangMeta> = {
+  en: { code: "en", englishName: "English",    nativeName: "English",     flag: "🇬🇧", script: "latin",    whisperName: "english",    whisperCode: "en", marksSpeakerGender: false, synonyms: ["eng", "english", "англ", "англійська"] },
+  uk: { code: "uk", englishName: "Ukrainian",  nativeName: "Українська", flag: "🇺🇦", script: "cyrillic", whisperName: "ukrainian",  whisperCode: "uk", marksSpeakerGender: true,  synonyms: ["ua", "ukr", "ukrainian", "укр", "українська"] },
+  es: { code: "es", englishName: "Spanish",    nativeName: "Español",  flag: "🇪🇸", script: "latin",    whisperName: "spanish",    whisperCode: "es", marksSpeakerGender: true,  synonyms: ["spa", "spanish", "espanol", "español"] },
+  fr: { code: "fr", englishName: "French",     nativeName: "Français", flag: "🇫🇷", script: "latin",    whisperName: "french",     whisperCode: "fr", marksSpeakerGender: true,  synonyms: ["fra", "fre", "french", "francais", "français"] },
+  de: { code: "de", englishName: "German",     nativeName: "Deutsch",     flag: "🇩🇪", script: "latin",    whisperName: "german",     whisperCode: "de", marksSpeakerGender: false, synonyms: ["ger", "deu", "german", "deutsch"] },
+  it: { code: "it", englishName: "Italian",    nativeName: "Italiano",    flag: "🇮🇹", script: "latin",    whisperName: "italian",    whisperCode: "it", marksSpeakerGender: true,  synonyms: ["ita", "italian", "italiano"] },
+  pt: { code: "pt", englishName: "Portuguese", nativeName: "Português", flag: "🇵🇹", script: "latin",    whisperName: "portuguese", whisperCode: "pt", marksSpeakerGender: true,  synonyms: ["por", "portuguese", "portugues", "português"] },
+  pl: { code: "pl", englishName: "Polish",     nativeName: "Polski",      flag: "🇵🇱", script: "latin",    whisperName: "polish",     whisperCode: "pl", marksSpeakerGender: true,  synonyms: ["pol", "polish", "polski"] },
+};
+// Total accessor: never throws, so label helpers stay safe even for an unexpected code.
+function langMeta(code: string): LangMeta {
+  return LANGUAGES[code] ??
+    { code, englishName: code, nativeName: code, flag: "", script: "latin", whisperName: code, whisperCode: code, marksSpeakerGender: false, synonyms: [] };
+}
 
 type Gender = "male" | "female";
 type Person = { name: string; gender: Gender };
@@ -249,16 +288,18 @@ async function lookupUser(tgUser: any) {
 }
 
 async function lookupPartner(userId: string) {
-  // Use complementary native_language instead of .neq("id") so a stray 3rd row never breaks things.
-  const { data: self } = await supabase.from("users").select("native_language").eq("id", userId).single();
+  // Partner = the other member of the couple: the user whose native language is this
+  // user's learning language. Keying on the complementary language (instead of
+  // .neq("id")) means a stray 3rd row never breaks things, and it generalizes to any
+  // configured pair (no en/uk assumption).
+  const { data: self } = await supabase.from("users").select("native_language, learning_language").eq("id", userId).single();
   if (!self) return null;
-  const partnerLang = self.native_language === "en" ? "uk" : "en";
-  const { data, error } = await supabase.from("users").select("*").eq("native_language", partnerLang).maybeSingle();
+  const { data, error } = await supabase.from("users").select("*").eq("native_language", self.learning_language).maybeSingle();
   if (error) { console.error("lookupPartner failed:", error); return null; }
   return data;
 }
 
-async function lookupLearnerOfLanguage(lang: "uk" | "en"): Promise<any | null> {
+async function lookupLearnerOfLanguage(lang: LangCode): Promise<any | null> {
   const { data, error } = await supabase.from("users").select("*").eq("learning_language", lang).maybeSingle();
   if (error) { console.error("lookupLearnerOfLanguage failed:", error); return null; }
   return data;
@@ -268,7 +309,7 @@ async function lookupLearnerOfLanguage(lang: "uk" | "en"): Promise<any | null> {
 // rows. Gender is invariant (GENDER_BY_NATIVE_LANG); names come from each user's
 // display_name, falling back to a neutral role label if a row is missing so
 // translate() and listings still read sensibly.
-function buildPersonMap(asker: any, partner: any): Record<"en" | "uk", Person> {
+function buildPersonMap(asker: any, partner: any): Record<LangCode, Person> {
   const make = (lang: "en" | "uk"): Person => {
     const row = [asker, partner].find((r) => r?.native_language === lang);
     return {
@@ -279,22 +320,23 @@ function buildPersonMap(asker: any, partner: any): Record<"en" | "uk", Person> {
   return { en: make("en"), uk: make("uk") };
 }
 
-function langLabel(lang: "uk" | "en"): string {
-  return lang === "uk" ? "Ukrainian" : "English";
+function langLabel(lang: LangCode): string {
+  return langMeta(lang).englishName;
 }
 
-function langFlag(lang: "uk" | "en"): string {
-  return lang === "uk" ? "\ud83c\uddfa\ud83c\udde6" : "\ud83c\uddec\ud83c\udde7";
+function langFlag(lang: LangCode): string {
+  return langMeta(lang).flag;
 }
 
-function speakerName(lang: string, persons: Record<"en" | "uk", Person>): string {
-  return (lang === "en" || lang === "uk") ? persons[lang].name : "?";
+function speakerName(lang: LangCode, persons: Record<LangCode, Person>): string {
+  return persons[lang]?.name ?? "?";
 }
 
-function parseLangArg(token: string): "uk" | "en" | null {
+function parseLangArg(token: string): LangCode | null {
   const t = token.trim().toLowerCase();
-  if (["uk", "ua", "ukr", "ukrainian", "\u0443\u043a\u0440", "\u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430"].includes(t)) return "uk";
-  if (["en", "eng", "english", "\u0430\u043d\u0433\u043b", "\u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430"].includes(t)) return "en";
+  for (const meta of Object.values(LANGUAGES)) {
+    if (meta.code === t || meta.synonyms.includes(t)) return meta.code;
+  }
   return null;
 }
 
@@ -1400,7 +1442,7 @@ async function handleHelp(msg: any, user: any) {
   await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
 }
 
-async function fetchTopUnlearned(lang: "uk" | "en", learnerId: string | null, limit: number): Promise<any[]> {
+async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
   if (!learnerId) return [];
   const { data, error } = await supabase.rpc("vocab_top_unlearned", {
     p_language: lang,
@@ -1514,7 +1556,7 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   }
   const N = Math.min(n, 50);
 
-  let targetLang: "uk" | "en";
+  let targetLang: LangCode;
   if (langTokenRaw) {
     const parsed = parseLangArg(langTokenRaw);
     if (!parsed) {
