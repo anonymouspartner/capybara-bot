@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v67";
+const BUILD_VERSION = "v68";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -225,11 +225,17 @@ async function handleUpdate(update: any) {
   // Command dispatch table — to add a command, append one entry here.
   type Cmd = { match: (t: string) => boolean; handle: (m: any, u: any) => Promise<void> };
   const COMMANDS: Cmd[] = [
-    { match: t => t === "/start", handle: async (m, u) => { await sendMessage(m.chat.id,
-        `Hi ${u.display_name}! Send me text or voice messages in ${langLabel(u.native_language)}, ` +
-        `and I'll translate them to ${langLabel(u.learning_language)}.\n\n` +
-        `You can also send photos, videos, files, stickers, GIFs, audio, locations, and contacts — I'll forward them to your partner, and translate any caption.\n\n` +
-        `Everything is saved as a study corpus.\n\nType /help to see what I can do.`); } },
+    { match: t => t === "/start", handle: async (m, u) => {
+        const solo = !(await lookupPartner(u.id));
+        const media = solo
+          ? `Send a photo, file, GIF, or audio with a caption and I'll translate the caption into your study corpus too.\n\n`
+          : `You can also send photos, videos, files, stickers, GIFs, audio, locations, and contacts — I'll forward them to the other person, and translate any caption.\n\n`;
+        const tail = solo
+          ? `Everything is saved as your personal study corpus, searchable with /recap.\n\nType /help to see what I can do.`
+          : `Everything is saved as a study corpus.\n\nType /help to see what I can do.`;
+        await sendMessage(m.chat.id,
+          `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
+          media + tail); } },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
@@ -461,9 +467,11 @@ async function handleTextMessage(msg: any, user: any) {
   const originalText = msg.text;
   const originalLang = await classifyLanguage(originalText, user.native_language, user.learning_language);
   const translationTargetLang = otherLang(originalLang, user);
-  const persons = buildPersonMap(user, await lookupPartner(user.id));
+  const partner = await lookupPartner(user.id);
+  const persons = buildPersonMap(user, partner);
   const speaker = persons[originalLang];
-  const addressee = persons[translationTargetLang];
+  // No partner (solo instance) = no fixed addressee, so skip addressee gender agreement.
+  const addressee = partner ? persons[translationTargetLang] : undefined;
   const translated = await translate(originalText, originalLang, translationTargetLang, speaker, addressee);
   const translationOk = translated !== null;
 
@@ -534,9 +542,10 @@ async function handleVoiceMessage(msg: any, user: any) {
     ? whisperCode
     : await classifyLanguage(transcript, user.native_language, user.learning_language);
   const targetLang = otherLang(originalLang, user);
-  const persons = buildPersonMap(user, await lookupPartner(user.id));
+  const partner = await lookupPartner(user.id);
+  const persons = buildPersonMap(user, partner);
   const speaker = persons[originalLang];
-  const addressee = persons[targetLang];
+  const addressee = partner ? persons[targetLang] : undefined;
   const translated = await translate(transcript, originalLang, targetLang, speaker, addressee);
   const translationOk = translated !== null;
 
@@ -1125,8 +1134,9 @@ async function translateAndForwardCaption(msg: any, user: any, caption: string) 
 async function translateCaptionToPartner(user: any, senderChatId: number, caption: string, telegramMessageId: number | null) {
   const originalLang = await classifyLanguage(caption, user.native_language, user.learning_language);
   const translationTargetLang = otherLang(originalLang, user);
-  const persons = buildPersonMap(user, await lookupPartner(user.id));
-  const translated = await translate(caption, originalLang, translationTargetLang, persons[originalLang], persons[translationTargetLang]);
+  const partner = await lookupPartner(user.id);
+  const persons = buildPersonMap(user, partner);
+  const translated = await translate(caption, originalLang, translationTargetLang, persons[originalLang], partner ? persons[translationTargetLang] : undefined);
   const translationOk = translated !== null;
 
   const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
@@ -1451,6 +1461,7 @@ async function refreshVocabularyCounts() {
 async function handleHelp(msg: any, user: any) {
   const isAdmin = msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID;
   const viewerLang = user.native_language === "uk" ? "uk" : "en";
+  const solo = !(await lookupPartner(user.id));
   const lines: string[] = [];
   if (viewerLang === "uk") {
     lines.push(
@@ -1458,8 +1469,12 @@ async function handleHelp(msg: any, user: any) {
       "",
       "\u0414\u0432\u0456 \u043a\u043e\u043b\u043e\u0434\u0438: \ud83c\uddfa\ud83c\udde6 \u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0456 \ud83c\uddec\ud83c\udde7 \u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430.",
       "",
-      "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0456 \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
-      "\u2022 \u041d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0444\u043e\u0442\u043e \u0430\u0431\u043e \u0432\u0456\u0434\u0435\u043e \u2014 \u044f \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u0439\u043e\u0433\u043e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
+      solo
+        ? "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u043c\u0456\u0436 \u0442\u0432\u043e\u0457\u043c\u0438 \u0434\u0432\u043e\u043c\u0430 \u043c\u043e\u0432\u0430\u043c\u0438"
+        : "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0456 \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
+      solo
+        ? "\u2022 \u0414\u043e\u0434\u0430\u0439 \u043f\u0456\u0434\u043f\u0438\u0441 \u0434\u043e \u0444\u043e\u0442\u043e/\u0444\u0430\u0439\u043b\u0443 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0439\u043e\u0433\u043e \u0443 \u0442\u0432\u0456\u0439 \u043a\u043e\u0440\u043f\u0443\u0441"
+        : "\u2022 \u041d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0444\u043e\u0442\u043e \u0430\u0431\u043e \u0432\u0456\u0434\u0435\u043e \u2014 \u044f \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u0439\u043e\u0433\u043e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
       "\u2022 /vocab \u2014 \u041d\u0430\u0439\u0447\u0430\u0441\u0442\u0456\u0448\u0456 \u0441\u043b\u043e\u0432\u0430, \u0449\u0435 \u043d\u0435 \u0432\u0438\u0432\u0447\u0435\u043d\u0456",
       "\u2022 /learn <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0414\u043e\u0434\u0430\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0434\u043e \u043a\u043e\u043b\u043e\u0434\u0438",
       "\u2022 /learn top N \u2014 \u041e\u043f\u0442\u043e\u043c \u0434\u043e\u0434\u0430\u0442\u0438 N \u0441\u043b\u0456\u0432",
@@ -1482,8 +1497,12 @@ async function handleHelp(msg: any, user: any) {
       "",
       "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
       "",
-      "\u2022 Just type or send a voice message \u2014 I translate it and forward to your partner",
-      "\u2022 Send a photo, video, file, sticker, GIF, audio, location, or contact \u2014 I forward it to your partner",
+      solo
+        ? "\u2022 Just type or send a voice message \u2014 I translate it between your two languages"
+        : "\u2022 Just type or send a voice message \u2014 I translate it and forward to the other person",
+      solo
+        ? "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it into your study corpus"
+        : "\u2022 Send a photo, video, file, sticker, GIF, audio, location, or contact \u2014 I forward it to the other person",
       "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it and add it to your study corpus",
       "\u2022 /vocab \u2014 Top words still unlearned in each deck",
       "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
@@ -1568,10 +1587,16 @@ async function handleVocab(msg: any, user: any) {
   ]);
   const sections: string[] = [];
   sections.push(...formatVocabSection(learnLang, learnWords, user, learnLearner));
+  // Only show the other-language deck if someone is actually learning it (a solo
+  // instance has no learner for the user's native language, so that deck is hidden).
+  if (nativeLearner) {
+    sections.push("");
+    sections.push(...formatVocabSection(nativeLang, nativeWords, user, nativeLearner));
+  }
   sections.push("");
-  sections.push(...formatVocabSection(nativeLang, nativeWords, user, nativeLearner));
-  sections.push("");
-  sections.push(`_Add with_ \`/learn <word>\` _or_ \`/learn top N ${learnLang}\` _/_ \`/learn top N ${nativeLang}\`_._`);
+  sections.push(nativeLearner
+    ? `_Add with_ \`/learn <word>\` _or_ \`/learn top N ${learnLang}\` _/_ \`/learn top N ${nativeLang}\`_._`
+    : `_Add with_ \`/learn <word>\` _or_ \`/learn top N\`_._`);
   await sendMessage(msg.chat.id, sections.join("\n"), "Markdown");
 }
 
