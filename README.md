@@ -1,8 +1,10 @@
 # Capybara
 
-A private **English ↔ Ukrainian** Telegram translation bot for a couple, that doubles
+A private **two-language** Telegram translation bot for a couple, that doubles
 as a bilingual **language-study corpus** and a shared, private **relationship-memory**
-tool (`/recap`).
+tool (`/recap`). Each instance is configured for one language pair at setup — English ↔
+Ukrainian out of the box, or any pair from the built-in registry (English, Ukrainian,
+Spanish, French, German, Italian, Portuguese, Polish; extensible in `index.ts`).
 
 Send the bot a text or voice message and it replies with the translation and forwards
 it to your partner — while quietly logging everything as study material (vocabulary,
@@ -41,20 +43,22 @@ translating any caption along the way.
 Capybara wears three hats at once. Every message a partner sends flows through all of
 them in a single turn.
 
-**1. Translator (EN ↔ UK).**
+**1. Translator (the configured pair).**
 - **Text and voice both work.** Voice notes are transcribed (OpenAI Whisper) and then
   translated; the original audio is archived to private storage.
-- **Direction is auto-detected from script** (Cyrillic → Ukrainian, Latin → English),
-  so either partner can write in either language — including the language they're
-  *learning* — and it still routes correctly.
-- **Gendered Ukrainian.** Translations into Ukrainian are told the speaker's and
-  addressee's gender (English-native = male, Ukrainian-native = female) so past-tense
-  verbs, adjectives, and participles agree with the real people. Names come from your
-  `users` rows; the genders are fixed.
-- **Never Russian.** Cyrillic in this project is *always* Ukrainian. The prompts
-  enforce standard literary Ukrainian and reject Russian / surzhyk forms, even when the
-  input is ambiguous. Whisper is retried forcing `language=uk` if it mishears a clip as
-  a neighbouring Slavic language.
+- **Direction is auto-detected.** Either partner can write in either language — including
+  the one they're *learning* — and it routes correctly. Cross-script pairs (anything with
+  Ukrainian, the only Cyrillic language in the default registry) use a free script check;
+  same-script pairs (e.g. English ↔ Spanish) are disambiguated by a cheap Claude Haiku
+  classification, defaulting to the sender's language when unsure.
+- **Grammatical gender.** For target languages that mark it (Ukrainian, Spanish, French,
+  …), translations are told the speaker's and addressee's gender — stored per user
+  (`users.gender`) — so past-tense verbs, adjectives, and participles agree with the real
+  people. Names come from your `users` rows.
+- **Per-language discipline.** Language-specific translation rules live in the language
+  registry. For Ukrainian that means standard literary Ukrainian with Russian / surzhyk
+  forms rejected even on ambiguous input, and Whisper retried forcing the sender's
+  language if it mishears a clip as a neighbouring language.
 - **Forwards to your partner.** Each translation (and the original) is relayed to the
   other partner automatically, so the bot doubles as the chat channel itself.
 - **Any attachment passes through.** Photos, videos and round "video notes",
@@ -70,8 +74,9 @@ them in a single turn.
 - Every message — and every media **caption** — is **annotated in the background** (Claude) into **vocabulary**
   (lemma + part of speech + gloss + cross-language translation), **grammar features**,
   **idioms**, and **register**.
-- **Two decks of equal weight** — a 🇺🇦 Ukrainian deck and a 🇬🇧 English deck — built
-  from the words that actually came up in *your* conversations.
+- **Two decks of equal weight** — one per language of your pair (e.g. 🇺🇦 Ukrainian and
+  🇬🇧 English) — built from the words that actually came up in *your* conversations. Each
+  word's gloss is given in the learner's own language.
 - `/vocab` surfaces the top still-unlearned words; `/learn` / `/forget` curate a deck;
   `/export` produces a ready-to-import **Anki CSV** with both sub-decks and example
   sentences drawn from real messages.
@@ -107,7 +112,7 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
   `EdgeRuntime.waitUntil` when available, so the user isn't kept waiting on study-corpus
   bookkeeping.
 - **Admin gating.** Maintenance commands (`/diag`, `/backfill*`, `/recap_backfill`) are
-  restricted to the `ADMIN_TELEGRAM_ID` (the English-native partner), read once at boot.
+  restricted to the `ADMIN_TELEGRAM_ID` partner, read once at boot.
 
 ## The `/recap` memory pipeline
 
@@ -134,8 +139,9 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
 
 Each couple runs **one isolated Supabase project + one Telegram bot** — not
 multi-tenant. Separate projects give perfect data isolation for free. Every instance is
-the **same pair**: an English-native partner (learning Ukrainian) and a Ukrainian-native
-partner (learning English). The **English-native partner is the admin**.
+**two people with complementary languages**, chosen at provisioning (native + learning,
+plus each partner's gender): English ↔ Ukrainian by default, or any pair from the
+registry. Whichever partner's Telegram ID is set as `ADMIN_TELEGRAM_ID` is the **admin**.
 
 **Self-hosted.** You run your own Supabase project, your own Anthropic/OpenAI keys, your
 own bot, and your own deploys. The single canonical `index.ts` is couple-agnostic —
@@ -255,7 +261,7 @@ for a menu. In brief:
 | `WEBHOOK_SECRET` | freshly generated, e.g. `openssl rand -hex 32` |
 | `ANTHROPIC_API_KEY` | your Anthropic key |
 | `OPENAI_API_KEY` | your OpenAI key (Whisper + embeddings) |
-| `ADMIN_TELEGRAM_ID` | the **English-native** partner's numeric Telegram ID |
+| `ADMIN_TELEGRAM_ID` | the **admin** partner's numeric Telegram ID |
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are **auto-injected** by Supabase — don't set them.
 
@@ -423,7 +429,7 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 
 ## Admin & maintenance commands
 
-These are gated to the admin (English-native partner) and exist mainly for **migrating
+These are gated to the admin partner and exist mainly for **migrating
 an existing corpus** — new couples can ignore them.
 
 | Command | Does |
