@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v64";
+const BUILD_VERSION = "v65";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -355,48 +355,104 @@ function detectScriptRatios(text: string): { cyrillicRatio: number; letters: num
   return { cyrillicRatio: letters === 0 ? 0 : cyrillic / letters, letters };
 }
 
-function detectLanguageFromScript(text: string): "uk" | "en" | null {
+// The instance's two languages are the sender's native and learning languages (one
+// couple, two complementary languages). otherLang flips between them; isInstanceLang
+// tests membership.
+function otherLang(code: LangCode, user: any): LangCode {
+  return code === user.native_language ? user.learning_language : user.native_language;
+}
+function isInstanceLang(code: LangCode, user: any): boolean {
+  return code === user.native_language || code === user.learning_language;
+}
+
+// Decide which of the instance's two languages a message is in. Cross-script pairs
+// (anything paired with a different script, e.g. Ukrainian vs a Latin language) use the
+// free, deterministic script check. Same-script pairs can't be told apart by script, so
+// they fall to a cheap Haiku classification. No letters, or an unsure/failed classify,
+// falls back to defaultLang (the sender's expected language).
+async function classifyLanguage(text: string, defaultLang: LangCode, otherLangCode: LangCode): Promise<LangCode> {
   const { cyrillicRatio, letters } = detectScriptRatios(text);
-  if (letters === 0) return null;
-  if (cyrillicRatio > CYRILLIC_SKIP_THRESHOLD) return "uk";
-  if (cyrillicRatio < (1 - CYRILLIC_SKIP_THRESHOLD)) return "en";
+  if (letters === 0) return defaultLang;
+  if (langMeta(defaultLang).script !== langMeta(otherLangCode).script) {
+    const cyrLang = langMeta(defaultLang).script === "cyrillic" ? defaultLang : otherLangCode;
+    const latLang = langMeta(defaultLang).script === "cyrillic" ? otherLangCode : defaultLang;
+    if (cyrillicRatio > CYRILLIC_SKIP_THRESHOLD) return cyrLang;
+    if (cyrillicRatio < (1 - CYRILLIC_SKIP_THRESHOLD)) return latLang;
+    return defaultLang; // ambiguous script mix -> sender's expected language
+  }
+  return await classifyLanguageLLM(text, defaultLang, otherLangCode);
+}
+
+// Same-script disambiguation via the cheap model (same tier as the /recap parser).
+// Always resolves to one of the two candidates; any failure/unsure -> defaultLang.
+async function classifyLanguageLLM(text: string, defaultLang: LangCode, otherLangCode: LangCode): Promise<LangCode> {
+  const dm = langMeta(defaultLang), om = langMeta(otherLangCode);
+  try {
+    const result = await withRetry(() => anthropic.messages.create({
+      model: CLAUDE_HAIKU_MODEL,
+      max_tokens: 8,
+      system: `Identify which language a message is written in. It is either ${dm.englishName} (code "${defaultLang}") or ${om.englishName} (code "${otherLangCode}"). Reply with ONLY one token: ${defaultLang}, ${otherLangCode}, or unsure. No punctuation, no explanation. If it is a proper noun, a shared cognate, or too short to tell, reply unsure.`,
+      messages: [{ role: "user", content: text }],
+    }));
+    const block = result.content.find((b) => b.type === "text");
+    const ans = block?.type === "text" ? block.text.trim().toLowerCase() : "";
+    if (ans === defaultLang) return defaultLang;
+    if (ans === otherLangCode) return otherLangCode;
+    return defaultLang;
+  } catch (e) {
+    console.error("classifyLanguage LLM failed:", e);
+    return defaultLang;
+  }
+}
+
+// Map a Whisper-reported language name (e.g. "spanish") to a registered code, or null.
+function whisperLangToCode(name: string): LangCode | null {
+  const n = (name ?? "").toLowerCase();
+  for (const meta of Object.values(LANGUAGES)) {
+    if (meta.whisperName === n) return meta.code;
+  }
   return null;
 }
 
-function exampleScriptMatchesLanguage(text: string, language: "uk" | "en"): boolean {
+function exampleScriptMatchesLanguage(text: string, language: LangCode): boolean {
   if (!text) return false;
   const { cyrillicRatio, letters } = detectScriptRatios(text);
   if (letters === 0) return false;
-  if (language === "uk") return cyrillicRatio >= CYRILLIC_SKIP_THRESHOLD;
+  if (langMeta(language).script === "cyrillic") return cyrillicRatio >= CYRILLIC_SKIP_THRESHOLD;
   return cyrillicRatio <= (1 - CYRILLIC_SKIP_THRESHOLD);
 }
 
-function scheduleAnnotation(messageId: string, text: string, language: "uk" | "en", source: string, parallelText?: string) {
+function scheduleAnnotation(messageId: string, text: string, language: LangCode, source: string, parallelText?: string) {
   if (!text) return;
+  // Only meaningful for cross-script pairs: if the two instance languages share a
+  // script, latin/cyrillic ratios never contradict the claimed language, so the check
+  // naturally passes and everything is annotated.
   const { cyrillicRatio, letters } = detectScriptRatios(text);
+  const expectedScript = langMeta(language).script;
   const wrongScript = letters === 0 ||
-    (language === "en" && cyrillicRatio > CYRILLIC_SKIP_THRESHOLD) ||
-    (language === "uk" && cyrillicRatio < (1 - CYRILLIC_SKIP_THRESHOLD));
+    (expectedScript === "latin" && cyrillicRatio > CYRILLIC_SKIP_THRESHOLD) ||
+    (expectedScript === "cyrillic" && cyrillicRatio < (1 - CYRILLIC_SKIP_THRESHOLD));
   if (wrongScript) {
     console.log(`skip annotation: ${source} ${messageId} letters=${letters} cyrillic=${Math.round(cyrillicRatio * 100)}%, expected ${language}`);
-    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(messageId));
+    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(messageId, language));
     return;
   }
   scheduleBackgroundWork(`annotateMessage (${source}, ${messageId})`, annotateMessage(messageId, text, language, parallelText));
 }
 
-async function writeFallbackAnnotation(messageId: string) {
+// Language-tagged so message_annotations.language (generated from details->>'language')
+// is the real side language, letting the backfill anti-join retire the side.
+async function writeFallbackAnnotation(messageId: string, language: LangCode) {
   const { error } = await supabase.from("message_annotations").upsert(
-    [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral" }],
+    [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral", details: { language } }],
     { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
   if (error) console.error("fallback row insert failed:", error);
 }
 
 async function handleTextMessage(msg: any, user: any) {
   const originalText = msg.text;
-  const detectedLang = detectLanguageFromScript(originalText);
-  const originalLang: "en" | "uk" = detectedLang ?? (user.native_language as "en" | "uk");
-  const translationTargetLang: "en" | "uk" = originalLang === "uk" ? "en" : "uk";
+  const originalLang = await classifyLanguage(originalText, user.native_language, user.learning_language);
+  const translationTargetLang = otherLang(originalLang, user);
   const persons = buildPersonMap(user, await lookupPartner(user.id));
   const speaker = persons[originalLang];
   const addressee = persons[translationTargetLang];
@@ -423,9 +479,9 @@ async function handleTextMessage(msg: any, user: any) {
   }
 
   if (inserted) {
-    if (originalLang === "uk" || originalLang === "en") scheduleAnnotation(inserted.id, originalText, originalLang, "text-original", translationOk ? translated! : undefined);
-    if (translationOk && (translationTargetLang === "uk" || translationTargetLang === "en")) scheduleAnnotation(inserted.id, translated!, translationTargetLang, "text-translation", originalText);
-    if (originalLang === "uk" || originalLang === "en") {
+    if (isInstanceLang(originalLang, user)) scheduleAnnotation(inserted.id, originalText, originalLang, "text-original", translationOk ? translated! : undefined);
+    if (translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(inserted.id, translated!, translationTargetLang, "text-translation", originalText);
+    if (isInstanceLang(originalLang, user)) {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, originalText, originalLang));
     }
   }
@@ -463,9 +519,13 @@ async function handleVoiceMessage(msg: any, user: any) {
   }
   const transcript = transcribeResult.text;
 
-  const detectedLang = detectLanguageFromScript(transcript);
-  const originalLang: "en" | "uk" = detectedLang ?? (user.native_language as "en" | "uk");
-  const targetLang: "en" | "uk" = originalLang === "uk" ? "en" : "uk";
+  // Prefer Whisper's acoustic language detection (free) when it maps to one of the
+  // instance's two languages; otherwise classify the transcript text.
+  const whisperCode = whisperLangToCode(transcribeResult.language);
+  const originalLang = (whisperCode && isInstanceLang(whisperCode, user))
+    ? whisperCode
+    : await classifyLanguage(transcript, user.native_language, user.learning_language);
+  const targetLang = otherLang(originalLang, user);
   const persons = buildPersonMap(user, await lookupPartner(user.id));
   const speaker = persons[originalLang];
   const addressee = persons[targetLang];
@@ -495,9 +555,9 @@ async function handleVoiceMessage(msg: any, user: any) {
   }
 
   if (inserted) {
-    if (originalLang === "uk" || originalLang === "en") scheduleAnnotation(inserted.id, transcript, originalLang, "voice-original", translationOk ? translated! : undefined);
-    if (translationOk && (targetLang === "uk" || targetLang === "en")) scheduleAnnotation(inserted.id, translated!, targetLang, "voice-translation", transcript);
-    if (originalLang === "uk" || originalLang === "en") {
+    if (isInstanceLang(originalLang, user)) scheduleAnnotation(inserted.id, transcript, originalLang, "voice-original", translationOk ? translated! : undefined);
+    if (translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(inserted.id, translated!, targetLang, "voice-translation", transcript);
+    if (isInstanceLang(originalLang, user)) {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, transcript, originalLang));
     }
   }
@@ -571,7 +631,7 @@ async function translate(
 }
 
 type WhisperResult =
-  | { ok: true; text: string }
+  | { ok: true; text: string; language: string }
   | { ok: false; error: string };
 
 type WhisperAttemptResult =
@@ -638,14 +698,16 @@ async function whisperRequest(audioBlob: Blob, language?: string): Promise<Whisp
 async function transcribeWithWhisper(audioBlob: Blob): Promise<WhisperResult> {
   const first = await whisperRequest(audioBlob);
   if (!first.ok) return first;
-  if (WHISPER_SUPPORTED_LANGUAGES.has(first.language)) return { ok: true, text: first.text };
+  if (WHISPER_SUPPORTED_LANGUAGES.has(first.language)) return { ok: true, text: first.text, language: first.language };
 
   console.log(`whisper detected unsupported language "${first.language}", retrying with language=uk`);
   const retry = await whisperRequest(audioBlob, "uk");
-  return retry.ok ? { ok: true, text: retry.text } : { ok: true, text: first.text };
+  // The retry forced Ukrainian, so report that as the settled language; if it failed,
+  // fall back to the first transcript and its (unsupported) detected language.
+  return retry.ok ? { ok: true, text: retry.text, language: "ukrainian" } : { ok: true, text: first.text, language: first.language };
 }
 
-function buildAnnotationPrompt(language: "uk" | "en", parallelText?: string): string {
+function buildAnnotationPrompt(language: LangCode, parallelText?: string): string {
   const langName = language === "uk" ? "Ukrainian" : "English";
   const otherLangName = language === "uk" ? "English" : "Ukrainian";
   // Sense anchor: annotation is a separate model call from translate(), so without
@@ -685,10 +747,10 @@ function buildAnnotationPrompt(language: "uk" | "en", parallelText?: string): st
   );
 }
 
-async function annotateMessage(messageId: string, text: string, language: "uk" | "en", parallelText?: string) {
+async function annotateMessage(messageId: string, text: string, language: LangCode, parallelText?: string) {
   const writeFallbackRow = async () => {
     const { error } = await supabase.from("message_annotations").upsert(
-      [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral" }],
+      [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral", details: { language } }],
       { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
     if (error) console.error("fallback row insert failed:", error);
   };
@@ -1047,9 +1109,8 @@ async function translateAndForwardCaption(msg: any, user: any, caption: string) 
 // gender agreement, shows the sender the translation, forwards a bilingual note to the
 // partner, and stores the caption as a study-corpus message (input_type "text").
 async function translateCaptionToPartner(user: any, senderChatId: number, caption: string, telegramMessageId: number | null) {
-  const detectedLang = detectLanguageFromScript(caption);
-  const originalLang: "en" | "uk" = detectedLang ?? (user.native_language as "en" | "uk");
-  const translationTargetLang: "en" | "uk" = originalLang === "uk" ? "en" : "uk";
+  const originalLang = await classifyLanguage(caption, user.native_language, user.learning_language);
+  const translationTargetLang = otherLang(originalLang, user);
   const persons = buildPersonMap(user, await lookupPartner(user.id));
   const translated = await translate(caption, originalLang, translationTargetLang, persons[originalLang], persons[translationTargetLang]);
   const translationOk = translated !== null;
@@ -1506,7 +1567,7 @@ async function handleVocab(msg: any, user: any) {
   await sendMessage(msg.chat.id, sections.join("\n"), "Markdown");
 }
 
-async function lemmatize(word: string, language: "uk" | "en"): Promise<string | null> {
+async function lemmatize(word: string, language: LangCode): Promise<string | null> {
   const langName = language === "uk" ? "Ukrainian" : "English";
   let result;
   try {
@@ -1528,7 +1589,7 @@ async function lemmatize(word: string, language: "uk" | "en"): Promise<string | 
   } catch (e) { console.error("lemmatize JSON parse failed:", block.text); return null; }
 }
 
-async function lookupVocabByLemma(lemma: string, language: "uk" | "en"): Promise<any[]> {
+async function lookupVocabByLemma(lemma: string, language: LangCode): Promise<any[]> {
   const { data, error } = await supabase.from("vocabulary")
     .select("id, lemma, part_of_speech, gloss, first_seen_message_id, language")
     .eq("language", language)
@@ -1620,19 +1681,18 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
 }
 
 async function resolveLearnTarget(user: any, word: string): Promise<
-  | { targetUser: any; targetLang: "uk" | "en"; isPartnerDeck: boolean }
+  | { targetUser: any; targetLang: LangCode; isPartnerDeck: boolean }
   | { error: string }
 > {
-  const detected = detectLanguageFromScript(word);
-  if (!detected) {
-    return { error: `Couldn't tell if "${word}" is Ukrainian or English. Try a word with clearer Cyrillic or Latin letters.` };
-  }
+  // A bare word is the hardest case for a same-script pair, so bias toward the asker's
+  // learning language (the usual intent of /learn) by passing it as the default.
+  const detected = await classifyLanguage(word, user.learning_language, user.native_language);
   if (detected === user.learning_language) {
     return { targetUser: user, targetLang: detected, isPartnerDeck: false };
   }
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    return { error: `Detected "${word}" as ${detected === "uk" ? "Ukrainian" : "English"}, but couldn't find a partner to add the card for.` };
+    return { error: `Detected "${word}" as ${langLabel(detected)}, but couldn't find a partner to add the card for.` };
   }
   return { targetUser: partner, targetLang: detected, isPartnerDeck: true };
 }
@@ -2221,7 +2281,7 @@ async function insertEmbedding(
   sourceType: "message" | "note",
   sourceId: string,
   content: string,
-  language: "uk" | "en",
+  language: LangCode,
   embedding: number[],
 ): Promise<void> {
   const { error } = await supabase.rpc("upsert_recap_embedding", {
@@ -2234,13 +2294,13 @@ async function insertEmbedding(
   if (error) console.error(`insertEmbedding (${sourceType}/${sourceId}) failed:`, error);
 }
 
-async function embedMessageBackground(messageId: string, text: string, language: "uk" | "en"): Promise<void> {
+async function embedMessageBackground(messageId: string, text: string, language: LangCode): Promise<void> {
   const emb = await embedText(text);
   if (!emb) { console.error(`embedMessageBackground skipped (${messageId}): embedding failed`); return; }
   await insertEmbedding("message", messageId, text, language, emb);
 }
 
-async function embedNoteBackground(noteId: string, text: string, language: "uk" | "en"): Promise<void> {
+async function embedNoteBackground(noteId: string, text: string, language: LangCode): Promise<void> {
   const emb = await embedText(text);
   if (!emb) { console.error(`embedNoteBackground skipped (${noteId}): embedding failed`); return; }
   await insertEmbedding("note", noteId, text, language, emb);
@@ -2409,8 +2469,7 @@ async function handleRemember(msg: any, user: any) {
     await sendMessage(msg.chat.id, "Usage: `/remember <note>`\n\nAdds a private note that only your own /recap will find.", "Markdown");
     return;
   }
-  const detected = detectLanguageFromScript(note);
-  const language: "uk" | "en" = detected ?? (user.native_language === "uk" ? "uk" : "en");
+  const language = await classifyLanguage(note, user.native_language, user.learning_language);
   const { data: inserted, error } = await supabase
     .from("notes")
     .insert({ author_id: user.id, content: note, language })
