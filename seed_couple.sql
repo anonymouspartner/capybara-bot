@@ -4,13 +4,15 @@
 -- + one Telegram bot). Run ONCE, after the DB migration is applied and the function
 -- is deployed, from the Dashboard SQL editor (or psql).
 --
--- The couple is always the same language pair:
---   * admin   = English-native partner  (native en, learning uk). This is also
---               the person whose Telegram ID goes in the ADMIN_TELEGRAM_ID
---               function secret.
---   * partner = Ukrainian-native partner (native uk, learning en).
--- (Gender is not stored -- the code derives en=male / uk=female. No Russian
--- anywhere; the placeholder names below are neutral, replace them.)
+-- One couple = two people with complementary languages, configured in the input
+-- block below (native/learning must be complementary: if admin is native en +
+-- learning uk, the partner is native uk + learning en).
+--   * admin is the person whose Telegram ID goes in the ADMIN_TELEGRAM_ID secret.
+-- Gender ('male'/'female') is stored per user and drives grammatical gender
+-- agreement for languages that mark it (Ukrainian, Spanish, French, ...). It
+-- requires the users.gender migration (20260719000000) applied first.
+-- Supported language codes: en, uk, es, fr, de, it, pt, pl (see the LANGUAGES
+-- registry in index.ts; add an entry there to support more).
 --
 -- HOW TO GET THE TWO TELEGRAM IDs (the onboarding trick):
 --   Before anyone is seeded the bot recognizes no one. When an unregistered
@@ -26,18 +28,22 @@
 -- Re-runnable: ON CONFLICT DO NOTHING means running this twice is harmless.
 -- ============================================================================
 
--- >>> EDIT THESE FOUR VALUES, then run the whole file. <<<
+-- >>> EDIT THESE VALUES, then run the whole file. <<<
 with input as (
   select
-    000000000::bigint                       as admin_telegram_id,    -- EDIT: English-native partner's Telegram ID
-    '<English-native partner name>'::text   as admin_display_name,   -- EDIT: that partner's display name
-    000000000::bigint                       as partner_telegram_id,  -- EDIT: Ukrainian-native partner's Telegram ID
-    '<Ukrainian-native partner name>'::text as partner_display_name  -- EDIT: that partner's display name
+    000000000::bigint                       as admin_telegram_id,    -- EDIT: admin partner's Telegram ID
+    '<admin partner name>'::text            as admin_display_name,   -- EDIT: admin's display name
+    'en'::text                              as admin_native,         -- EDIT: admin's native language code (en, uk, es, fr, de, it, pt, pl)
+    'uk'::text                              as admin_learning,       -- EDIT: admin's learning language code (= the partner's native)
+    'male'::text                            as admin_gender,         -- EDIT: 'male' or 'female'
+    000000000::bigint                       as partner_telegram_id,  -- EDIT: partner's Telegram ID
+    '<partner name>'::text                  as partner_display_name, -- EDIT: partner's display name
+    'female'::text                          as partner_gender        -- EDIT: 'male' or 'female'
 )
-insert into public.users (telegram_id, display_name, native_language, learning_language)
-select admin_telegram_id,   admin_display_name,   'en', 'uk' from input
+insert into public.users (telegram_id, display_name, native_language, learning_language, gender)
+select admin_telegram_id,   admin_display_name,   admin_native,   admin_learning, admin_gender   from input
 union all
-select partner_telegram_id, partner_display_name, 'uk', 'en' from input
+select partner_telegram_id, partner_display_name, admin_learning, admin_native,   partner_gender from input
 on conflict (telegram_id) do nothing;
 
 -- Default conversation row. The bot inserts every message with
@@ -49,9 +55,9 @@ insert into public.conversations (id, title)
 values ('00000000-0000-0000-0000-000000000001', 'Default conversation')
 on conflict (id) do nothing;
 
--- Verify: expect exactly two rows -- one 'en' native (admin) and one 'uk' native.
--- If you still see the <...> placeholders or 000000000 here, you ran it without
--- editing the input block above; fix the values and re-run.
-select native_language, learning_language, telegram_id, display_name
+-- Verify: expect exactly two rows with complementary native/learning languages
+-- and a gender each. If you still see the <...> placeholders or 000000000 here,
+-- you ran it without editing the input block above; fix the values and re-run.
+select native_language, learning_language, gender, telegram_id, display_name
 from public.users
 order by native_language;
