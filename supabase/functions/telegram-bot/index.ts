@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v66";
+const BUILD_VERSION = "v67";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1526,7 +1526,7 @@ async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit
 }
 
 function formatVocabSection(
-  langCode: "uk" | "en",
+  langCode: LangCode,
   words: any[],
   viewer: any,
   learnerOfLang: any | null,
@@ -1555,26 +1555,23 @@ function formatVocabSection(
 async function handleVocab(msg: any, user: any) {
   try { await refreshVocabularyCounts(); }
   catch (e) { console.error("refreshVocabularyCounts failed:", e); }
-  const [ukLearner, enLearner] = await Promise.all([
-    lookupLearnerOfLanguage("uk"),
-    lookupLearnerOfLanguage("en"),
+  // Show both instance-language decks, the user's own learning deck first.
+  const learnLang = user.learning_language;
+  const nativeLang = user.native_language;
+  const [learnLearner, nativeLearner] = await Promise.all([
+    lookupLearnerOfLanguage(learnLang),
+    lookupLearnerOfLanguage(nativeLang),
   ]);
-  const [ukWords, enWords] = await Promise.all([
-    fetchTopUnlearned("uk", ukLearner?.id ?? null, 10),
-    fetchTopUnlearned("en", enLearner?.id ?? null, 10),
+  const [learnWords, nativeWords] = await Promise.all([
+    fetchTopUnlearned(learnLang, learnLearner?.id ?? null, 10),
+    fetchTopUnlearned(nativeLang, nativeLearner?.id ?? null, 10),
   ]);
   const sections: string[] = [];
-  if (user.learning_language === "uk") {
-    sections.push(...formatVocabSection("uk", ukWords, user, ukLearner));
-    sections.push("");
-    sections.push(...formatVocabSection("en", enWords, user, enLearner));
-  } else {
-    sections.push(...formatVocabSection("en", enWords, user, enLearner));
-    sections.push("");
-    sections.push(...formatVocabSection("uk", ukWords, user, ukLearner));
-  }
+  sections.push(...formatVocabSection(learnLang, learnWords, user, learnLearner));
   sections.push("");
-  sections.push(`_Add with_ \`/learn <word>\` _or_ \`/learn top N uk\` _/_ \`/learn top N en\`_._`);
+  sections.push(...formatVocabSection(nativeLang, nativeWords, user, nativeLearner));
+  sections.push("");
+  sections.push(`_Add with_ \`/learn <word>\` _or_ \`/learn top N ${learnLang}\` _/_ \`/learn top N ${nativeLang}\`_._`);
   await sendMessage(msg.chat.id, sections.join("\n"), "Markdown");
 }
 
@@ -1906,7 +1903,7 @@ async function backfillGrind(chatId: number) {
 
 async function translateLemmasBatch(
   items: Array<{ id: string; lemma: string; part_of_speech: string | null; gloss: string | null }>,
-  sourceLang: "uk" | "en",
+  sourceLang: LangCode,
 ): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   if (items.length === 0) return out;
@@ -2325,7 +2322,7 @@ type CorpusMessageRow = {
   id: string;
   sender_id: string;
   original_text: string;
-  original_language: "uk" | "en";
+  original_language: LangCode;
   telegram_message_id: number | null;
   created_at: string;
 };
@@ -2500,30 +2497,30 @@ async function handleRemember(msg: any, user: any) {
 }
 
 type ParseOutput = {
-  language: "en" | "uk";
+  language: LangCode;
   time_window: { start: string; end: string } | null;
   shape: "narrow" | "broad";
   k: number;
 };
 
-function defaultParse(fallbackLang: "en" | "uk"): ParseOutput {
+function defaultParse(fallbackLang: LangCode): ParseOutput {
   return { language: fallbackLang, time_window: null, shape: "broad", k: RECAP_K_BROAD };
 }
 
-async function parseQuestion(question: string, fallbackLang: "en" | "uk"): Promise<ParseOutput> {
+async function parseQuestion(question: string, fallbackLang: LangCode, langs: LangCode[]): Promise<ParseOutput> {
   const today = new Date().toISOString().slice(0, 10);
   const system =
     `You are the parser for a /recap query on a bilingual relationship-memory bot. ` +
     `Extract structured fields from the user's question.\n\n` +
     `Output ONLY raw JSON with this shape:\n` +
     `{\n` +
-    `  "language": "en" | "uk",\n` +
+    `  "language": "${langs[0]}" | "${langs[1]}",\n` +
     `  "time_window": null | { "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" },\n` +
     `  "shape": "narrow" | "broad"\n` +
     `}\n\n` +
     `Today's date is ${today}.\n\n` +
     `Rules:\n` +
-    `- "language" is the dominant language of the question (en or uk). Detect from script and word content.\n` +
+    `- "language" is the dominant language of the question (${langs[0]} or ${langs[1]}). Detect from script and word content.\n` +
     `- "time_window" is null unless the question has an explicit time marker. If present, return an inclusive [start, end] range (YYYY-MM-DD).\n` +
     `- "shape" is "narrow" for specific factual questions and "broad" for open-ended ones.\n\n` +
     `Do NOT wrap in markdown code fences. Do NOT include preamble.`;
@@ -2549,7 +2546,7 @@ async function parseQuestion(question: string, fallbackLang: "en" | "uk"): Promi
     console.error("parseQuestion JSON parse failed:", block.text);
     return defaultParse(fallbackLang);
   }
-  const language: "en" | "uk" = (parsed.language === "uk" || parsed.language === "en") ? parsed.language : fallbackLang;
+  const language: LangCode = langs.includes(parsed.language) ? parsed.language : fallbackLang;
   const shape: "narrow" | "broad" = parsed.shape === "narrow" ? "narrow" : "broad";
   const tw = parsed.time_window;
   const isDate = (s: any) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -2563,7 +2560,7 @@ type RetrievedItem = {
   source_type: "message" | "note";
   source_id: string;
   content: string;
-  language: "en" | "uk";
+  language: LangCode;
   created_at: string;
   sender_name: string | null;
   author_id: string | null;
@@ -2667,7 +2664,7 @@ function buildCoupleIdentity(asker: any, partner: any): string {
 function buildSynthesisPrompt(
   askerName: string,
   coupleIdentity: string,
-  answerLanguage: "en" | "uk",
+  answerLanguage: LangCode,
   retrievedItems: string,
   question: string,
 ): string {
@@ -2681,7 +2678,7 @@ async function synthesizeAnswer(
   items: RetrievedItem[],
   askerName: string,
   coupleIdentity: string,
-  answerLanguage: "en" | "uk",
+  answerLanguage: LangCode,
 ): Promise<string | null> {
   const context = formatContextForSynthesis(items);
   const systemPrompt = buildSynthesisPrompt(askerName, coupleIdentity, answerLanguage, context, question);
@@ -2727,8 +2724,8 @@ async function handleRecap(msg: any, user: any) {
   }
   scheduleBackgroundWork(`recap typing (${msg.chat.id})`, sendChatAction(msg.chat.id, "typing"));
 
-  const askerFallbackLang: "en" | "uk" = user.native_language === "uk" ? "uk" : "en";
-  const parsed = await parseQuestion(question, askerFallbackLang);
+  const askerFallbackLang: LangCode = user.native_language;
+  const parsed = await parseQuestion(question, askerFallbackLang, [user.native_language, user.learning_language]);
 
   const qEmb = await embedText(question);
   if (!qEmb) {
@@ -2786,7 +2783,7 @@ async function handleRecapBackfill(msg: any, user: any) {
     await sendMessage(msg.chat.id, "Couldn't fetch backfill batch. Check logs.");
     return;
   }
-  const batch = (batchData as Array<{ id: string; original_text: string; original_language: "uk" | "en" }> | null) ?? [];
+  const batch = (batchData as Array<{ id: string; original_text: string; original_language: LangCode }> | null) ?? [];
   if (batch.length === 0) {
     await sendMessage(msg.chat.id, "\u2705 Recap backfill complete. 0 messages remaining.");
     return;
