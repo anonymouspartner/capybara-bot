@@ -1,16 +1,21 @@
 # Capybara
 
 A private **two-language** Telegram translation bot for two people who don't share a
-first language, that doubles as a bilingual **language-study corpus** and a shared,
-private **conversation-memory** tool (`/recap`). Each instance is configured for one language pair at setup — English ↔
-Ukrainian out of the box, or any pair from the built-in registry (English, Ukrainian,
-Spanish, French, German, Italian, Portuguese, Polish; extensible in `index.ts`).
+first language — or for one person learning another — that doubles as a bilingual
+**language-study corpus** and a searchable, private **conversation-memory** tool (`/recap`).
 
-Send the bot a text or voice message and it replies with the translation and forwards
-it to the other person — while quietly logging everything as study material (vocabulary,
-flashcards) and as a searchable shared memory. It also relays photos, videos, files,
-stickers, GIFs, audio, locations, and contacts (and whole photo albums) to the other person,
-translating any caption along the way.
+**Any language pair, not just English↔Ukrainian.** Each instance is configured at setup for
+whatever two languages you need — **English, Ukrainian, Spanish, French, German, Italian,
+Portuguese, or Polish** out of the box (and easily extended in `index.ts`), in any
+combination: English↔Ukrainian, English↔Spanish, Spanish↔French, and so on. Same-script
+pairs (e.g. English↔Spanish) are handled as well as cross-script ones. Run it for **two
+people**, or **solo** as a personal translator + tutor.
+
+Send the bot a text or voice message and it replies with the translation and (in a
+two-person instance) forwards it to the other person — while quietly logging everything as
+study material (vocabulary, flashcards) and as a searchable memory. It also relays photos,
+videos, files, stickers, GIFs, audio, locations, and contacts (and whole photo albums) to
+the other person, translating any caption along the way.
 
 > **Status:** in daily use. Self-hosted, one instance per pair, deployed by hand
 > behind a deliberately strict deploy gate.
@@ -400,7 +405,7 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 
 | Command | Does |
 |---|---|
-| *(any text/voice)* | Translate EN↔UK and forward to the other person |
+| *(any text/voice)* | Translate between your two languages and forward to the other person (solo: just translate) |
 | *(photo / video / file / sticker / GIF / audio / location / contact / album)* | Forward to the other person; a caption is translated and added to your corpus (video captions kept as-is) |
 | `/recap <question>` | Ask your shared conversation history (private to you) |
 | `/remember <note>` | Add a private note that `/recap` can find |
