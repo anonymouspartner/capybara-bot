@@ -28,22 +28,30 @@
 -- Re-runnable: ON CONFLICT DO NOTHING means running this twice is harmless.
 -- ============================================================================
 
+-- SOLO vs TWO-PERSON: to run a **solo** instance (just you — a personal translator +
+-- study corpus + /recap memory, no forwarding), leave `partner_telegram_id` at 0 and
+-- only your own user is created. Fill it in for a normal two-person instance. `admin_*`
+-- is always you (native + learning language + gender); the two languages you translate
+-- between are your native and learning languages either way.
+--
 -- >>> EDIT THESE VALUES, then run the whole file. <<<
 with input as (
   select
-    000000000::bigint                       as admin_telegram_id,    -- EDIT: admin partner's Telegram ID
-    '<admin partner name>'::text            as admin_display_name,   -- EDIT: admin's display name
-    'en'::text                              as admin_native,         -- EDIT: admin's native language code (en, uk, es, fr, de, it, pt, pl)
-    'uk'::text                              as admin_learning,       -- EDIT: admin's learning language code (= the partner's native)
+    000000000::bigint                       as admin_telegram_id,    -- EDIT: your Telegram ID (also the ADMIN_TELEGRAM_ID)
+    '<your name>'::text                     as admin_display_name,   -- EDIT: your display name
+    'en'::text                              as admin_native,         -- EDIT: your native language code (en, uk, es, fr, de, it, pt, pl)
+    'uk'::text                              as admin_learning,       -- EDIT: your learning language code (the other language)
     'male'::text                            as admin_gender,         -- EDIT: 'male' or 'female'
-    000000000::bigint                       as partner_telegram_id,  -- EDIT: partner's Telegram ID
-    '<partner name>'::text                  as partner_display_name, -- EDIT: partner's display name
+    000000000::bigint                       as partner_telegram_id,  -- EDIT (or leave 0 for SOLO): the other person's Telegram ID
+    '<partner name>'::text                  as partner_display_name, -- EDIT: the other person's display name
     'female'::text                          as partner_gender        -- EDIT: 'male' or 'female'
 )
 insert into public.users (telegram_id, display_name, native_language, learning_language, gender)
 select admin_telegram_id,   admin_display_name,   admin_native,   admin_learning, admin_gender   from input
 union all
+-- The second user is created only for a two-person instance (partner_telegram_id set).
 select partner_telegram_id, partner_display_name, admin_learning, admin_native,   partner_gender from input
+where partner_telegram_id is not null and partner_telegram_id <> 0
 on conflict (telegram_id) do nothing;
 
 -- Default conversation row. The bot inserts every message with
@@ -55,9 +63,9 @@ insert into public.conversations (id, title)
 values ('00000000-0000-0000-0000-000000000001', 'Default conversation')
 on conflict (id) do nothing;
 
--- Verify: expect exactly two rows with complementary native/learning languages
--- and a gender each. If you still see the <...> placeholders or 000000000 here,
--- you ran it without editing the input block above; fix the values and re-run.
+-- Verify: expect one row (solo) or two rows (two-person, complementary native/learning
+-- languages), each with a gender. If you still see the <...> placeholders or 000000000
+-- for the admin here, you ran it without editing the input block; fix and re-run.
 select native_language, learning_language, gender, telegram_id, display_name
 from public.users
 order by native_language;

@@ -311,6 +311,7 @@ async function ensureSupabaseAuth(): Promise<boolean> {
 
 // ---------------------------------------------------------------------------- SQL: bucket + seed
 type Seed = {
+  solo: boolean;
   adminId: string; adminName: string; adminNative: string; adminLearning: string; adminGender: string;
   partnerId: string; partnerName: string; partnerGender: string;
 };
@@ -325,7 +326,7 @@ function fillSeedSql(template: string, s: Seed): string {
   let i = 0;
   return template
     .replace(/000000000::bigint/g, () => `${i++ === 0 ? s.adminId : s.partnerId}::bigint`)
-    .replace("<admin partner name>", esc(s.adminName))
+    .replace("<your name>", esc(s.adminName))
     .replace("<partner name>", esc(s.partnerName));
 }
 
@@ -351,7 +352,9 @@ async function applyBucketAndSeedOverConnection(ref: string, dbpw: string, s: Se
           "insert into storage.buckets (id, name, public) values ('voice-messages','voice-messages',false) on conflict (id) do nothing",
         );
         await client.queryArray`insert into public.users (telegram_id, display_name, native_language, learning_language, gender) values (${s.adminId}, ${s.adminName}, ${s.adminNative}, ${s.adminLearning}, ${s.adminGender}) on conflict (telegram_id) do nothing`;
-        await client.queryArray`insert into public.users (telegram_id, display_name, native_language, learning_language, gender) values (${s.partnerId}, ${s.partnerName}, ${s.adminLearning}, ${s.adminNative}, ${s.partnerGender}) on conflict (telegram_id) do nothing`;
+        if (!s.solo) {
+          await client.queryArray`insert into public.users (telegram_id, display_name, native_language, learning_language, gender) values (${s.partnerId}, ${s.partnerName}, ${s.adminLearning}, ${s.adminNative}, ${s.partnerGender}) on conflict (telegram_id) do nothing`;
+        }
         await client.queryArray(
           `insert into public.conversations (id, title) values ('${CONV_UUID}','Default conversation') on conflict (id) do nothing`,
         );
@@ -517,27 +520,32 @@ async function main() {
     }
   }
 
-  // Step 3 - partners' IDs + names
-  step(3, "Who are the two partners?");
-  info("Each partner should message @userinfobot once and read their numeric Id.");
+  // Step 3 - who's using this instance
+  step(3, "Who's using this instance?");
+  const solo = await confirmYes("   Solo instance — just you (personal translator + study + /recap), no forwarding?");
+  info("Message @userinfobot once and read the numeric Id.");
   await maybeOpen("userinfobot", "https://t.me/userinfobot");
   const adminId = await askValidated(
-    "English-native partner's Telegram ID (this person is the admin):", V.id, "Numbers only.",
+    "Your Telegram ID (this is the admin):", V.id, "Numbers only.",
   );
-  const adminName = await askValidated("English-native partner's display name:", V.name, "1–64 chars, no < or >.");
-  let partnerId = await askValidated("Ukrainian-native partner's Telegram ID:", V.id, "Numbers only.");
-  while (partnerId === adminId) {
-    warn("That's the same ID as the admin — the two partners need different IDs.");
-    partnerId = await askValidated("Ukrainian-native partner's Telegram ID:", V.id, "Numbers only.");
+  const adminName = await askValidated("Your display name:", V.name, "1–64 chars, no < or >.");
+  let partnerId = "";
+  let partnerName = "";
+  if (!solo) {
+    partnerId = await askValidated("The other person's Telegram ID:", V.id, "Numbers only.");
+    while (partnerId === adminId) {
+      warn("That's the same ID as the admin — the two people need different IDs.");
+      partnerId = await askValidated("The other person's Telegram ID:", V.id, "Numbers only.");
+    }
+    partnerName = await askValidated("The other person's display name:", V.name, "1–64 chars, no < or >.");
   }
-  const partnerName = await askValidated("Ukrainian-native partner's display name:", V.name, "1–64 chars, no < or >.");
   values.ADMIN_TELEGRAM_ID = adminId;
-  // The guided wizard provisions the historical English↔Ukrainian pair (admin native
-  // en, partner native uk) and stores each partner's gender. For any other language
-  // pair or gender combination, edit and run seed_couple.sql directly — it takes each
-  // partner's language code and gender.
+  // The guided wizard provisions the historical English↔Ukrainian pair (admin native en,
+  // learning uk) and stores gender. For any other language pair or gender combination,
+  // edit and run seed_couple.sql directly — it takes each person's language code and
+  // gender, and supports solo by leaving the partner ID blank.
   const seed: Seed = {
-    adminId, adminName, adminNative: "en", adminLearning: "uk", adminGender: "male",
+    solo, adminId, adminName, adminNative: "en", adminLearning: "uk", adminGender: "male",
     partnerId, partnerName, partnerGender: "female",
   };
 
