@@ -1,18 +1,18 @@
 # Capybara
 
-A private **two-language** Telegram translation bot for a couple, that doubles
-as a bilingual **language-study corpus** and a shared, private **relationship-memory**
-tool (`/recap`). Each instance is configured for one language pair at setup — English ↔
+A private **two-language** Telegram translation bot for two people who don't share a
+first language, that doubles as a bilingual **language-study corpus** and a shared,
+private **conversation-memory** tool (`/recap`). Each instance is configured for one language pair at setup — English ↔
 Ukrainian out of the box, or any pair from the built-in registry (English, Ukrainian,
 Spanish, French, German, Italian, Portuguese, Polish; extensible in `index.ts`).
 
 Send the bot a text or voice message and it replies with the translation and forwards
-it to your partner — while quietly logging everything as study material (vocabulary,
+it to the other person — while quietly logging everything as study material (vocabulary,
 flashcards) and as a searchable shared memory. It also relays photos, videos, files,
-stickers, GIFs, audio, locations, and contacts (and whole photo albums) to your partner,
+stickers, GIFs, audio, locations, and contacts (and whole photo albums) to the other person,
 translating any caption along the way.
 
-> **Status:** in daily use. Self-hosted, one instance per couple, deployed by hand
+> **Status:** in daily use. Self-hosted, one instance per pair, deployed by hand
 > behind a deliberately strict deploy gate.
 
 ---
@@ -22,7 +22,7 @@ translating any caption along the way.
 - [What it does](#what-it-does)
 - [How it works](#how-it-works)
 - [The `/recap` memory pipeline](#the-recap-memory-pipeline)
-- [The model: one instance per couple](#the-model-one-instance-per-couple)
+- [The model: one instance per pair](#the-model-one-instance-per-pair)
 - [Data model](#data-model)
 - [Repository map](#repository-map)
 - [Prerequisites](#prerequisites)
@@ -40,13 +40,13 @@ translating any caption along the way.
 
 ## What it does
 
-Capybara wears three hats at once. Every message a partner sends flows through all of
+Capybara wears three hats at once. Every message a user sends flows through all of
 them in a single turn.
 
 **1. Translator (the configured pair).**
 - **Text and voice both work.** Voice notes are transcribed (OpenAI Whisper) and then
   translated; the original audio is archived to private storage.
-- **Direction is auto-detected.** Either partner can write in either language — including
+- **Direction is auto-detected.** Either person can write in either language — including
   the one they're *learning* — and it routes correctly. Cross-script pairs (anything with
   Ukrainian, the only Cyrillic language in the default registry) use a free script check;
   same-script pairs (e.g. English ↔ Spanish) are disambiguated by a cheap Claude Haiku
@@ -59,15 +59,15 @@ them in a single turn.
   registry. For Ukrainian that means standard literary Ukrainian with Russian / surzhyk
   forms rejected even on ambiguous input, and Whisper retried forcing the sender's
   language if it mishears a clip as a neighbouring language.
-- **Forwards to your partner.** Each translation (and the original) is relayed to the
-  other partner automatically, so the bot doubles as the chat channel itself.
+- **Forwards to the other person.** Each translation (and the original) is relayed to the
+  other person automatically, so the bot doubles as the chat channel itself.
 - **Any attachment passes through.** Photos, videos and round "video notes",
   files/documents, stickers, GIFs, audio, locations/venues, and contacts are all
-  forwarded to your partner by Telegram `file_id` — no size limit, no download. A
+  forwarded to the other person by Telegram `file_id` — no size limit, no download. A
   multi-photo **album** is regrouped and delivered as a single album, not a burst of
   separate messages.
 - **Captions are translated too.** A caption on a photo/file/GIF/audio is translated for
-  your partner and folded into the study corpus, exactly like a text message. (Video
+  the other person and folded into the study corpus, exactly like a text message. (Video
   captions are left as-is.)
 
 **2. Language-study corpus.**
@@ -81,7 +81,7 @@ them in a single turn.
   `/export` produces a ready-to-import **Anki CSV** with both sub-decks and example
   sentences drawn from real messages.
 
-**3. Private relationship memory.**
+**3. Private shared memory.**
 - `/recap <question>` answers questions about your shared history using hybrid
   semantic + keyword search over everything you've said, then a grounded synthesis
   (see [the pipeline below](#the-recap-memory-pipeline)).
@@ -98,8 +98,8 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
 ```
 
 - **One canonical file.** The entire bot is a single ~2,700-line
-  `supabase/functions/telegram-bot/index.ts`. It is **couple-agnostic** — nothing about
-  a specific couple is in the code; identity lives in secrets and seed data. **Never
+  `supabase/functions/telegram-bot/index.ts`. It is **instance-agnostic** — nothing about
+  a specific pair is in the code; identity lives in secrets and seed data. **Never
   fork it.**
 - **Webhook-driven.** Telegram POSTs updates to the function URL; an
   `x-telegram-bot-api-secret-token` header (your `WEBHOOK_SECRET`) gates every call.
@@ -112,7 +112,7 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
   `EdgeRuntime.waitUntil` when available, so the user isn't kept waiting on study-corpus
   bookkeeping.
 - **Admin gating.** Maintenance commands (`/diag`, `/backfill*`, `/recap_backfill`) are
-  restricted to the `ADMIN_TELEGRAM_ID` partner, read once at boot.
+  restricted to the `ADMIN_TELEGRAM_ID` user, read once at boot.
 
 ## The `/recap` memory pipeline
 
@@ -135,17 +135,17 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
    language, messages and notes are cited distinctly, and the model is instructed never
    to guess beyond the retrieved context or to play advisor/predictor/judge.
 
-## The model: one instance per couple
+## The model: one instance per pair
 
-Each couple runs **one isolated Supabase project + one Telegram bot** — not
+Each instance runs **one isolated Supabase project + one Telegram bot** — not
 multi-tenant. Separate projects give perfect data isolation for free. Every instance is
 **two people with complementary languages**, chosen at provisioning (native + learning,
-plus each partner's gender): English ↔ Ukrainian by default, or any pair from the
-registry. Whichever partner's Telegram ID is set as `ADMIN_TELEGRAM_ID` is the **admin**.
+plus each person's gender): English ↔ Ukrainian by default, or any pair from the
+registry. Whichever user's Telegram ID is set as `ADMIN_TELEGRAM_ID` is the **admin**.
 
 **Self-hosted.** You run your own Supabase project, your own Anthropic/OpenAI keys, your
-own bot, and your own deploys. The single canonical `index.ts` is couple-agnostic —
-nothing about a specific couple is baked into the code; it all lives in secrets and seed
+own bot, and your own deploys. The single canonical `index.ts` is instance-agnostic —
+nothing about a specific pair is baked into the code; it all lives in secrets and seed
 data. **Never fork `index.ts`** — one file deploys to every instance unchanged.
 
 ## Data model
@@ -158,7 +158,7 @@ connects as the service role.
 
 | Table | Holds |
 |---|---|
-| `users` | The two partners — Telegram ID, display name, native + learning language. |
+| `users` | The two people — Telegram ID, display name, native + learning language, gender. |
 | `conversations` | The single default conversation every message is filed under. |
 | `messages` | Every text/voice message and media caption: original + translation, languages, input type, voice metadata. |
 | `message_annotations` | Per-message vocabulary / grammar / idiom / register findings. |
@@ -208,7 +208,7 @@ database, not Storage).
 ## Prerequisites
 
 - A **Supabase** account + the **Supabase CLI** (`supabase`).
-- An **Anthropic** API key and an **OpenAI** API key (each couple uses their own).
+- An **Anthropic** API key and an **OpenAI** API key (each instance uses its own).
 - A **Telegram** account (create the bot via **@BotFather**).
 - **Deno** — the pre-deploy gate runs `deno check`.
 - **Git**.
@@ -230,7 +230,7 @@ deno run -A setup.ts
 It walks you through the whole setup one question at a time: it guides the steps that must
 be done in a browser/app (create the bot, create the Supabase project, get API keys) and
 automates the rest (generates `WEBHOOK_SECRET`, writes `.env`, applies the migration,
-creates the bucket, seeds the couple, sets secrets, **optionally wires up one-tap `/update`
+creates the bucket, seeds the two users, sets secrets, **optionally wires up one-tap `/update`
 self-deploy**, deploys, sets the webhook, smoke-tests). It's idempotent and resumable.
 
 **Prefer a local machine?** Install **Deno** + the **Supabase CLI** and run the same
@@ -239,7 +239,7 @@ self-deploy**, deploys, sets the webhook, smoke-tests). It's idempotent and resu
 for a menu. In brief:
 
 1. Create the bot (**@BotFather**) → bot token.
-2. Both partners get their Telegram IDs (e.g. via **@userinfobot**).
+2. Both people get their Telegram IDs (e.g. via **@userinfobot**).
 3. Create a Supabase project — **eu-west-1 / Postgres 17**.
 4. Apply the database migration — `supabase db push` (or paste the init migration into the Dashboard SQL editor).
 5. Create a **private storage bucket named `voice-messages`** (for voice-note audio).
@@ -251,7 +251,7 @@ for a menu. In brief:
 11. _(Optional)_ Enable one-tap **`/update`** self-deploy from Telegram — see the
     **Self-deploy from Telegram (`/update`)** section below.
 
-> New couples start with an **empty corpus**, so the `/backfill*` commands don't apply.
+> New instances start with an **empty corpus**, so the `/backfill*` commands don't apply.
 
 ## Secrets (set on your Supabase project)
 
@@ -261,7 +261,7 @@ for a menu. In brief:
 | `WEBHOOK_SECRET` | freshly generated, e.g. `openssl rand -hex 32` |
 | `ANTHROPIC_API_KEY` | your Anthropic key |
 | `OPENAI_API_KEY` | your OpenAI key (Whisper + embeddings) |
-| `ADMIN_TELEGRAM_ID` | the **admin** partner's numeric Telegram ID |
+| `ADMIN_TELEGRAM_ID` | the **admin** user's numeric Telegram ID |
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are **auto-injected** by Supabase — don't set them.
 
@@ -400,8 +400,8 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 
 | Command | Does |
 |---|---|
-| *(any text/voice)* | Translate EN↔UK and forward to your partner |
-| *(photo / video / file / sticker / GIF / audio / location / contact / album)* | Forward to your partner; a caption is translated and added to your corpus (video captions kept as-is) |
+| *(any text/voice)* | Translate EN↔UK and forward to the other person |
+| *(photo / video / file / sticker / GIF / audio / location / contact / album)* | Forward to the other person; a caption is translated and added to your corpus (video captions kept as-is) |
 | `/recap <question>` | Ask your shared conversation history (private to you) |
 | `/remember <note>` | Add a private note that `/recap` can find |
 | `/pin` · `/pinned` · `/unpin` | Mark / list / unmark meaningful messages (reply to one) |
@@ -417,20 +417,20 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 
 ## Privacy
 
-- **Per-couple isolation.** Each couple is a separate Supabase project, database, and
-  bot — there is no shared infrastructure and no cross-couple data path.
+- **Per-instance isolation.** Each instance is a separate Supabase project, database, and
+  bot — there is no shared infrastructure and no cross-instance data path.
 - **Private by default.** The storage bucket is private; the webhook is secret-gated;
   RLS is on for every table and the bot speaks only as the service role.
 - **Notes are personal.** `/remember` notes are only ever returned to their author's
-  own `/recap`. Messages are shared between the two partners by design (it's one
+  own `/recap`. Messages are shared between the two people by design (it's one
   conversation), but `/recap` answers are generated per-asker.
 - **Your keys, your data.** You bring your own Anthropic and OpenAI keys; nothing is
   routed through a shared service.
 
 ## Admin & maintenance commands
 
-These are gated to the admin partner and exist mainly for **migrating
-an existing corpus** — new couples can ignore them.
+These are gated to the admin user and exist mainly for **migrating
+an existing corpus** — new instances can ignore them.
 
 | Command | Does |
 |---|---|
@@ -462,7 +462,7 @@ deploy-safety and reproducibility handoffs that shaped them.
 - **Health route shows `adminConfigured: false`** — `ADMIN_TELEGRAM_ID` isn't set on
   that project. Set it and **redeploy** (it's read once at boot); admin commands stay
   gated shut until you do.
-- **Bot doesn't recognize a partner** — an unregistered Telegram user gets a reply with
+- **Bot doesn't recognize a user** — an unregistered Telegram user gets a reply with
   their own numeric ID. Put both IDs in `seed_couple.sql` and run it.
 - **A freshly-sent message doesn't appear in `/recap`** — expected: messages have a
   24-hour cooling-off. Use a `/remember` note to test recap immediately.
