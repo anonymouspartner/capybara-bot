@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v68";
+const BUILD_VERSION = "v69";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -242,6 +242,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
     { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
+    { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
     { match: t => t === "/diag",                                                         handle: handleDiag },
     { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
@@ -1013,6 +1014,7 @@ const ADMIN_COMMANDS: { command: string; description: string }[] = [
   { command: "update", description: "Admin: check/deploy a new build" },
   { command: "backfill", description: "Admin: backfill annotations" },
   { command: "backfill_translations", description: "Admin: backfill translations" },
+  { command: "backfill_senses", description: "Admin: fix wrong-sense flashcards" },
   { command: "reconcile", description: "Admin: reconcile forwarded media" },
   { command: "restore", description: "Admin: restore a message" },
   { command: "recap_backfill", description: "Admin: backfill recap embeddings" },
@@ -1526,6 +1528,7 @@ async function handleHelp(msg: any, user: any) {
     lines.push("_Admin:_");
     lines.push("\u2022 /backfill \u2014 Annotate one batch of unprocessed messages");
     lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
+    lines.push("\u2022 /backfill\\_senses \u2014 Re-fix flashcard translations to match their example sentence");
     lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
     lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
     lines.push("\u2022 /update \u2014 Check GitHub for a newer build; deploy with one tap");
@@ -2042,6 +2045,120 @@ async function handleBackfillTranslations(msg: any, user: any) {
       ? `Send the command again to continue.`
       : `\ud83c\udf89 All done!`);
   await sendMessage(msg.chat.id, reply);
+}
+
+// --- /backfill_senses: retroactively fix wrong-sense flashcard translations ---
+// Vocabulary rows created before the annotation sense-anchor shipped can carry a
+// lemma_translation in the wrong sense (e.g. "sorry" glossed as "засмучений"/saddened when
+// the sentence used it as an apology, "Вибач"). This re-derives lemma_translation + gloss
+// for every carded (studied) row using its example sentence AND the accepted translation as
+// the sense anchor, and overwrites the row only when the answer actually changes. Admin-only.
+
+// Re-derive one carded row's translation + gloss, anchored to how the word was actually
+// rendered in the accepted translation. Returns null on any failure.
+async function resenseCard(it: {
+  lemma: string; part_of_speech: string | null; language: LangCode; otherLanguage: LangCode;
+  sourceText: string; targetText: string;
+}): Promise<{ lemma_translation: string; gloss: string } | null> {
+  const langName = langMeta(it.language).englishName;
+  const otherName = langMeta(it.otherLanguage).englishName;
+  const notes = langMeta(it.otherLanguage).translationNotes;
+  const system =
+    `A ${langName} sentence was translated into ${otherName}:\n` +
+    `${langName}: "${it.sourceText}"\n` +
+    `${otherName}: "${it.targetText}"\n\n` +
+    `Analyze the ${langName} word "${it.lemma}" (${it.part_of_speech ?? "word"}) as it is used in that sentence.\n` +
+    `Return ONLY raw JSON: {"lemma_translation": "<dictionary form in ${otherName}>", "gloss": "<1-4 word ${otherName} gloss>"}.\n` +
+    `- lemma_translation MUST match the exact sense in which the word appears in the ${otherName} translation above — do not substitute a different sense.\n` +
+    `- Dictionary form: infinitive for verbs, nominative singular for nouns, base form for adjectives.\n` +
+    `- No markdown fences, no preamble.` +
+    (notes ? `\n${notes}` : "");
+  try {
+    const result = await withRetry(() => anthropic.messages.create({
+      model: CLAUDE_MODEL, max_tokens: 200, thinking: { type: "disabled" },
+      system, messages: [{ role: "user", content: it.lemma }],
+    }));
+    const block = result.content.find((b) => b.type === "text");
+    if (block?.type !== "text") return null;
+    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    const parsed = JSON.parse(cleaned);
+    const t = typeof parsed?.lemma_translation === "string" ? parsed.lemma_translation.trim() : "";
+    const g = typeof parsed?.gloss === "string" ? parsed.gloss.trim() : "";
+    if (!t) return null;
+    return { lemma_translation: t, gloss: g };
+  } catch (e) {
+    console.error("resenseCard failed:", e);
+    return null;
+  }
+}
+
+async function resenseGrind(chatId: number) {
+  const startedAt = Date.now();
+  // Studied deck = vocabulary rows referenced by a flashcard (cards are created with
+  // example_message_id = first_seen_message_id, so that message is the card's example).
+  const { data: cardRows, error: cErr } = await supabase
+    .from("flashcards")
+    .select("vocabulary(id, lemma, part_of_speech, language, first_seen_message_id, lemma_translation)");
+  if (cErr) { console.error("resense: flashcards fetch failed:", cErr); await sendMessage(chatId, "Couldn't fetch the deck. Check logs."); return; }
+  const vocabById = new Map<string, any>();
+  for (const r of (cardRows ?? []) as any[]) {
+    const v = r.vocabulary;
+    if (v?.id && v.first_seen_message_id) vocabById.set(v.id, v);
+  }
+  const vocab = [...vocabById.values()];
+  // Fetch the example messages in chunks (avoids an oversized IN filter).
+  const msgIds = [...new Set(vocab.map((v) => v.first_seen_message_id))];
+  const msgById = new Map<string, any>();
+  for (let i = 0; i < msgIds.length; i += 100) {
+    const { data: ms } = await supabase.from("messages")
+      .select("id, original_text, translated_text, original_language, translated_language")
+      .in("id", msgIds.slice(i, i + 100));
+    for (const m of (ms ?? []) as any[]) msgById.set(m.id, m);
+  }
+  // Build work items with the sense-anchor context (both language sides).
+  type Item = { id: string; lemma: string; part_of_speech: string | null; language: LangCode; otherLanguage: LangCode; sourceText: string; targetText: string; oldTranslation: string | null };
+  const items: Item[] = [];
+  for (const v of vocab) {
+    const m = msgById.get(v.first_seen_message_id);
+    if (!m || !m.translated_language || !m.translated_text) continue;
+    const isOrig = m.original_language === v.language;
+    const sourceText = isOrig ? m.original_text : m.translated_text;
+    const targetText = isOrig ? m.translated_text : m.original_text;
+    const otherLanguage = isOrig ? m.translated_language : m.original_language;
+    if (!sourceText || !targetText || !otherLanguage) continue;
+    items.push({ id: v.id, lemma: v.lemma, part_of_speech: v.part_of_speech, language: v.language, otherLanguage, sourceText, targetText, oldTranslation: v.lemma_translation });
+  }
+  let processed = 0, corrected = 0, unchanged = 0, failed = 0;
+  for (let i = 0; i < items.length; i += BACKFILL_CONCURRENCY) {
+    if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
+    const chunk = items.slice(i, i + BACKFILL_CONCURRENCY);
+    await Promise.allSettled(chunk.map(async (it) => {
+      const res = await resenseCard(it);
+      processed++;
+      if (!res) { failed++; return; }
+      if (res.lemma_translation === it.oldTranslation) { unchanged++; return; }
+      const patch: Record<string, string> = { lemma_translation: res.lemma_translation };
+      if (res.gloss) patch.gloss = res.gloss;
+      const { error: uErr } = await supabase.from("vocabulary").update(patch).eq("id", it.id);
+      if (uErr) { failed++; console.error("resense update failed:", uErr); } else { corrected++; }
+    }));
+  }
+  const remaining = items.length - processed;
+  await sendMessage(chatId,
+    `✅ Sense backfill run done.\n` +
+    `Cards checked: ${processed}/${items.length}\n` +
+    `Corrected: ${corrected}\n` +
+    `Already correct (unchanged): ${unchanged}\n` +
+    (failed > 0 ? `Failed: ${failed}\n` : "") +
+    (remaining > 0
+      ? `\nRan out of time with ${remaining} left — send /backfill_senses again to finish.`
+      : `\n🎉 Whole deck checked. Run /export and re-import into Anki (update existing notes when the first field matches) to refresh the cards — your study progress is kept.`));
+}
+
+async function handleBackfillSenses(msg: any, user: any) {
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  await sendMessage(msg.chat.id, "⏳ Re-deriving flashcard translations against each card's example sentence — I'll report when this run finishes.");
+  scheduleBackgroundWork("resenseGrind", resenseGrind(msg.chat.id));
 }
 
 // --- /update: check GitHub for a newer build, and (admin) deploy it with one tap ---
