@@ -94,10 +94,13 @@ them in a single turn.
   it's off by default. Text messages for now.
 
 **3. Private shared memory.**
-- `/recap <question>` answers questions about your shared history using hybrid
+- `/ask <question>` answers questions about your shared history using hybrid
   semantic + keyword search over everything you've said, then a grounded synthesis
   (see [the pipeline below](#the-recap-memory-pipeline)).
-- `/remember <note>` stores a private note that only *your* `/recap` can retrieve.
+- `/note <note>` stores a private note that only *your* `/ask` can retrieve.
+- Both have long-form aliases — `/recap` and `/remember` — which keep working. The short
+  names are what the `/` menu shows: a command you want to add text to has to be *typed*,
+  since tapping a menu entry sends it immediately.
 - `/pin` / `/pinned` / `/unpin` mark messages as meaningful (a small recall boost);
   `/reconcile` / `/restore` hide or restore a message from recap results.
 
@@ -414,8 +417,8 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 |---|---|
 | *(any text/voice)* | Translate between your two languages and forward to the other person (solo: just translate) |
 | *(photo / video / file / sticker / GIF / audio / location / contact / album)* | Forward to the other person; a caption is translated and added to your corpus (video captions kept as-is) |
-| `/recap <question>` | Ask your shared conversation history (private to you) |
-| `/remember <note>` | Add a private note that `/recap` can find |
+| `/ask <question>` | Ask your shared conversation history (private to you). Long form: `/recap` |
+| `/note <note>` | Add a private note that `/ask` can find. Long form: `/remember` |
 | `/pin` · `/pinned` · `/unpin` | Mark / list / unmark meaningful messages (reply to one) |
 | `/reconcile` · `/restore` | Hide / unhide a message from `/recap` (reply to one) |
 | `/vocab` | Top still-unlearned words in each deck |
