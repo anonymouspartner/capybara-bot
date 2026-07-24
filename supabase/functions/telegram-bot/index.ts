@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v71";
+const BUILD_VERSION = "v72";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1079,16 +1079,15 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "unpin", description: "Unpin a message" },
   { command: "pinned", description: "List pinned messages" },
 ];
+// Only the two commands an admin uses on a live instance appear in the menu. The
+// one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
+// /recap_backfill) and the reply-based /reconcile & /restore are intentionally omitted
+// to keep the menu clean -- they remain fully functional when typed, and /help still
+// lists them.
 const ADMIN_COMMANDS: { command: string; description: string }[] = [
   ...PUBLIC_COMMANDS,
   { command: "diag", description: "Admin: ping upstream APIs + DB" },
   { command: "update", description: "Admin: check/deploy a new build" },
-  { command: "backfill", description: "Admin: backfill annotations" },
-  { command: "backfill_translations", description: "Admin: backfill translations" },
-  { command: "backfill_senses", description: "Admin: fix wrong-sense flashcards" },
-  { command: "reconcile", description: "Admin: reconcile forwarded media" },
-  { command: "restore", description: "Admin: restore a message" },
-  { command: "recap_backfill", description: "Admin: backfill recap embeddings" },
 ];
 
 async function setMyCommands(commands: { command: string; description: string }[], scope?: unknown): Promise<boolean> {
