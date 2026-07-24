@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v72";
+const BUILD_VERSION = "v73";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -204,6 +204,13 @@ Deno.serve(async (req) => {
   }
 });
 
+// True if `text` invokes any of `names` -- matching "/name", "/name <args>", and the
+// group-chat "/name@BotName" form. Takes several names so one command can have short
+// aliases (e.g. /ask for /recap).
+function isCmd(text: string, ...names: string[]): boolean {
+  return names.some((n) => text === `/${n}` || text.startsWith(`/${n} `) || text.startsWith(`/${n}@`));
+}
+
 async function handleUpdate(update: any) {
   // Populate the "/" command menu on first use per warm instance (background, idempotent).
   scheduleBackgroundWork("ensureCommandsRegistered", ensureCommandsRegistered());
@@ -252,9 +259,12 @@ async function handleUpdate(update: any) {
     { match: t => t === "/pin" || t.startsWith("/pin@"),                                handle: handlePin },
     { match: t => t === "/unpin" || t.startsWith("/unpin@"),                            handle: handleUnpin },
     { match: t => t === "/pinned" || t.startsWith("/pinned@"),                          handle: handlePinned },
-    { match: t => t === "/remember" || t.startsWith("/remember ") || t.startsWith("/remember@"), handle: handleRemember },
+    // /note and /ask are short aliases for /remember and /recap -- the long names keep
+    // working, but the short ones are what the "/" menu advertises, since a command you
+    // want to add text to has to be typed out (tapping the menu entry sends it as-is).
+    { match: t => isCmd(t, "remember", "note"),                                         handle: handleRemember },
     { match: t => t === "/recap_backfill" || t.startsWith("/recap_backfill@"),          handle: handleRecapBackfill },
-    { match: t => t === "/recap" || t.startsWith("/recap ") || t.startsWith("/recap@"),  handle: handleRecap },
+    { match: t => isCmd(t, "recap", "ask"),                                             handle: handleRecap },
   ];
   if (msg.text) {
     for (const cmd of COMMANDS) {
@@ -1073,8 +1083,8 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "forget", description: "Remove a word from a deck" },
   { command: "export", description: "Download both decks as CSV for Anki" },
   { command: "capybara", description: "Toggle grammar help for your learning language" },
-  { command: "recap", description: "Ask your shared relationship memory" },
-  { command: "remember", description: "Save a private note to memory" },
+  { command: "ask", description: "Ask your shared conversation memory" },
+  { command: "note", description: "Save a private note to memory" },
   { command: "pin", description: "Pin a message to memory" },
   { command: "unpin", description: "Unpin a message" },
   { command: "pinned", description: "List pinned messages" },
@@ -1570,10 +1580,10 @@ async function handleHelp(msg: any, user: any) {
       "",
       "*\u041f\u0430\u043c'\u044f\u0442\u044c \u0440\u043e\u0437\u043c\u043e\u0432*",
       "",
-      "\u2022 /recap <\u0437\u0430\u043f\u0438\u0442> \u2014 \u0417\u0430\u043f\u0438\u0442\u0430\u0439 \u043f\u0440\u043e \u0432\u0430\u0448\u0456 \u0440\u043e\u0437\u043c\u043e\u0432\u0438 (\u043f\u0440\u0438\u0432\u0430\u0442\u043d\u043e)",
-      "\u2022 /remember <\u043d\u043e\u0442\u0430\u0442\u043a\u0430> \u2014 \u041f\u0440\u0438\u0432\u0430\u0442\u043d\u0430 \u043d\u043e\u0442\u0430\u0442\u043a\u0430",
-      "\u2022 /reconcile \u2014 \u0412\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c \u043d\u0430 \u043f\u043e\u0432\u0456\u0434\u043e\u043c\u043b\u0435\u043d\u043d\u044f, \u0449\u043e\u0431 \u0432\u0438\u043a\u043b\u044e\u0447\u0438\u0442\u0438 \u0437 /recap",
-      "\u2022 /restore \u2014 \u041f\u043e\u0432\u0435\u0440\u043d\u0443\u0442\u0438 \u0432 /recap",
+      "\u2022 /ask <\u0437\u0430\u043f\u0438\u0442> \u2014 \u0417\u0430\u043f\u0438\u0442\u0430\u0439 \u043f\u0440\u043e \u0432\u0430\u0448\u0456 \u0440\u043e\u0437\u043c\u043e\u0432\u0438 (\u043f\u0440\u0438\u0432\u0430\u0442\u043d\u043e)",
+      "\u2022 /note <\u043d\u043e\u0442\u0430\u0442\u043a\u0430> \u2014 \u041f\u0440\u0438\u0432\u0430\u0442\u043d\u0430 \u043d\u043e\u0442\u0430\u0442\u043a\u0430",
+      "\u2022 /reconcile \u2014 \u0412\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c \u043d\u0430 \u043f\u043e\u0432\u0456\u0434\u043e\u043c\u043b\u0435\u043d\u043d\u044f, \u0449\u043e\u0431 \u0432\u0438\u043a\u043b\u044e\u0447\u0438\u0442\u0438 \u0437 /ask",
+      "\u2022 /restore \u2014 \u041f\u043e\u0432\u0435\u0440\u043d\u0443\u0442\u0438 \u0432 /ask",
       "\u2022 /pin \u2014 \u041f\u043e\u0437\u043d\u0430\u0447\u0438\u0442\u0438 \u044f\u043a \u0432\u0430\u0436\u043b\u0438\u0432\u0435",
       "\u2022 /unpin \u2014 \u0417\u043d\u044f\u0442\u0438 \u043f\u043e\u0437\u043d\u0430\u0447\u043a\u0443",
       "\u2022 /pinned \u2014 \u0421\u043f\u0438\u0441\u043e\u043a \u0437\u0430\u043a\u0440\u0456\u043f\u043b\u0435\u043d\u0438\u0445",
@@ -1600,11 +1610,11 @@ async function handleHelp(msg: any, user: any) {
       "",
       "*Conversation memory*",
       "",
-      "\u2022 /recap <question> \u2014 Ask about your conversations (private to you)",
-      "\u2022 /remember <note> \u2014 Add a private note only your /recap finds",
-      "\u2022 /reconcile \u2014 Reply to a message to exclude it from /recap",
-      "\u2022 /restore \u2014 Reply to a message to bring it back into /recap",
-      "\u2022 /pin \u2014 Reply to a message to mark it meaningful (small /recap boost)",
+      "\u2022 /ask <question> \u2014 Ask about your conversations (private to you)",
+      "\u2022 /note <note> \u2014 Add a private note only your /ask finds",
+      "\u2022 /reconcile \u2014 Reply to a message to exclude it from /ask",
+      "\u2022 /restore \u2014 Reply to a message to bring it back into /ask",
+      "\u2022 /pin \u2014 Reply to a message to mark it meaningful (small /ask boost)",
       "\u2022 /unpin \u2014 Reply to a pinned message to remove the pin",
       "\u2022 /pinned \u2014 List all pinned messages chronologically",
     );
@@ -2706,7 +2716,7 @@ async function handleRemember(msg: any, user: any) {
   const firstSpace = text.indexOf(" ");
   const note = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
   if (!note) {
-    await sendMessage(msg.chat.id, "Usage: `/remember <note>`\n\nAdds a private note that only your own /recap will find.", "Markdown");
+    await sendMessage(msg.chat.id, "Usage: `/note <note>` (or `/remember`)\n\nAdds a private note that only your own /ask will find.", "Markdown");
     return;
   }
   const language = await classifyLanguage(note, user.native_language, user.learning_language);
@@ -2946,7 +2956,7 @@ async function handleRecap(msg: any, user: any) {
   const question = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
   if (!question) {
     await sendMessage(msg.chat.id,
-      "Usage: `/recap <question>`\n\nAsk about your conversations. Results are private to you. Notes from /remember participate alongside messages.",
+      "Usage: `/ask <question>` (or `/recap`)\n\nAsk about your conversations. Results are private to you. Notes from /note participate alongside messages.",
       "Markdown");
     return;
   }
