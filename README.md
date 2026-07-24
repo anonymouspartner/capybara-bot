@@ -85,6 +85,13 @@ them in a single turn.
 - `/vocab` surfaces the top still-unlearned words; `/learn` / `/forget` curate a deck;
   `/export` produces a ready-to-import **Anki CSV** with both sub-decks and example
   sentences drawn from real messages.
+- **On-demand grammar coaching (`/capybara`).** An opt-in, per-person switch: when it's
+  on and you write in the language you're *learning*, the bot checks the message and, if
+  something's off, replies **privately to you** with the corrected sentence and a one- or
+  two-sentence explanation **in your own language** — a correct sentence just gets a ✓.
+  The note is never forwarded to the other person, and your message still translates and
+  relays exactly as normal. Each person toggles their own (`/capybara`, `/capybara on|off`);
+  it's off by default. Text messages for now.
 
 **3. Private shared memory.**
 - `/recap <question>` answers questions about your shared history using hybrid
@@ -102,7 +109,7 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
                                                             +  OpenAI     (Whisper voice transcription + embeddings)
 ```
 
-- **One canonical file.** The entire bot is a single ~2,700-line
+- **One canonical file.** The entire bot is a single ~3,000-line
   `supabase/functions/telegram-bot/index.ts`. It is **instance-agnostic** — nothing about
   a specific pair is in the code; identity lives in secrets and seed data. **Never
   fork it.**
@@ -163,7 +170,7 @@ connects as the service role.
 
 | Table | Holds |
 |---|---|
-| `users` | The two people — Telegram ID, display name, native + learning language, gender. |
+| `users` | The two people — Telegram ID, display name, native + learning language, gender, and a per-person grammar-assistant toggle. |
 | `conversations` | The single default conversation every message is filed under. |
 | `messages` | Every text/voice message and media caption: original + translation, languages, input type, voice metadata. |
 | `message_annotations` | Per-message vocabulary / grammar / idiom / register findings. |
@@ -415,6 +422,7 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 | `/learn <word>` · `/learn top N [uk\|en]` | Add a word (or the top N) to a deck |
 | `/forget <word>` | Remove a word from the matching deck |
 | `/export` | Export both decks as a single Anki CSV |
+| `/capybara` · `/capybara on\|off` | Toggle a private grammar coach for your learning language (per person, off by default) |
 | `/help` · `/start` | Help / welcome |
 
 > `/recap` has a 24-hour cooling-off on **messages** (recent messages don't surface),
