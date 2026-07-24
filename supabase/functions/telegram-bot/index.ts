@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v69";
+const BUILD_VERSION = "v70";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1032,6 +1032,19 @@ async function setMyCommands(commands: { command: string; description: string }[
   return true;
 }
 
+// Pin the compose-box menu button to the "commands" mode so it renders as the "/"
+// command shortcut (which autofills a slash command on tap) rather than the default
+// "Menu" label. Set globally (no chat scope) — applies to every chat.
+async function setChatMenuButtonToCommands(): Promise<boolean> {
+  const resp = await fetch(`${TELEGRAM_API}/setChatMenuButton`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ menu_button: { type: "commands" } }),
+  });
+  if (!resp.ok) { console.error("setChatMenuButton failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
+  return true;
+}
+
 let commandsRegistered = false;
 // Register the "/" menu once per warm instance (self-heals on each cold start /
 // deploy, picking up any command changes). The flag flips only after success, so a
@@ -1043,7 +1056,8 @@ async function ensureCommandsRegistered(): Promise<void> {
   if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
     okAdmin = await setMyCommands(ADMIN_COMMANDS, { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
   }
-  if (okPublic && okAdmin) commandsRegistered = true;
+  const okMenuButton = await setChatMenuButtonToCommands();
+  if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
 }
 
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
