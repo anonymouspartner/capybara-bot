@@ -8,8 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v1";
-const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
+const BUILD_VERSION = "saas-v2";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
@@ -141,8 +140,72 @@ const RECAP_PIN_BOOST = 0.005;
 const RECAP_CANDIDATE_POOL = 50;
 const RECAP_BACKFILL_BATCH_SIZE = 50;
 
-const supabase = createClient(SUPABASE_URL, SERVICE_ROLE);
+// The raw, UNSCOPED client. It sees every tenant's rows, so it is deliberately not
+// named `supabase` -- in the single-tenant build that name was on every query, and
+// keeping it would let a copy-pasted line silently read the whole instance. Reach for
+// this only where crossing the tenant boundary is the actual intent (resolving an
+// incoming Telegram id to a tenant, superadmin totals, the media-group orphan sweep);
+// every such use is commented with why. Everything else goes through tenantDb().
+const dbAdmin = createClient(SUPABASE_URL, SERVICE_ROLE);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+
+// A tenant-scoped view of the database: reads get `.eq("tenant_id", …)`, writes get
+// tenant_id stamped into the payload, and RPCs get p_tenant_id prepended.
+//
+// This is the whole point of the phase-2 refactor. Scoping by hand means every one of
+// ~50 call sites has to remember a filter, and the failure mode of forgetting is silent
+// -- one couple reading another's messages, with no error to notice. Here the filter is
+// structural: a scoped call cannot omit it, and an unscoped call has to name dbAdmin.
+type TenantDb = ReturnType<typeof tenantDb>;
+function tenantDb(tenantId: string) {
+  if (!tenantId) throw new Error("tenantDb: called without a tenant id");
+  const stamp = (rows: any) =>
+    Array.isArray(rows)
+      ? rows.map((r) => ({ ...r, tenant_id: tenantId }))
+      : { ...rows, tenant_id: tenantId };
+  return {
+    tenantId,
+    from(table: string) {
+      return {
+        select: (...args: any[]) => dbAdmin.from(table).select(...args).eq("tenant_id", tenantId),
+        // Stamped rather than filtered: the caller's payload never carries tenant_id, so
+        // the column is set here or the NOT NULL constraint rejects the insert.
+        insert: (rows: any) => dbAdmin.from(table).insert(stamp(rows)),
+        upsert: (rows: any, opts?: any) => dbAdmin.from(table).upsert(stamp(rows), opts),
+        update: (patch: any) => dbAdmin.from(table).update(patch).eq("tenant_id", tenantId),
+        delete: () => dbAdmin.from(table).delete().eq("tenant_id", tenantId),
+      };
+    },
+    // Every tenant-scoped SQL function takes p_tenant_id first (migrations-saas
+    // 20260726000100/200). Spreading the caller's args after it means a caller cannot
+    // accidentally override the tenant with its own p_tenant_id key.
+    rpc: (fn: string, args: Record<string, unknown> = {}) =>
+      dbAdmin.rpc(fn, { ...args, p_tenant_id: tenantId }),
+    // Storage is pathed per tenant by the caller; the bucket itself is shared.
+    storage: dbAdmin.storage,
+  };
+}
+
+// Each tenant owns exactly one conversation. The single-tenant build could hardcode its
+// id (DEFAULT_CONVERSATION_ID, the seeded all-zeros-but-one uuid) because there was only
+// ever one; here it has to be looked up, and every message insert needs it, so the
+// result is memoized per tenant for the life of the warm instance. Conversations are
+// created once at onboarding and never renamed or replaced, so the entry cannot go
+// stale -- and a cold start simply re-reads it.
+const conversationIdCache = new Map<string, string>();
+async function conversationIdFor(db: TenantDb): Promise<string> {
+  const cached = conversationIdCache.get(db.tenantId);
+  if (cached) return cached;
+  const { data, error } = await db.from("conversations").select("id")
+    .order("created_at", { ascending: true }).limit(1).maybeSingle();
+  if (error) throw new Error(`conversationIdFor: read failed: ${error.message}`);
+  // Throw rather than invent one. A tenant with no conversation is a broken onboarding,
+  // and inserting a message against a fabricated id would violate the FK anyway --
+  // failing here names the real problem instead of surfacing a constraint error.
+  if (!data?.id) throw new Error(`conversationIdFor: tenant ${db.tenantId} has no conversation row`);
+  conversationIdCache.set(db.tenantId, data.id);
+  return data.id;
+}
 
 declare const EdgeRuntime: { waitUntil: (p: Promise<unknown>) => void };
 
@@ -178,18 +241,24 @@ Deno.serve(async (req) => {
       version: BUILD_VERSION,
       adminConfigured: !Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID),
     };
-    // Opt-in seed check (?seed): a read-only users count so a post-deploy smoke
-    // test can catch an UNSEEDED instance — an empty users table makes every
-    // sender see "not registered" even though the function is healthy. Kept off
-    // the default probe so plain health stays DB-free and doesn't go red when
-    // the DB is briefly unreachable. seeded is null if the count couldn't run.
+    // Opt-in seed check (?seed): a read-only count so a post-deploy smoke test can
+    // catch an instance that cannot serve anyone. Kept off the default probe so plain
+    // health stays DB-free and doesn't go red when the DB is briefly unreachable.
+    // seeded is null if the count couldn't run.
+    //
+    // Counts TENANTS, not users. On the single-tenant build an empty users table meant
+    // an unprovisioned instance; here users arrive through self-serve onboarding, so a
+    // healthy multi-tenant instance legitimately has zero of them on day one. Tenants
+    // are what must exist for the bot to have anything to serve.
+    //
+    // Unscoped by nature -- an instance-wide total has no tenant to belong to.
     if (url.searchParams.has("seed")) {
       try {
-        const { count, error } = await supabase
-          .from("users")
+        const { count, error } = await dbAdmin
+          .from("tenants")
           .select("*", { count: "exact", head: true });
         if (error) throw error;
-        body.userCount = count ?? 0;
+        body.tenantCount = count ?? 0;
         body.seeded = (count ?? 0) > 0;
       } catch (e) {
         body.seeded = null;
@@ -245,11 +314,15 @@ async function handleUpdate(update: any) {
     );
     return;
   }
+  // Everything past this point is scoped to the sender's tenant. lookupUser is the only
+  // read that crosses the boundary; from here the tenant is known and fixed for the rest
+  // of the update.
+  const db = tenantDb(user.tenant_id);
   // Command dispatch table — to add a command, append one entry here.
   type Cmd = { match: (t: string) => boolean; handle: (m: any, u: any) => Promise<void> };
   const COMMANDS: Cmd[] = [
     { match: t => t === "/start", handle: async (m, u) => {
-        const solo = !(await lookupPartner(u.id));
+        const solo = !(await lookupPartner(db, u.id));
         const media = solo
           ? `Send a photo, file, GIF, or audio with a caption and I'll translate the caption into your study corpus too.\n\n`
           : `You can also send photos, videos, files, stickers, GIFs, audio, locations, and contacts — I'll forward them to the other person, and translate any caption.\n\n`;
@@ -314,9 +387,15 @@ async function lookupUser(tgUser: any) {
   // below), retry, and if the read keeps failing THROW so the caller aborts
   // silently instead of misinforming the user. The "not registered" branch must
   // fire only on a genuine, error-free absence.
+  //
+  // Unscoped, necessarily: this IS the tenant-resolution step. An incoming update
+  // carries only a Telegram id, and which tenant that id belongs to is exactly what
+  // this read answers -- there is no tenant context to filter by until it returns.
+  // users.telegram_id is globally unique (see migrations-saas/20260726000000), so the
+  // row it finds determines the tenant for everything downstream.
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const { data, error } = await supabase.from("users").select("*")
+    const { data, error } = await dbAdmin.from("users").select("*")
       .eq("telegram_id", tgUser.id).maybeSingle();
     if (!error) return data ?? null;
     lastErr = error;
@@ -328,20 +407,20 @@ async function lookupUser(tgUser: any) {
   );
 }
 
-async function lookupPartner(userId: string) {
+async function lookupPartner(db: TenantDb, userId: string) {
   // Partner = the other member of the couple: the user whose native language is this
   // user's learning language. Keying on the complementary language (instead of
   // .neq("id")) means a stray 3rd row never breaks things, and it generalizes to any
   // configured pair (no en/uk assumption).
-  const { data: self } = await supabase.from("users").select("native_language, learning_language").eq("id", userId).single();
+  const { data: self } = await db.from("users").select("native_language, learning_language").eq("id", userId).single();
   if (!self) return null;
-  const { data, error } = await supabase.from("users").select("*").eq("native_language", self.learning_language).maybeSingle();
+  const { data, error } = await db.from("users").select("*").eq("native_language", self.learning_language).maybeSingle();
   if (error) { console.error("lookupPartner failed:", error); return null; }
   return data;
 }
 
-async function lookupLearnerOfLanguage(lang: LangCode): Promise<any | null> {
-  const { data, error } = await supabase.from("users").select("*").eq("learning_language", lang).maybeSingle();
+async function lookupLearnerOfLanguage(db: TenantDb, lang: LangCode): Promise<any | null> {
+  const { data, error } = await db.from("users").select("*").eq("learning_language", lang).maybeSingle();
   if (error) { console.error("lookupLearnerOfLanguage failed:", error); return null; }
   return data;
 }
@@ -466,7 +545,7 @@ function exampleScriptMatchesLanguage(text: string, language: LangCode): boolean
   return cyrillicRatio <= (1 - CYRILLIC_SKIP_THRESHOLD);
 }
 
-function scheduleAnnotation(messageId: string, text: string, language: LangCode, otherLanguage: LangCode, source: string, parallelText?: string) {
+function scheduleAnnotation(db: TenantDb, messageId: string, text: string, language: LangCode, otherLanguage: LangCode, source: string, parallelText?: string) {
   if (!text) return;
   // Only meaningful for cross-script pairs: if the two instance languages share a
   // script, latin/cyrillic ratios never contradict the claimed language, so the check
@@ -478,26 +557,27 @@ function scheduleAnnotation(messageId: string, text: string, language: LangCode,
     (expectedScript === "cyrillic" && cyrillicRatio < (1 - CYRILLIC_SKIP_THRESHOLD));
   if (wrongScript) {
     console.log(`skip annotation: ${source} ${messageId} letters=${letters} cyrillic=${Math.round(cyrillicRatio * 100)}%, expected ${language}`);
-    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(messageId, language));
+    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(db, messageId, language));
     return;
   }
-  scheduleBackgroundWork(`annotateMessage (${source}, ${messageId})`, annotateMessage(messageId, text, language, otherLanguage, parallelText));
+  scheduleBackgroundWork(`annotateMessage (${source}, ${messageId})`, annotateMessage(db, messageId, text, language, otherLanguage, parallelText));
 }
 
 // Language-tagged so message_annotations.language (generated from details->>'language')
 // is the real side language, letting the backfill anti-join retire the side.
-async function writeFallbackAnnotation(messageId: string, language: LangCode) {
-  const { error } = await supabase.from("message_annotations").upsert(
+async function writeFallbackAnnotation(db: TenantDb, messageId: string, language: LangCode) {
+  const { error } = await db.from("message_annotations").upsert(
     [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral", details: { language } }],
     { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
   if (error) console.error("fallback row insert failed:", error);
 }
 
 async function handleTextMessage(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const originalText = msg.text;
   const originalLang = await classifyLanguage(originalText, user.native_language, user.learning_language);
   const translationTargetLang = otherLang(originalLang, user);
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   const persons = buildPersonMap(user, partner);
   const speaker = persons[originalLang];
   // No partner (solo instance) = no fixed addressee, so skip addressee gender agreement.
@@ -505,8 +585,8 @@ async function handleTextMessage(msg: any, user: any) {
   const translated = await translate(originalText, originalLang, translationTargetLang, speaker, addressee);
   const translationOk = translated !== null;
 
-  const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
-    conversation_id: DEFAULT_CONVERSATION_ID,
+  const { data: inserted, error: insertErr } = await db.from("messages").insert({
+    conversation_id: await conversationIdFor(db),
     sender_id: user.id,
     telegram_message_id: msg.message_id,
     original_text: originalText,
@@ -525,10 +605,10 @@ async function handleTextMessage(msg: any, user: any) {
   }
 
   if (inserted) {
-    if (isInstanceLang(originalLang, user)) scheduleAnnotation(inserted.id, originalText, originalLang, translationTargetLang, "text-original", translationOk ? translated! : undefined);
-    if (translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
+    if (isInstanceLang(originalLang, user)) scheduleAnnotation(db, inserted.id, originalText, originalLang, translationTargetLang, "text-original", translationOk ? translated! : undefined);
+    if (translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
     if (isInstanceLang(originalLang, user)) {
-      scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, originalText, originalLang));
+      scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, originalText, originalLang));
     }
   }
 
@@ -541,6 +621,7 @@ async function handleTextMessage(msg: any, user: any) {
 }
 
 async function handleVoiceMessage(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const voice = msg.voice;
   let fileInfo: any;
   try {
@@ -561,8 +642,12 @@ async function handleVoiceMessage(msg: any, user: any) {
     await sendMessage(msg.chat.id, "Couldn't download the voice file from Telegram. Try again in a moment.");
     return;
   }
-  const storagePath = `${user.id}/${Date.now()}_${voice.file_id}.ogg`;
-  const { error: uploadErr } = await supabase.storage.from("voice-messages").upload(storagePath, audioBlob, { contentType: "audio/ogg" });
+  // Tenant-prefixed. The bucket is private and only the service role touches it, so this
+  // is defense in depth rather than the access control itself -- but it means a tenant's
+  // audio lives under one prefix, which is what makes "delete this account's data" a
+  // single recursive remove instead of a join against messages.
+  const storagePath = `${db.tenantId}/${user.id}/${Date.now()}_${voice.file_id}.ogg`;
+  const { error: uploadErr } = await db.storage.from("voice-messages").upload(storagePath, audioBlob, { contentType: "audio/ogg" });
   if (uploadErr) console.error("storage upload:", uploadErr);
 
   const transcribeResult = await transcribeWithWhisper(audioBlob, user);
@@ -579,15 +664,15 @@ async function handleVoiceMessage(msg: any, user: any) {
     ? whisperCode
     : await classifyLanguage(transcript, user.native_language, user.learning_language);
   const targetLang = otherLang(originalLang, user);
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   const persons = buildPersonMap(user, partner);
   const speaker = persons[originalLang];
   const addressee = partner ? persons[targetLang] : undefined;
   const translated = await translate(transcript, originalLang, targetLang, speaker, addressee);
   const translationOk = translated !== null;
 
-  const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
-    conversation_id: DEFAULT_CONVERSATION_ID,
+  const { data: inserted, error: insertErr } = await db.from("messages").insert({
+    conversation_id: await conversationIdFor(db),
     sender_id: user.id,
     telegram_message_id: msg.message_id,
     original_text: transcript,
@@ -609,10 +694,10 @@ async function handleVoiceMessage(msg: any, user: any) {
   }
 
   if (inserted) {
-    if (isInstanceLang(originalLang, user)) scheduleAnnotation(inserted.id, transcript, originalLang, targetLang, "voice-original", translationOk ? translated! : undefined);
-    if (translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
+    if (isInstanceLang(originalLang, user)) scheduleAnnotation(db, inserted.id, transcript, originalLang, targetLang, "voice-original", translationOk ? translated! : undefined);
+    if (translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(db, inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
     if (isInstanceLang(originalLang, user)) {
-      scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, transcript, originalLang));
+      scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, transcript, originalLang));
     }
   }
 }
@@ -812,6 +897,7 @@ async function checkGrammar(text: string, learnLang: LangCode, nativeLang: LangC
 // also recorded so /export can turn them into study cards; a failed insert is logged
 // but never blocks the note, since the coaching is the part the user is waiting on.
 async function grammarAssist(chatId: number, text: string, user: any, messageId?: string) {
+  const db = tenantDb(user.tenant_id);
   const verdict = await checkGrammar(text, user.learning_language, user.native_language);
   if (verdict === null) return; // API/parse failed -- stay silent rather than nag.
   const ui = grammarUi(user.native_language);
@@ -819,7 +905,7 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
     await sendMessage(chatId, ui.correct);
     return;
   }
-  const { error } = await supabase.from("grammar_corrections").insert({
+  const { error } = await db.from("grammar_corrections").insert({
     user_id: user.id,
     message_id: messageId ?? null,
     language: user.learning_language,
@@ -841,10 +927,11 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
 // /capybara [on|off] -- per-user toggle for the grammar assistant. Bare /capybara
 // flips the current state.
 async function handleCapybara(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const arg = msg.text.replace(/^\/capybara(@\S+)?/i, "").trim().toLowerCase();
   const enabled = arg === "on" ? true : arg === "off" ? false : !user.grammar_assist;
   const ui = grammarUi(user.native_language);
-  const { error } = await supabase.from("users").update({ grammar_assist: enabled }).eq("id", user.id);
+  const { error } = await db.from("users").update({ grammar_assist: enabled }).eq("id", user.id);
   if (error) {
     console.error("grammar toggle failed:", error);
     await sendMessage(msg.chat.id, ui.saveFailed);
@@ -1017,9 +1104,9 @@ async function runAnnotation(
   }
 }
 
-async function annotateMessage(messageId: string, text: string, language: LangCode, otherLanguage: LangCode, parallelText?: string) {
+async function annotateMessage(db: TenantDb, messageId: string, text: string, language: LangCode, otherLanguage: LangCode, parallelText?: string) {
   const writeFallbackRow = async () => {
-    const { error } = await supabase.from("message_annotations").upsert(
+    const { error } = await db.from("message_annotations").upsert(
       [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral", details: { language } }],
       { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
     if (error) console.error("fallback row insert failed:", error);
@@ -1037,7 +1124,11 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
       language: language,
     }));
   if (vocabRows.length > 0) {
-    await supabase.from("vocabulary").upsert(vocabRows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
+    // onConflict must name the tenant-scoped key (migrations-saas/20260726000000).
+    // With the old three-column target this upsert would match ANOTHER tenant's row for
+    // the same lemma and, with ignoreDuplicates, silently drop this couple's word --
+    // their vocabulary would be missing entries that "already existed" for strangers.
+    await db.from("vocabulary").upsert(vocabRows, { onConflict: "tenant_id,lemma,part_of_speech,language", ignoreDuplicates: true });
   }
   const annotations: any[] = [];
   for (const v of parsed.vocabulary ?? []) {
@@ -1054,7 +1145,7 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
     annotations.push({ message_id: messageId, annotation_type: "register", annotation_value: parsed.register, details: { language } });
   }
   if (annotations.length > 0) {
-    await supabase.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
+    await db.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
   }
 }
 
@@ -1281,14 +1372,16 @@ async function ensureCommandsRegistered(): Promise<void> {
 }
 
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
-  const partner = await lookupPartner(sender.id);
+  const db = tenantDb(sender.tenant_id);
+  const partner = await lookupPartner(db, sender.id);
   if (!partner) return;
   const senderName = sender.display_name;
   await sendMessage(partner.telegram_id, `\ud83d\udcac ${senderName} says (${transLang}):\n${translated}\n\n_Original (${origLang}):_\n${original}`, "Markdown");
 }
 
 async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcript: string, translated: string, origLang: string, transLang: string) {
-  const partner = await lookupPartner(sender.id);
+  const db = tenantDb(sender.tenant_id);
+  const partner = await lookupPartner(db, sender.id);
   if (!partner) return;
   const senderName = sender.display_name;
   await sendVoice(partner.telegram_id, voiceFileId);
@@ -1300,7 +1393,8 @@ async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcrip
 // from the phone gallery. Forwarding by file_id works at any size, so there is no
 // download/Whisper step and no 20 MB bot-download limit to worry about.
 async function handleVideoMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   const senderName = user.display_name;
 
   if (msg.video_note) {
@@ -1329,7 +1423,8 @@ async function handleVideoMessage(msg: any, user: any) {
 // the same approach as handleVideoMessage. Telegram sends msg.photo as an array of
 // the same image at increasing resolutions, so the largest is the last entry.
 async function handlePhotoMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, "🖼️ Got your photo, but there's no partner to forward it to yet.");
     return;
@@ -1343,7 +1438,8 @@ async function handlePhotoMessage(msg: any, user: any) {
 // msg.document, not msg.photo) are forwarded as-is by file_id, the same approach as
 // handlePhotoMessage / handleVideoMessage: no download, translation, or corpus storage.
 async function handleDocumentMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, "📎 Got your file, but there's no partner to forward it to yet.");
     return;
@@ -1368,15 +1464,16 @@ async function translateAndForwardCaption(msg: any, user: any, caption: string) 
 // gender agreement, shows the sender the translation, forwards a bilingual note to the
 // partner, and stores the caption as a study-corpus message (input_type "text").
 async function translateCaptionToPartner(user: any, senderChatId: number, caption: string, telegramMessageId: number | null) {
+  const db = tenantDb(user.tenant_id);
   const originalLang = await classifyLanguage(caption, user.native_language, user.learning_language);
   const translationTargetLang = otherLang(originalLang, user);
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   const persons = buildPersonMap(user, partner);
   const translated = await translate(caption, originalLang, translationTargetLang, persons[originalLang], partner ? persons[translationTargetLang] : undefined);
   const translationOk = translated !== null;
 
-  const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
-    conversation_id: DEFAULT_CONVERSATION_ID,
+  const { data: inserted, error: insertErr } = await db.from("messages").insert({
+    conversation_id: await conversationIdFor(db),
     sender_id: user.id,
     telegram_message_id: telegramMessageId,
     original_text: caption,
@@ -1395,9 +1492,9 @@ async function translateCaptionToPartner(user: any, senderChatId: number, captio
   }
 
   if (inserted) {
-    scheduleAnnotation(inserted.id, caption, originalLang, translationTargetLang, "caption-original", translationOk ? translated! : undefined);
-    if (translationOk) scheduleAnnotation(inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
-    scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, caption, originalLang));
+    scheduleAnnotation(db, inserted.id, caption, originalLang, translationTargetLang, "caption-original", translationOk ? translated! : undefined);
+    if (translationOk) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
+    scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, caption, originalLang));
   }
 }
 
@@ -1418,7 +1515,8 @@ async function finishMediaForward(msg: any, user: any, partner: any, noCaptionAt
 
 // Audio files (music / non-voice audio). Caption translated + corpus'd like a photo.
 async function handleAudioMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, "🎵 Got your audio, but there's no partner to forward it to yet.");
     return;
@@ -1430,7 +1528,8 @@ async function handleAudioMessage(msg: any, user: any) {
 // Animations / GIFs. Telegram also sets msg.document on an animation, so the dispatch
 // checks msg.animation BEFORE msg.document.
 async function handleAnimationMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, "🎞️ Got your GIF, but there's no partner to forward it to yet.");
     return;
@@ -1441,7 +1540,8 @@ async function handleAnimationMessage(msg: any, user: any) {
 
 // Stickers are forwarded as-is; they never carry a caption, so there is no translation.
 async function handleStickerMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, "🎭 Got your sticker, but there's no partner to forward it to yet.");
     return;
@@ -1454,7 +1554,8 @@ async function handleStickerMessage(msg: any, user: any) {
 // Location or venue. A venue message ALSO carries msg.location, so the dispatch and
 // this handler check venue first, else the title/address would be dropped. No translation.
 async function handleLocationMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, "📍 Got your location, but there's no partner to forward it to yet.");
     return;
@@ -1473,7 +1574,8 @@ async function handleLocationMessage(msg: any, user: any) {
 
 // Shared contact card. No translation.
 async function handleContactMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, "👤 Got your contact, but there's no partner to forward it to yet.");
     return;
@@ -1526,10 +1628,11 @@ async function forwardMediaGroupFallback(msg: any, user: any) {
 }
 
 async function handleMediaGroupItem(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const item = mediaGroupItemOf(msg);
   if (!item) { await forwardMediaGroupFallback(msg, user); return; }
   const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
-  const { error } = await supabase.from("pending_media_group").insert({
+  const { error } = await db.from("pending_media_group").insert({
     media_group_id: String(msg.media_group_id),
     sender_id: user.id,
     chat_id: msg.chat.id,
@@ -1545,12 +1648,13 @@ async function handleMediaGroupItem(msg: any, user: any) {
 }
 
 async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
+  const db = tenantDb(user.tenant_id);
   await new Promise((r) => setTimeout(r, ALBUM_DEBOUNCE_MS));
   // Atomic single-flush claim: the first flusher's DELETE drains the group; concurrent
   // flushers get 0 rows and return. The same DELETE also sweeps rows older than
   // ALBUM_STALE_MS (orphans from an instance that died mid-debounce) so nothing lingers.
   const staleCutoff = new Date(Date.now() - ALBUM_STALE_MS).toISOString();
-  const { data: rows, error } = await supabase
+  const { data: rows, error } = await db
     .from("pending_media_group")
     .delete()
     .or(`media_group_id.eq.${mediaGroupId},created_at.lt.${staleCutoff}`)
@@ -1561,7 +1665,7 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   groupRows.sort((a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
 
   const senderChatId = groupRows[0].chat_id;
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(senderChatId, "🖼️ Got your album, but there's no partner to forward it to yet.");
     return;
@@ -1609,7 +1713,8 @@ async function handleExport(msg: any, user: any) {
 }
 
 async function exportRun(chatId: number, user: any) {
-  const { data: cards, error } = await supabase
+  const db = tenantDb(user.tenant_id);
+  const { data: cards, error } = await db
     .from("flashcards")
     .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
     .order("created_at", { ascending: true });
@@ -1623,7 +1728,7 @@ async function exportRun(chatId: number, user: any) {
   // Grammar corrections ride in the same file as a third deck. They are personal, so
   // only the requester's own rows are exported. A read failure here degrades to a
   // vocabulary-only export rather than losing the whole thing.
-  const { data: corrections, error: corrError } = await supabase
+  const { data: corrections, error: corrError } = await db
     .from("grammar_corrections")
     .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
     .eq("user_id", user.id)
@@ -1798,15 +1903,16 @@ async function exportRun(chatId: number, user: any) {
   await sendDocument(chatId, filename, csv, "text/csv", caption);
 }
 
-async function refreshVocabularyCounts() {
-  const { error } = await supabase.rpc("refresh_vocabulary_counts");
+async function refreshVocabularyCounts(db: TenantDb) {
+  const { error } = await db.rpc("refresh_vocabulary_counts");
   if (error) throw error;
 }
 
 async function handleHelp(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const isAdmin = msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID;
   const viewerLang = user.native_language === "uk" ? "uk" : "en";
-  const solo = !(await lookupPartner(user.id));
+  const solo = !(await lookupPartner(db, user.id));
   const lines: string[] = [];
   if (viewerLang === "uk") {
     lines.push(
@@ -1883,9 +1989,9 @@ async function handleHelp(msg: any, user: any) {
   await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
 }
 
-async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
+async function fetchTopUnlearned(db: TenantDb, lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
   if (!learnerId) return [];
-  const { data, error } = await supabase.rpc("vocab_top_unlearned", {
+  const { data, error } = await db.rpc("vocab_top_unlearned", {
     p_language: lang,
     p_user_id: learnerId,
     p_limit: limit,
@@ -1922,18 +2028,19 @@ function formatVocabSection(
 }
 
 async function handleVocab(msg: any, user: any) {
-  try { await refreshVocabularyCounts(); }
+  const db = tenantDb(user.tenant_id);
+  try { await refreshVocabularyCounts(db); }
   catch (e) { console.error("refreshVocabularyCounts failed:", e); }
   // Show both instance-language decks, the user's own learning deck first.
   const learnLang = user.learning_language;
   const nativeLang = user.native_language;
   const [learnLearner, nativeLearner] = await Promise.all([
-    lookupLearnerOfLanguage(learnLang),
-    lookupLearnerOfLanguage(nativeLang),
+    lookupLearnerOfLanguage(db, learnLang),
+    lookupLearnerOfLanguage(db, nativeLang),
   ]);
   const [learnWords, nativeWords] = await Promise.all([
-    fetchTopUnlearned(learnLang, learnLearner?.id ?? null, 10),
-    fetchTopUnlearned(nativeLang, nativeLearner?.id ?? null, 10),
+    fetchTopUnlearned(db, learnLang, learnLearner?.id ?? null, 10),
+    fetchTopUnlearned(db, nativeLang, nativeLearner?.id ?? null, 10),
   ]);
   const sections: string[] = [];
   sections.push(...formatVocabSection(learnLang, learnWords, user, learnLearner));
@@ -1972,8 +2079,8 @@ async function lemmatize(word: string, language: LangCode): Promise<string | nul
   } catch (e) { console.error("lemmatize JSON parse failed:", block.text); return null; }
 }
 
-async function lookupVocabByLemma(lemma: string, language: LangCode): Promise<any[]> {
-  const { data, error } = await supabase.from("vocabulary")
+async function lookupVocabByLemma(db: TenantDb, lemma: string, language: LangCode): Promise<any[]> {
+  const { data, error } = await db.from("vocabulary")
     .select("id, lemma, part_of_speech, gloss, first_seen_message_id, language")
     .eq("language", language)
     .ilike("lemma", lemma);
@@ -1982,6 +2089,7 @@ async function lookupVocabByLemma(lemma: string, language: LangCode): Promise<an
 }
 
 async function handleLearnTop(msg: any, user: any, arg: string) {
+  const db = tenantDb(user.tenant_id);
   const match = arg.match(/^top\s*(\d+)?(?:\s+(\S+))?$/i);
   if (!match) {
     await sendMessage(msg.chat.id, "Usage: `/learn top <N> [uk|en]`", "Markdown");
@@ -2020,7 +2128,7 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
     targetUser = user;
     isOwnDeck = true;
   } else {
-    const learner = await lookupLearnerOfLanguage(targetLang);
+    const learner = await lookupLearnerOfLanguage(db, targetLang);
     if (!learner) {
       await sendMessage(msg.chat.id, `Couldn't find anyone learning ${targetLangLabel}. No deck to add to.`);
       return;
@@ -2030,9 +2138,9 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   }
   const deckOwnerLabel = isOwnDeck ? "your" : `${targetUser.display_name}'s`;
 
-  try { await refreshVocabularyCounts(); }
+  try { await refreshVocabularyCounts(db); }
   catch (e) { console.error("refreshVocabularyCounts (learn top) failed:", e); }
-  const unlearned = await fetchTopUnlearned(targetLang, targetUser.id, N);
+  const unlearned = await fetchTopUnlearned(db, targetLang, targetUser.id, N);
   if (unlearned.length === 0) {
     await sendMessage(msg.chat.id, `No unlearned ${targetLangLabel} words available for ${deckOwnerLabel} deck.\n\nRun /vocab to see the current top words.`);
     return;
@@ -2042,7 +2150,7 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
     vocabulary_id: v.id,
     example_message_id: v.first_seen_message_id,
   }));
-  const { error: insertErr } = await supabase.from("flashcards")
+  const { error: insertErr } = await db.from("flashcards")
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true });
   if (insertErr) {
     console.error("learn top flashcard insert failed:", insertErr);
@@ -2067,13 +2175,14 @@ async function resolveLearnTarget(user: any, word: string): Promise<
   | { targetUser: any; targetLang: LangCode; isPartnerDeck: boolean }
   | { error: string }
 > {
+  const db = tenantDb(user.tenant_id);
   // A bare word is the hardest case for a same-script pair, so bias toward the asker's
   // learning language (the usual intent of /learn) by passing it as the default.
   const detected = await classifyLanguage(word, user.learning_language, user.native_language);
   if (detected === user.learning_language) {
     return { targetUser: user, targetLang: detected, isPartnerDeck: false };
   }
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     return { error: `Detected "${word}" as ${langLabel(detected)}, but couldn't find a partner to add the card for.` };
   }
@@ -2081,6 +2190,7 @@ async function resolveLearnTarget(user: any, word: string): Promise<
 }
 
 async function handleLearn(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const arg = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
@@ -2103,12 +2213,12 @@ async function handleLearn(msg: any, user: any) {
   }
   const { targetUser, targetLang, isPartnerDeck } = resolved;
   const targetLangLabel = langLabel(targetLang);
-  let vocabRows = await lookupVocabByLemma(arg, targetLang);
+  let vocabRows = await lookupVocabByLemma(db, arg, targetLang);
   let lemmaUsed = arg;
   if (vocabRows.length === 0) {
     const lemma = await lemmatize(arg, targetLang);
     if (lemma && lemma.toLowerCase() !== arg.toLowerCase()) {
-      const retry = await lookupVocabByLemma(lemma, targetLang);
+      const retry = await lookupVocabByLemma(db, lemma, targetLang);
       if (retry.length > 0) { vocabRows = retry; lemmaUsed = lemma; }
     }
   }
@@ -2121,7 +2231,7 @@ async function handleLearn(msg: any, user: any) {
     vocabulary_id: v.id,
     example_message_id: v.first_seen_message_id,
   }));
-  const { data: inserted, error: insertErr } = await supabase.from("flashcards")
+  const { data: inserted, error: insertErr } = await db.from("flashcards")
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true })
     .select("vocabulary_id");
   if (insertErr) {
@@ -2152,6 +2262,7 @@ async function handleLearn(msg: any, user: any) {
 }
 
 async function handleForget(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const arg = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
@@ -2170,12 +2281,12 @@ async function handleForget(msg: any, user: any) {
   }
   const { targetUser, targetLang, isPartnerDeck } = resolved;
   const targetLangLabel = langLabel(targetLang);
-  let vocabRows = await lookupVocabByLemma(arg, targetLang);
+  let vocabRows = await lookupVocabByLemma(db, arg, targetLang);
   let lemmaUsed = arg;
   if (vocabRows.length === 0) {
     const lemma = await lemmatize(arg, targetLang);
     if (lemma && lemma.toLowerCase() !== arg.toLowerCase()) {
-      const retry = await lookupVocabByLemma(lemma, targetLang);
+      const retry = await lookupVocabByLemma(db, lemma, targetLang);
       if (retry.length > 0) { vocabRows = retry; lemmaUsed = lemma; }
     }
   }
@@ -2184,7 +2295,7 @@ async function handleForget(msg: any, user: any) {
     return;
   }
   const vocabIds = vocabRows.map((v: any) => v.id);
-  const { data: deleted, error } = await supabase.from("flashcards")
+  const { data: deleted, error } = await db.from("flashcards")
     .delete()
     .eq("user_id", targetUser.id)
     .in("vocabulary_id", vocabIds)
@@ -2216,9 +2327,10 @@ async function handleForget(msg: any, user: any) {
 }
 
 async function handleBackfill(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   // 1-row probe so an empty backlog replies instantly without kicking off a background run.
-  const { data: probe, error: probeErr } = await supabase.rpc("backfill_pending_sides", { p_batch_size: 1 });
+  const { data: probe, error: probeErr } = await db.rpc("backfill_pending_sides", { p_batch_size: 1 });
   if (probeErr) {
     console.error("backfill_pending_sides error:", probeErr);
     await sendMessage(msg.chat.id, "Backfill query failed. Check logs.");
@@ -2232,23 +2344,25 @@ async function handleBackfill(msg: any, user: any) {
   // would time out the webhook and get retried -> duplicate runs). One tap clears as much
   // as the time budget allows; the run reports done / re-tap-to-continue at the end.
   await sendMessage(msg.chat.id, "\u23f3 Backfilling in the background \u2014 I'll report when this run finishes. (Avoid tapping again until then.)");
-  scheduleBackgroundWork("backfillGrind", backfillGrind(msg.chat.id));
+  scheduleBackgroundWork("backfillGrind", backfillGrind(db, msg.chat.id));
 }
 
 // Time-boxed background grind. backfill_pending_sides already returns only annotatable
 // sides (wrong-script/letterless ones are filtered in SQL), so each wave is annotated
 // directly in small concurrent batches. Idempotent across runs \u2014 annotated sides drop out
 // of the pending set \u2014 so a partial/killed run is safely resumed by another /backfill.
-async function backfillGrind(chatId: number) {
+async function backfillGrind(db: TenantDb, chatId: number) {
   const startedAt = Date.now();
   let succeeded = 0; let failed = 0;
   // The "other language" for annotation is the opposite instance language.
-  const { data: uRows } = await supabase.from("users").select("native_language");
-  const instanceLangs = [...new Set((uRows ?? []).map((u: any) => u.native_language as string))];
+  const { data: uRows } = await db.from("users").select("native_language");
+  // Typed explicitly: uRows is `any` off the query builder, and without the annotation
+  // the Set spread widens to unknown[] and otherOf's `string` return stops checking.
+  const instanceLangs: string[] = [...new Set(((uRows ?? []) as Array<{ native_language: string }>).map((u) => u.native_language))];
   const otherOf = (lang: string): string => instanceLangs.find((l) => l !== lang) ?? lang;
   try {
     while (Date.now() - startedAt < BACKFILL_BUDGET_MS) {
-      const { data: rows, error } = await supabase
+      const { data: rows, error } = await db
         .rpc("backfill_pending_sides", { p_batch_size: BACKFILL_CONCURRENCY });
       if (error) {
         console.error("backfill_pending_sides error mid-run:", error);
@@ -2258,7 +2372,7 @@ async function backfillGrind(chatId: number) {
       if (!rows || rows.length === 0) break;
       const results = await Promise.allSettled(
         (rows as Array<{ message_id: string; text: string; language: LangCode }>)
-          .map((w) => annotateMessage(w.message_id, w.text, w.language, otherOf(w.language))),
+          .map((w) => annotateMessage(db, w.message_id, w.text, w.language, otherOf(w.language))),
       );
       for (const r of results) {
         if (r.status === "fulfilled") succeeded++;
@@ -2268,7 +2382,7 @@ async function backfillGrind(chatId: number) {
   } catch (e) {
     console.error("backfillGrind crashed:", e);
   }
-  const { data: still } = await supabase.rpc("backfill_pending_sides", { p_batch_size: 1 });
+  const { data: still } = await db.rpc("backfill_pending_sides", { p_batch_size: 1 });
   const done = !still || still.length === 0;
   const tail = failed > 0 ? ` (${failed} failed \u2014 check logs)` : "";
   await sendMessage(chatId, done
@@ -2339,8 +2453,9 @@ async function translateLemmasBatch(
 }
 
 async function handleBackfillTranslations(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
-  const { data: rows, error } = await supabase
+  const { data: rows, error } = await db
     .from("vocabulary")
     .select("id, lemma, part_of_speech, gloss, language")
     .is("lemma_translation", null)
@@ -2367,7 +2482,7 @@ async function handleBackfillTranslations(msg: any, user: any) {
   let failed = 0;
   if (updates.length > 0) {
     const upsertRows = updates.map(([id, translation]) => ({ id, lemma_translation: translation }));
-    const { error: upsertErr } = await supabase
+    const { error: upsertErr } = await db
       .from("vocabulary")
       .upsert(upsertRows, { onConflict: "id" });
     if (upsertErr) {
@@ -2378,7 +2493,7 @@ async function handleBackfillTranslations(msg: any, user: any) {
     }
   }
   const untranslated = rows.length - (ukMap.size + enMap.size);
-  const { count: stillRemaining } = await supabase
+  const { count: stillRemaining } = await db
     .from("vocabulary")
     .select("id", { count: "exact", head: true })
     .is("lemma_translation", null);
@@ -2439,11 +2554,11 @@ async function resenseCard(it: {
   }
 }
 
-async function resenseGrind(chatId: number) {
+async function resenseGrind(db: TenantDb, chatId: number) {
   const startedAt = Date.now();
   // Studied deck = vocabulary rows referenced by a flashcard (cards are created with
   // example_message_id = first_seen_message_id, so that message is the card's example).
-  const { data: cardRows, error: cErr } = await supabase
+  const { data: cardRows, error: cErr } = await db
     .from("flashcards")
     .select("vocabulary(id, lemma, part_of_speech, language, first_seen_message_id, lemma_translation)");
   if (cErr) { console.error("resense: flashcards fetch failed:", cErr); await sendMessage(chatId, "Couldn't fetch the deck. Check logs."); return; }
@@ -2457,7 +2572,7 @@ async function resenseGrind(chatId: number) {
   const msgIds = [...new Set(vocab.map((v) => v.first_seen_message_id))];
   const msgById = new Map<string, any>();
   for (let i = 0; i < msgIds.length; i += 100) {
-    const { data: ms } = await supabase.from("messages")
+    const { data: ms } = await db.from("messages")
       .select("id, original_text, translated_text, original_language, translated_language")
       .in("id", msgIds.slice(i, i + 100));
     for (const m of (ms ?? []) as any[]) msgById.set(m.id, m);
@@ -2486,7 +2601,7 @@ async function resenseGrind(chatId: number) {
       if (res.lemma_translation === it.oldTranslation) { unchanged++; return; }
       const patch: Record<string, string> = { lemma_translation: res.lemma_translation };
       if (res.gloss) patch.gloss = res.gloss;
-      const { error: uErr } = await supabase.from("vocabulary").update(patch).eq("id", it.id);
+      const { error: uErr } = await db.from("vocabulary").update(patch).eq("id", it.id);
       if (uErr) { failed++; console.error("resense update failed:", uErr); } else { corrected++; }
     }));
   }
@@ -2503,9 +2618,10 @@ async function resenseGrind(chatId: number) {
 }
 
 async function handleBackfillSenses(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   await sendMessage(msg.chat.id, "⏳ Re-deriving flashcard translations against each card's example sentence — I'll report when this run finishes.");
-  scheduleBackgroundWork("resenseGrind", resenseGrind(msg.chat.id));
+  scheduleBackgroundWork("resenseGrind", resenseGrind(db, msg.chat.id));
 }
 
 // --- /backfill_grammar: fill in the card fields older corrections never captured -----
@@ -2516,9 +2632,9 @@ async function handleBackfillSenses(msg: any, user: any) {
 // Every derived field is rewritten together rather than patched individually: a fresh
 // correction_focus has to be locatable in the corrected_text it came from, so mixing a
 // new focus word with an old sentence could leave a row whose cloze silently fails.
-async function grammarBackfillGrind(chatId: number) {
+async function grammarBackfillGrind(db: TenantDb, chatId: number) {
   const startedAt = Date.now();
-  const { data: rows, error } = await supabase
+  const { data: rows, error } = await db
     .from("grammar_corrections")
     .select("id, user_id, language, original_text")
     .or("correction_focus.is.null,correction_lemma.is.null,correction_gloss.is.null")
@@ -2534,7 +2650,7 @@ async function grammarBackfillGrind(chatId: number) {
   // The correction stores the language being learned; the explanation language comes
   // from the author's own row, so corrections stay per-user correct in both directions.
   const userIds = [...new Set(pending.map((r) => r.user_id))];
-  const { data: users } = await supabase.from("users").select("id, native_language, learning_language").in("id", userIds);
+  const { data: users } = await db.from("users").select("id, native_language, learning_language").in("id", userIds);
   const userById = new Map<string, any>((users ?? []).map((u: any) => [u.id, u]));
 
   let updated = 0, skipped = 0;
@@ -2548,7 +2664,7 @@ async function grammarBackfillGrind(chatId: number) {
       // A re-run that fails, or now judges the sentence correct, leaves the row alone --
       // the stored correction is still better than nothing.
       if (verdict === null || verdict.correct) return "skip";
-      const { error: upErr } = await supabase.from("grammar_corrections").update({
+      const { error: upErr } = await db.from("grammar_corrections").update({
         corrected_text: verdict.corrected,
         explanation: verdict.explanation || null,
         error_focus: verdict.errorFocus,
@@ -2571,9 +2687,10 @@ async function grammarBackfillGrind(chatId: number) {
 }
 
 async function handleBackfillGrammar(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   await sendMessage(msg.chat.id, "⏳ Re-deriving card fields for stored corrections — I'll report when this run finishes.");
-  scheduleBackgroundWork("grammarBackfillGrind", grammarBackfillGrind(msg.chat.id));
+  scheduleBackgroundWork("grammarBackfillGrind", grammarBackfillGrind(db, msg.chat.id));
 }
 
 // --- /annotate_ab: compare annotation models before switching ANNOTATION_MODEL ------
@@ -2620,7 +2737,8 @@ async function handleAnnotateAb(msg: any, user: any) {
 }
 
 async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
-  const { data: rows, error } = await supabase
+  const db = tenantDb(user.tenant_id);
+  const { data: rows, error } = await db
     .from("messages")
     .select("id, original_text, original_language, translated_text")
     .not("original_text", "is", null)
@@ -2668,7 +2786,7 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
   // Project steady-state spend from the last 30 days of real traffic. Annotation runs
   // once per side, so a message costs two passes.
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-  const { count: monthlyMessages } = await supabase
+  const { count: monthlyMessages } = await db
     .from("messages").select("id", { count: "exact", head: true }).gte("created_at", since);
 
   const summary: string[] = ["— Totals —"];
@@ -2826,6 +2944,7 @@ async function handleCallbackQuery(cq: any) {
 }
 
 async function handleDiag(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   const lines: string[] = ["\ud83d\udd0d Diagnostic check..."];
 
@@ -2883,7 +3002,7 @@ async function handleDiag(msg: any, user: any) {
     lines.push(`\u274c OpenAI Embeddings transport FAIL: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  const { data: lastMsg } = await supabase.from("messages")
+  const { data: lastMsg } = await db.from("messages")
     .select("created_at").order("created_at", { ascending: false }).limit(1).maybeSingle();
   if (lastMsg) {
     const ageSec = Math.floor((Date.now() - new Date(lastMsg.created_at).getTime()) / 1000);
@@ -2961,13 +3080,14 @@ function vectorLiteral(emb: number[]): string {
 }
 
 async function insertEmbedding(
+  db: TenantDb,
   sourceType: "message" | "note",
   sourceId: string,
   content: string,
   language: LangCode,
   embedding: number[],
 ): Promise<void> {
-  const { error } = await supabase.rpc("upsert_recap_embedding", {
+  const { error } = await db.rpc("upsert_recap_embedding", {
     p_source_type: sourceType,
     p_source_id: sourceId,
     p_content: content,
@@ -2977,16 +3097,18 @@ async function insertEmbedding(
   if (error) console.error(`insertEmbedding (${sourceType}/${sourceId}) failed:`, error);
 }
 
-async function embedMessageBackground(messageId: string, text: string, language: LangCode): Promise<void> {
+async function embedMessageBackground(tenantId: string, messageId: string, text: string, language: LangCode): Promise<void> {
+  const db = tenantDb(tenantId);
   const emb = await embedText(text);
   if (!emb) { console.error(`embedMessageBackground skipped (${messageId}): embedding failed`); return; }
-  await insertEmbedding("message", messageId, text, language, emb);
+  await insertEmbedding(db, "message", messageId, text, language, emb);
 }
 
-async function embedNoteBackground(noteId: string, text: string, language: LangCode): Promise<void> {
+async function embedNoteBackground(tenantId: string, noteId: string, text: string, language: LangCode): Promise<void> {
+  const db = tenantDb(tenantId);
   const emb = await embedText(text);
   if (!emb) { console.error(`embedNoteBackground skipped (${noteId}): embedding failed`); return; }
-  await insertEmbedding("note", noteId, text, language, emb);
+  await insertEmbedding(db, "note", noteId, text, language, emb);
 }
 
 type CorpusMessageRow = {
@@ -2998,8 +3120,8 @@ type CorpusMessageRow = {
   created_at: string;
 };
 
-async function findMessageByTelegramId(telegramMessageId: number): Promise<CorpusMessageRow | null> {
-  const { data, error } = await supabase
+async function findMessageByTelegramId(db: TenantDb, telegramMessageId: number): Promise<CorpusMessageRow | null> {
+  const { data, error } = await db
     .from("messages")
     .select("id, sender_id, original_text, original_language, telegram_message_id, created_at")
     .eq("telegram_message_id", telegramMessageId)
@@ -3009,17 +3131,18 @@ async function findMessageByTelegramId(telegramMessageId: number): Promise<Corpu
 }
 
 async function handleReconcile(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
     await sendMessage(msg.chat.id, "Reply to a message with /reconcile to exclude it from /recap results.");
     return;
   }
-  const target = await findMessageByTelegramId(replyTo.message_id);
+  const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
     await sendMessage(msg.chat.id, "Couldn't find that message in the corpus. /reconcile works on replies to messages I've stored in this conversation.");
     return;
   }
-  const { data: inserted, error } = await supabase
+  const { data: inserted, error } = await db
     .from("message_reconciles")
     .upsert({ message_id: target.id, reconciled_by: user.id }, { onConflict: "message_id", ignoreDuplicates: true })
     .select("message_id");
@@ -3035,17 +3158,18 @@ async function handleReconcile(msg: any, user: any) {
 }
 
 async function handleRestore(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
     await sendMessage(msg.chat.id, "Reply to a message with /restore to bring it back into /recap results.");
     return;
   }
-  const target = await findMessageByTelegramId(replyTo.message_id);
+  const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
     await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
     return;
   }
-  const { data: deleted, error } = await supabase
+  const { data: deleted, error } = await db
     .from("message_reconciles")
     .delete()
     .eq("message_id", target.id)
@@ -3063,17 +3187,18 @@ async function handleRestore(msg: any, user: any) {
 }
 
 async function handlePin(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
     await sendMessage(msg.chat.id, "Reply to a message with /pin to mark it as meaningful.");
     return;
   }
-  const target = await findMessageByTelegramId(replyTo.message_id);
+  const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
     await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
     return;
   }
-  const { data: inserted, error } = await supabase
+  const { data: inserted, error } = await db
     .from("message_pins")
     .upsert({ message_id: target.id, pinned_by: user.id }, { onConflict: "message_id", ignoreDuplicates: true })
     .select("message_id");
@@ -3087,17 +3212,18 @@ async function handlePin(msg: any, user: any) {
 }
 
 async function handleUnpin(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
     await sendMessage(msg.chat.id, "Reply to a pinned message with /unpin to remove the pin.");
     return;
   }
-  const target = await findMessageByTelegramId(replyTo.message_id);
+  const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
     await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
     return;
   }
-  const { data: deleted, error } = await supabase
+  const { data: deleted, error } = await db
     .from("message_pins")
     .delete()
     .eq("message_id", target.id)
@@ -3115,7 +3241,8 @@ async function handleUnpin(msg: any, user: any) {
 }
 
 async function handlePinned(msg: any, user: any) {
-  const { data, error } = await supabase
+  const db = tenantDb(user.tenant_id);
+  const { data, error } = await db
     .from("message_pins")
     .select("pinned_at, message:message_id (id, original_text, original_language, created_at)")
     .order("pinned_at", { ascending: true })
@@ -3129,7 +3256,7 @@ async function handlePinned(msg: any, user: any) {
     await sendMessage(msg.chat.id, "No pinned messages yet. Reply to any message with /pin to mark it.");
     return;
   }
-  const persons = buildPersonMap(user, await lookupPartner(user.id));
+  const persons = buildPersonMap(user, await lookupPartner(db, user.id));
   const rows: string[] = [];
   for (const r of data as any[]) {
     const m = r.message;
@@ -3145,6 +3272,7 @@ async function handlePinned(msg: any, user: any) {
 }
 
 async function handleRemember(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const note = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
@@ -3153,7 +3281,7 @@ async function handleRemember(msg: any, user: any) {
     return;
   }
   const language = await classifyLanguage(note, user.native_language, user.learning_language);
-  const { data: inserted, error } = await supabase
+  const { data: inserted, error } = await db
     .from("notes")
     .insert({ author_id: user.id, content: note, language })
     .select("id")
@@ -3163,7 +3291,7 @@ async function handleRemember(msg: any, user: any) {
     await sendMessage(msg.chat.id, "Couldn't save that note. Check function logs.");
     return;
   }
-  scheduleBackgroundWork(`embedNote (${inserted.id})`, embedNoteBackground(inserted.id, note, language));
+  scheduleBackgroundWork(`embedNote (${inserted.id})`, embedNoteBackground(db.tenantId, inserted.id, note, language));
   await sendMessage(msg.chat.id, "\ud83d\udcdd Noted.");
 }
 
@@ -3240,6 +3368,7 @@ type RetrievedItem = {
 };
 
 async function retrieveCandidates(
+  db: TenantDb,
   question: string,
   queryEmbedding: number[],
   timeWindow: { start: string; end: string } | null,
@@ -3249,8 +3378,8 @@ async function retrieveCandidates(
   const p_limit = RECAP_CANDIDATE_POOL;
   const p_embedding = vectorLiteral(queryEmbedding);
   const [semResp, kwResp] = await Promise.all([
-    supabase.rpc("recap_semantic_search", { p_query_embedding: p_embedding, p_limit, p_start, p_end }),
-    supabase.rpc("recap_keyword_search", { p_query: question, p_limit, p_start, p_end }),
+    db.rpc("recap_semantic_search", { p_query_embedding: p_embedding, p_limit, p_start, p_end }),
+    db.rpc("recap_keyword_search", { p_query: question, p_limit, p_start, p_end }),
   ]);
   if (semResp.error) console.error("recap_semantic_search failed:", semResp.error);
   if (kwResp.error) console.error("recap_keyword_search failed:", kwResp.error);
@@ -3384,6 +3513,7 @@ async function sendChatAction(chatId: number, action: string): Promise<void> {
 }
 
 async function handleRecap(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const question = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
@@ -3406,7 +3536,7 @@ async function handleRecap(msg: any, user: any) {
     return;
   }
 
-  const { semantic, keyword } = await retrieveCandidates(question, qEmb, parsed.time_window);
+  const { semantic, keyword } = await retrieveCandidates(db, question, qEmb, parsed.time_window);
   const merged = rrfMerge(semantic, keyword);
   const top = filterAndRank(merged, user.id, parsed.k);
   if (top.length === 0) {
@@ -3416,7 +3546,7 @@ async function handleRecap(msg: any, user: any) {
     return;
   }
 
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   const coupleIdentity = buildCoupleIdentity(user, partner);
   const answer = await synthesizeAnswer(question, top, user.display_name, coupleIdentity, parsed.language);
   if (!answer) {
@@ -3428,8 +3558,8 @@ async function handleRecap(msg: any, user: any) {
   await sendMessage(msg.chat.id, answer);
 }
 
-async function recapBackfillRemaining(): Promise<number | null> {
-  const { data, error } = await supabase.rpc("recap_backfill_remaining");
+async function recapBackfillRemaining(db: TenantDb): Promise<number | null> {
+  const { data, error } = await db.rpc("recap_backfill_remaining");
   if (error) { console.error("recap_backfill_remaining failed:", error); return null; }
   if (Array.isArray(data)) {
     const row = data[0];
@@ -3442,13 +3572,14 @@ async function recapBackfillRemaining(): Promise<number | null> {
 }
 
 async function handleRecapBackfill(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
 
-  const remaining = await recapBackfillRemaining();
+  const remaining = await recapBackfillRemaining(db);
   if (remaining === null) { await sendMessage(msg.chat.id, "Couldn't query backfill remaining. Check logs."); return; }
   if (remaining === 0) { await sendMessage(msg.chat.id, "\u2705 Recap backfill complete. 0 messages remaining."); return; }
 
-  const { data: batchData, error: batchErr } = await supabase.rpc("recap_backfill_batch", { p_limit: RECAP_BACKFILL_BATCH_SIZE });
+  const { data: batchData, error: batchErr } = await db.rpc("recap_backfill_batch", { p_limit: RECAP_BACKFILL_BATCH_SIZE });
   if (batchErr) {
     console.error("recap_backfill_batch failed:", batchErr);
     await sendMessage(msg.chat.id, "Couldn't fetch backfill batch. Check logs.");
@@ -3470,7 +3601,7 @@ async function handleRecapBackfill(msg: any, user: any) {
     if (!emb) { failed++; continue; }
     const item = batch[i];
     try {
-      await insertEmbedding("message", item.id, item.original_text, item.original_language, emb);
+      await insertEmbedding(db, "message", item.id, item.original_text, item.original_language, emb);
       succeeded++;
     } catch (e) {
       console.error("recap_backfill insertEmbedding failed for", item.id, e);
@@ -3478,7 +3609,7 @@ async function handleRecapBackfill(msg: any, user: any) {
     }
   }
 
-  const after = await recapBackfillRemaining();
+  const after = await recapBackfillRemaining(db);
   const afterStr = after === null ? "unknown" : String(after);
   const reply =
     `\u2705 Batch done.\n` +
