@@ -170,6 +170,12 @@ has cost you roughly `quota × $0.015`.
 **Comping an account:** set `message_quota = NULL` on the tenant. NULL means uncapped;
 `status` still has to be `active`.
 
+**`/tenants`** (superadmin) is the service-wide view: signups needing attention first,
+then subscription and plan counts, then usage and estimated API spend. The line to watch
+is *paid but never set up* — a customer charged with nothing to show for it, who is one
+step from a chargeback. Revenue is deliberately not shown; that lives in Stripe and a
+copy here would only go stale.
+
 **Refunds and disputes** flow through the subscription events, so a refunded customer
 loses access on the next message without you doing anything.
 
@@ -193,7 +199,7 @@ deliberate — if anything fails partway, the customer has stopped being charged
 
 - **No card-expiry warning.** A failed payment now messages the couple in Telegram, but
   nothing warns them *before* a card expires. Stripe can email that on its own.
-- **No operator view.** Tenant counts, usage and revenue are SQL queries, not a command.
+
 - **A cancelled customer keeps their data indefinitely** unless they run
   `/delete_account`. If that becomes a storage or liability concern, a "deleted N days
   after cancellation" job is the natural fix — deliberately not built, because it is the

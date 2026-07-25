@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v4";
+const BUILD_VERSION = "saas-v5";
 // Which of the repo's two edge functions THIS file is. Used for the /update version
 // check and, critically, for the deploy dispatch: deploy.yml's function_name input
 // defaults to "telegram-bot", so a dispatch that omits it ships the single-tenant build
@@ -429,6 +429,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
+    { match: t => isCmd(t, "tenants"),                                                  handle: handleTenants },
     { match: t => t === "/diag",                                                         handle: handleDiag },
     { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
     { match: t => t === "/reconcile" || t.startsWith("/reconcile@"),                    handle: handleReconcile },
@@ -826,6 +827,126 @@ async function handleBilling(msg: any, user: any): Promise<void> {
     `To delete your account and all its data permanently, send /delete\\_account.`,
     "Markdown",
     { inline_keyboard: [[{ text: "Manage subscription", url: portalUrl }]] });
+}
+
+// ---------------------------------------------------------------------------- /tenants (operator)
+//
+// The one view that is about the SERVICE rather than about a couple. Everything else in
+// this file is deliberately confined to one tenant; this is the exception, so it is
+// superadmin-gated and reads through dbAdmin on purpose.
+//
+// It leads with what needs action rather than with totals. A dashboard of counts is
+// something you have to remember to interpret; "2 paid but never set up" is something you
+// can act on. That case in particular is the one worth catching early -- money taken with
+// no service delivered, and the customer's own next step is to complain or charge back.
+//
+// Aggregated in TypeScript over two reads rather than in SQL. At the scale this product
+// is meant to reach -- tens to low hundreds of couples -- pulling the tenant rows is
+// nothing, and it keeps the numbers in the same place as the text that explains them. If
+// it ever stops being nothing, that is a good problem and the fix is a view.
+
+// Established by measuring real traffic with /annotate_ab: ~$0.015 per message, of which
+// annotation is about 85%. Used only for the estimate below, so drift costs nothing.
+const EST_COST_PER_MESSAGE_USD = 0.015;
+
+async function handleTenants(msg: any, _user: any): Promise<void> {
+  if (await denyUnlessSuperadmin(msg)) return;
+
+  const { data: tenants, error } = await dbAdmin.from("tenants")
+    .select("id, plan, status, message_quota, messages_used, created_at, pairing_code");
+  if (error) {
+    console.error("/tenants: read failed:", error);
+    await sendMessage(msg.chat.id, "Couldn't read tenants.");
+    return;
+  }
+  if (!tenants || tenants.length === 0) {
+    await sendMessage(msg.chat.id, "No tenants yet.");
+    return;
+  }
+
+  // One read for the seat counts rather than a query per tenant.
+  const { data: allUsers } = await dbAdmin.from("users").select("tenant_id");
+  const seats = new Map<string, number>();
+  for (const u of allUsers ?? []) seats.set(u.tenant_id, (seats.get(u.tenant_id) ?? 0) + 1);
+
+  const byStatus = new Map<string, number>();
+  const byPlan = new Map<string, number>();
+  let totalUsed = 0;
+  const unclaimed: any[] = [];   // paid, nobody has set up at all
+  const halfSet: any[] = [];     // one seat taken, partner never joined
+  const overQuota: any[] = [];
+  const nearQuota: any[] = [];
+
+  for (const t of tenants) {
+    byStatus.set(t.status, (byStatus.get(t.status) ?? 0) + 1);
+    totalUsed += t.messages_used ?? 0;
+
+    const entitled = t.status === "active" || t.status === "trialing";
+    if (entitled) {
+      byPlan.set(t.plan, (byPlan.get(t.plan) ?? 0) + 1);
+      const taken = seats.get(t.id) ?? 0;
+      if (taken === 0) unclaimed.push(t);
+      else if (taken === 1) halfSet.push(t);
+
+      if (t.message_quota) {
+        const ratio = (t.messages_used ?? 0) / t.message_quota;
+        if (ratio >= 1) overQuota.push(t);
+        else if (ratio >= 0.8) nearQuota.push(t);
+      }
+    }
+  }
+
+  const ageDays = (iso: string) => Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
+  const oldest = (rows: any[]) => rows.length
+    ? Math.max(...rows.map((r) => ageDays(r.created_at)))
+    : 0;
+
+  const lines: string[] = [];
+  lines.push(`*Capybara operations* — ${tenants.length} tenant${tenants.length === 1 ? "" : "s"}`);
+
+  // Attention first, and only when there is something to say. An empty section trains
+  // you to skim past the place the warnings appear.
+  const attention: string[] = [];
+  if (unclaimed.length) {
+    attention.push(`• *${unclaimed.length} paid but never set up* (oldest ${oldest(unclaimed)}d) — they have been charged and have nothing`);
+  }
+  if (halfSet.length) {
+    attention.push(`• ${halfSet.length} waiting on a partner to join (oldest ${oldest(halfSet)}d)`);
+  }
+  if (overQuota.length) {
+    attention.push(`• ${overQuota.length} over quota — currently blocked`);
+  }
+  if (nearQuota.length) {
+    attention.push(`• ${nearQuota.length} above 80% of quota`);
+  }
+  const pastDue = byStatus.get("past_due") ?? 0;
+  const unpaid = byStatus.get("unpaid") ?? 0;
+  if (pastDue + unpaid > 0) {
+    attention.push(`• ${pastDue + unpaid} with a failed payment`);
+  }
+  if (attention.length) {
+    lines.push("", "*Needs attention*", ...attention);
+  }
+
+  lines.push("", "*Subscriptions*");
+  for (const [status, n] of [...byStatus.entries()].sort((a, b) => b[1] - a[1])) {
+    lines.push(`• ${status}: ${n}`);
+  }
+  if (byPlan.size) {
+    lines.push("", "*Active plans*");
+    for (const [plan, n] of [...byPlan.entries()].sort((a, b) => b[1] - a[1])) {
+      lines.push(`• ${plan}: ${n}`);
+    }
+  }
+
+  lines.push("",
+    `*Usage this period*`,
+    `• ${totalUsed.toLocaleString("en-GB")} messages`,
+    // Cost, not revenue: revenue lives in Stripe and duplicating it here would just be a
+    // number that goes stale. This is the side Stripe cannot tell you.
+    `• ~$${(totalUsed * EST_COST_PER_MESSAGE_USD).toFixed(2)} estimated API spend`);
+
+  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
 }
 
 // ---------------------------------------------------------------------------- /delete_account
@@ -1963,6 +2084,7 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
 // lists them.
 const ADMIN_COMMANDS: { command: string; description: string }[] = [
   ...PUBLIC_COMMANDS,
+  { command: "tenants", description: "Admin: service overview \u2014 signups, quotas, spend" },
   { command: "diag", description: "Admin: ping upstream APIs + DB" },
   { command: "update", description: "Admin: check/deploy a new build" },
 ];
@@ -2625,6 +2747,7 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /backfill\\_grammar \u2014 Fill in card fields for older grammar corrections");
     lines.push("\u2022 /annotate\\_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)");
     lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
+    lines.push("\u2022 /tenants \u2014 Service overview: signups needing attention, quotas, API spend");
     lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
     lines.push("\u2022 /update \u2014 Check GitHub for a newer build; deploy with one tap");
   }
