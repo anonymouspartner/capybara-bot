@@ -59,6 +59,19 @@ jobs:
           echo "FUNCTION_NAME=$fn" >> "$GITHUB_ENV"
           echo "Deploying function: $fn"
 
+      # esm.sh has 522'd three times in one afternoon, and a failed import fails the
+      # gate. Restoring DENO_DIR means a run only reaches the network when deno.lock
+      # changes, so a transient CDN outage no longer blocks a deploy. Integrity is still
+      # enforced -- deno.lock carries the hashes, so a poisoned cache is rejected rather
+      # than trusted.
+      - name: Cache Deno modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
       - name: Pre-deploy sanity gate
         run: bash ./predeploy-check.sh "$FUNCTION_NAME"
 

@@ -1,8 +1,8 @@
 {
   "tasks": {
     "setup": "deno run -A setup.ts",
-    "check": "deno check supabase/functions/telegram-bot/index.ts",
-    "lock": "deno cache --reload --lock=deno.lock supabase/functions/telegram-bot/index.ts"
+    "check": "deno check supabase/functions/telegram-bot/index.ts supabase/functions/telegram-bot-saas/index.ts supabase/functions/stripe-billing/index.ts",
+    "lock": "deno cache --reload --lock=deno.lock supabase/functions/telegram-bot/index.ts supabase/functions/telegram-bot-saas/index.ts supabase/functions/stripe-billing/index.ts"
   },
   "lock": "deno.lock"
 }
