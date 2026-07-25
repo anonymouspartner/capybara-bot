@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v3";
+const BUILD_VERSION = "saas-v4";
 // Which of the repo's two edge functions THIS file is. Used for the /update version
 // check and, critically, for the deploy dispatch: deploy.yml's function_name input
 // defaults to "telegram-bot", so a dispatch that omits it ships the single-tenant build
@@ -388,7 +388,7 @@ async function handleUpdate(update: any) {
   // paths (translate, annotate, /recap synthesis, Whisper) are spread across a dozen
   // handlers, and a gate that has to be remembered in each of them is a gate that will
   // eventually be forgotten in one.
-  if (!isSuperadmin(msg.from?.id) && !isCmd(msg.text ?? "", "billing")) {
+  if (!isSuperadmin(msg.from?.id) && !isCmd(msg.text ?? "", "billing", "delete_account", "export")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
       await sendMessage(msg.chat.id, quotaRefusalText(verdict), "Markdown");
@@ -417,6 +417,7 @@ async function handleUpdate(update: any) {
           `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
           media + tail); } },
     { match: t => isCmd(t, "billing"),                                                  handle: handleBilling },
+    { match: t => isCmd(t, "delete_account"),                                           handle: handleDeleteAccount },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
@@ -818,9 +819,173 @@ async function handleBilling(msg: any, user: any): Promise<void> {
     return;
   }
   await sendMessage(msg.chat.id,
-    `${summary}\n\nManage your card, plan or cancellation here — the link is private and expires shortly.`,
+    `${summary}\n\nManage your card, plan or cancellation here — the link is private and expires shortly.\n\n` +
+    // Surfaced here rather than in the "/" menu: this is where someone who wants out
+    // actually looks, and a destructive command does not belong one tap away in a menu
+    // used every day.
+    `To delete your account and all its data permanently, send /delete\\_account.`,
     "Markdown",
     { inline_keyboard: [[{ text: "Manage subscription", url: portalUrl }]] });
+}
+
+// ---------------------------------------------------------------------------- /delete_account
+//
+// Irreversible, so it is deliberately two steps: the command explains exactly what goes
+// and what it costs, and only a button press actually does it. Owner-only, for the same
+// reason /billing is -- one half of a couple must not be able to erase the other's
+// messages, and the account belongs to whoever pays for it.
+//
+// Order is chosen so that a partial failure is survivable in the direction that favours
+// the customer:
+//
+//   1. Cancel the Stripe subscription FIRST. If anything after this fails they have
+//      stopped being charged, which is the one outcome that is unacceptable to get
+//      wrong. Deleting someone's data while still billing them is worse than leaving
+//      data behind.
+//   2. Delete the Storage objects. They are not covered by any database cascade, so
+//      losing this step would orphan voice recordings with nothing left pointing at them.
+//   3. Delete the tenant row LAST. ON DELETE CASCADE takes every table with it, and it is
+//      the row that makes the rest reachable -- dropping it first would strand both of
+//      the steps above with no way to find what they were meant to clean up.
+async function handleDeleteAccount(msg: any, user: any): Promise<void> {
+  const { data: tenant, error } = await dbAdmin.from("tenants")
+    .select("id, owner_user_id, stripe_subscription_id, status")
+    .eq("id", user.tenant_id).maybeSingle();
+  if (error || !tenant) {
+    console.error("delete_account: tenant read failed:", error);
+    await sendMessage(msg.chat.id, "I couldn't load your account just now. Try again shortly.");
+    return;
+  }
+  if (tenant.owner_user_id && tenant.owner_user_id !== user.id) {
+    await sendMessage(msg.chat.id,
+      "Only the person who set up the subscription can delete the account. " +
+      "Ask them to run /delete_account.");
+    return;
+  }
+
+  const { count: messageCount } = await dbAdmin.from("messages")
+    .select("id", { count: "exact", head: true }).eq("tenant_id", tenant.id);
+
+  await sendMessage(msg.chat.id,
+    "*Delete your Capybara account?*\n\n" +
+    "This cancels your subscription and permanently deletes:\n" +
+    `• all ${messageCount ?? 0} messages, and their translations\n` +
+    "• your vocabulary, flashcards and grammar corrections\n" +
+    "• your notes, pins and conversation memory\n" +
+    "• any voice recordings\n\n" +
+    "Both of you lose access. *This cannot be undone.*\n\n" +
+    "If you want to keep your study decks, send /export first and wait for the file — " +
+    "then come back to this.",
+    "Markdown",
+    { inline_keyboard: [[{ text: "Delete everything permanently", callback_data: "del|confirm" }]] });
+}
+
+async function handleDeleteAccountConfirm(cq: any): Promise<void> {
+  const chatId = cq.message?.chat?.id;
+  // Re-resolve the sender from scratch. The button carries no authority of its own, and
+  // ownership could have changed between the command and the tap.
+  const user = await lookupUser(cq.from);
+  if (!user) { await answerCallbackQuery(cq.id, "Not authorized."); return; }
+
+  const { data: tenant } = await dbAdmin.from("tenants")
+    .select("id, owner_user_id, stripe_subscription_id")
+    .eq("id", user.tenant_id).maybeSingle();
+  if (!tenant || (tenant.owner_user_id && tenant.owner_user_id !== user.id)) {
+    await answerCallbackQuery(cq.id, "Not authorized.");
+    return;
+  }
+
+  await answerCallbackQuery(cq.id, "Deleting…");
+  if (chatId) await editMessageReplyMarkup(chatId, cq.message.message_id);
+
+  // Tell the partner before the data goes. Once the tenant row is gone there is no way
+  // left to find out who they were.
+  const { data: members } = await dbAdmin.from("users")
+    .select("telegram_id").eq("tenant_id", tenant.id).neq("id", user.id);
+
+  // 1. Stop the billing.
+  if (tenant.stripe_subscription_id) {
+    const cancelled = await cancelStripeSubscription(tenant.stripe_subscription_id);
+    if (!cancelled) {
+      // Abort rather than continue. Deleting the data now would leave them paying for an
+      // account that no longer exists, and they would have no way to reach /billing.
+      await sendMessage(chatId,
+        "I couldn't cancel your subscription just now, so I've stopped before deleting anything — " +
+        "I don't want to delete your account while you're still being charged.\n\n" +
+        "Please try again in a few minutes, or use /billing to cancel directly.");
+      return;
+    }
+  }
+
+  // 2. Voice files: no database cascade reaches Storage.
+  await deleteTenantStorage(tenant.id);
+
+  // 3. The row, and with it every table that references it.
+  const { error: delErr } = await dbAdmin.from("tenants").delete().eq("id", tenant.id);
+  if (delErr) {
+    console.error(`delete_account: tenant delete failed for ${tenant.id}:`, delErr);
+    await sendMessage(chatId,
+      "Your subscription is cancelled, but I hit an error deleting your data. " +
+      "Support has been notified and will finish removing it.");
+    return;
+  }
+  console.log(`deleted tenant ${tenant.id} at owner request`);
+
+  await sendMessage(chatId, "Your account and all its data have been deleted, and your subscription is cancelled. Take care. 🐹");
+  for (const m of members ?? []) {
+    await sendMessage(m.telegram_id, "Capybara here — the account you shared has been deleted by its owner. All of its data is gone. Take care. 🐹");
+  }
+}
+
+async function cancelStripeSubscription(subscriptionId: string): Promise<boolean> {
+  if (!STRIPE_SECRET_KEY) {
+    console.error("cancelStripeSubscription: STRIPE_SECRET_KEY not set");
+    return false;
+  }
+  try {
+    const resp = await fetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}`, "Stripe-Version": "2024-06-20" },
+    });
+    // 404 means it is already gone, which is the state we wanted anyway.
+    if (resp.status === 404) return true;
+    if (!resp.ok) {
+      console.error(`subscription cancel failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error("subscription cancel threw:", e);
+    return false;
+  }
+}
+
+// Voice uploads are stored at <tenant_id>/<user_id>/<file>, so a tenant's audio is one
+// prefix. Storage has no recursive delete, hence the two-level walk.
+async function deleteTenantStorage(tenantId: string): Promise<void> {
+  try {
+    const { data: userDirs, error } = await dbAdmin.storage.from("voice-messages").list(tenantId);
+    if (error) { console.error(`storage list failed for tenant ${tenantId}:`, error); return; }
+
+    const paths: string[] = [];
+    for (const dir of userDirs ?? []) {
+      const { data: files } = await dbAdmin.storage.from("voice-messages").list(`${tenantId}/${dir.name}`);
+      for (const f of files ?? []) paths.push(`${tenantId}/${dir.name}/${f.name}`);
+    }
+    if (paths.length === 0) return;
+
+    // Chunked: remove() takes a path array, and a long-lived couple can accumulate
+    // thousands of recordings.
+    for (let i = 0; i < paths.length; i += 100) {
+      const { error: rmErr } = await dbAdmin.storage.from("voice-messages").remove(paths.slice(i, i + 100));
+      if (rmErr) console.error(`storage remove failed for tenant ${tenantId}:`, rmErr);
+    }
+    console.log(`deleted ${paths.length} voice files for tenant ${tenantId}`);
+  } catch (e) {
+    // Never fatal: orphaned audio is a cleanup chore, whereas aborting here would leave
+    // the customer's account half-deleted with their subscription already cancelled.
+    console.error(`deleteTenantStorage threw for ${tenantId}:`, e);
+  }
 }
 
 async function createBillingPortalSession(customerId: string): Promise<string | null> {
@@ -3398,6 +3563,10 @@ async function handleCallbackQuery(cq: any) {
   // Their authorisation is the pairing code, which handleOnboardingCallback revalidates
   // against the database on every step rather than trusting the callback payload.
   if ((cq.data ?? "").startsWith("ob|")) { await handleOnboardingCallback(cq); return; }
+  // Account deletion is confirmed by the tenant OWNER, who is not the operator either.
+  // handleDeleteAccountConfirm re-resolves the sender and re-checks ownership rather than
+  // trusting the button.
+  if ((cq.data ?? "") === "del|confirm") { await handleDeleteAccountConfirm(cq); return; }
 
   // Auth by Telegram sender id, independent of the users table. The button is only
   // ever shown in the admin's own chat, but we re-check here for defense in depth.

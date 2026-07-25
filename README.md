@@ -19,6 +19,10 @@ the other person, translating any caption along the way.
 
 > **Status:** in daily use. Self-hosted, one instance per pair, deployed by hand
 > behind a deliberately strict deploy gate.
+>
+> There is also a **multi-tenant paid build** of the same product in this repo — one bot
+> and one database serving many subscribing couples, with Stripe billing and self-serve
+> onboarding. See [Two products](#two-products).
 
 ---
 
@@ -28,6 +32,7 @@ the other person, translating any caption along the way.
 - [How it works](#how-it-works)
 - [The `/recap` memory pipeline](#the-recap-memory-pipeline)
 - [The model: one instance per pair](#the-model-one-instance-per-pair)
+- [Two products](#two-products)
 - [Data model](#data-model)
 - [Repository map](#repository-map)
 - [Prerequisites](#prerequisites)
@@ -179,7 +184,37 @@ registry. Whichever user's Telegram ID is set as `ADMIN_TELEGRAM_ID` is the **ad
 **Self-hosted.** You run your own Supabase project, your own Anthropic/OpenAI keys, your
 own bot, and your own deploys. The single canonical `index.ts` is instance-agnostic —
 nothing about a specific pair is baked into the code; it all lives in secrets and seed
-data. **Never fork `index.ts`** — one file deploys to every instance unchanged.
+data. **Within a product, never fork `index.ts`** — one file deploys to every instance of
+that product unchanged. (The paid service is a separate product with its own file; see
+[Two products](#two-products).)
+
+## Two products
+
+The repo builds **two separate products** from a shared core. They are different
+products, not different instances, and each has its own file and its own Supabase project.
+
+| | Personal (`telegram-bot`) | Paid service (`telegram-bot-saas` + `stripe-billing`) |
+|---|---|---|
+| Tenancy | One couple per project | Many couples, one project |
+| Isolation | The project boundary | `tenant_id` on every table, plus a scoped DB client |
+| Onboarding | Edit `seed_couple.sql`, run it by hand | Stripe Checkout → one-tap Telegram deep link → two button taps |
+| Billing | None | Stripe subscription, two tiers, per-period message quota |
+| Admin | The couple's own `ADMIN_TELEGRAM_ID` | `SUPERADMIN_TELEGRAM_ID` — the operator, never a customer |
+| Retention | 30-day PII cron | Kept while the account exists; `/delete_account` removes everything |
+
+The fork was deliberate. Roughly 90% is shared core — translation, annotation, `/recap`,
+the language registry — so **a fix to one is not a fix to the other**; it has to be
+ported, and the commit should say which file it came from.
+
+The multi-tenant build's whole safety story is that scoping is structural rather than
+remembered: the raw Supabase client is named `dbAdmin` and every ordinary query goes
+through `tenantDb`, which adds the tenant filter to reads, stamps it into writes, and
+passes it to every RPC. Crossing the tenant boundary has to be spelled out, and the two
+places that legitimately do are commented as such. The `SECURITY DEFINER` SQL functions
+take a tenant argument too — scoping the TypeScript alone would not have reached them.
+
+Wiring up the paid service (BotFather, Stripe products, Payment Links, secrets, deploy
+order, an end-to-end test) is documented in **`LAUNCH_SAAS.md`**.
 
 ## Data model
 
@@ -221,13 +256,17 @@ database, not Storage).
 
 | Path | What it is |
 |---|---|
-| `supabase/functions/telegram-bot/index.ts` | The entire bot — one canonical file. |
+| `supabase/functions/telegram-bot/index.ts` | The entire personal bot — one canonical file. |
+| `supabase/functions/telegram-bot-saas/index.ts` | The multi-tenant paid build (tenant scoping, onboarding, quotas). |
+| `supabase/functions/stripe-billing/index.ts` | Paid build only: Stripe webhook + the Checkout claim route that provisions a tenant. |
 | `setup.ts` | **Guided setup wizard** — `deno run -A setup.ts` provisions a whole instance end to end. |
 | `start.sh` | Interactive start-up menu for a freshly cloned repo (prereqs + common tasks). |
-| `supabase/migrations/` | Versioned DB migrations; the init migration builds everything (10 tables, 7 functions, extensions). |
+| `supabase/migrations/` | Base DB migrations, applied to **both** products; the init migration builds everything (10 tables, 7 functions, extensions). |
+| `supabase/migrations-saas/` | Multi-tenant migrations — commercial project **only**. |
 | `seed_couple.sql` | Seeds your two users + the default conversation. |
 | `storage_setup.sql` | Creates the private `voice-messages` Storage bucket (bucket-as-code). |
 | **`PROVISION_NEW_COUPLE.md`** | **The setup runbook — start here.** |
+| **`LAUNCH_SAAS.md`** | **The paid-service runbook** — BotFather, Stripe, secrets, deploy order. |
 | `.env.example` | Template for the five function secrets (copy to `.env`). |
 | `.github/workflows/deploy.yml` | **Primary deploy path:** CI, manual (`workflow_dispatch`), gated deploy from GitHub. |
 | `.github/workflows/check.yml` | CI: runs the pre-deploy gate on every push/PR (never deploys). |

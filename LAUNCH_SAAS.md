@@ -73,13 +73,13 @@ their own.
 
 | Secret | Used by | Notes |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | bot | From step 1 |
+| `TELEGRAM_BOT_TOKEN` | bot **+ billing** | From step 1. Billing needs it to warn the couple when a payment fails |
 | `TELEGRAM_BOT_USERNAME` | bot + billing | No `@`. Builds the deep links |
 | `WEBHOOK_SECRET` | bot | Any long random string; also goes in the setWebhook call |
 | `ANTHROPIC_API_KEY` | bot | |
 | `OPENAI_API_KEY` | bot | Whisper + embeddings |
 | `SUPERADMIN_TELEGRAM_ID` | bot | **You.** Gates deploys, the grinds, and diagnostics. Not a customer |
-| `STRIPE_SECRET_KEY` | billing + bot | `sk_test_…` first |
+| `STRIPE_SECRET_KEY` | billing + bot | `sk_test_…` first. Also used by `/delete_account` to cancel the subscription |
 | `STRIPE_WEBHOOK_SECRET` | billing | `whsec_…`, from step 5 |
 | `STRIPE_PRICE_STANDARD` | billing | `price_…` |
 | `STRIPE_PRICE_HEAVY` | billing | `price_…` |
@@ -134,7 +134,13 @@ curl -sS "https://api.telegram.org/bot<TOKEN>/setWebhook" \
 4. Open the invite link from a **second Telegram account**, complete the one tap, and
    confirm both accounts now see each other's messages.
 5. `/billing` → confirm plan, usage, and that the portal link opens.
-6. Cancel in the portal → confirm the bot stops translating and points at `/billing`.
+6. Cancel in the portal → confirm **both** partners get the "subscription has ended"
+   message, and that the bot then refuses and points at `/billing`.
+7. Reactivate → confirm the "active again" message arrives.
+8. `/delete_account` from the **partner** → must be refused (owner-only). Then from the
+   owner → confirm the warning lists the right message count, and that confirming
+   cancels the subscription in Stripe, empties `<tenant_id>/` in the `voice-messages`
+   bucket, and leaves `select count(*) from public.tenants` one lower.
 
 Then check isolation directly, because it is the one failure that is invisible from
 inside a single account:
@@ -171,16 +177,24 @@ loses access on the next message without you doing anything.
 counter does not reset. The reset happens on the first message after
 `current_period_end`, which stays aligned with what Stripe bills.
 
+## Retention
+
+There is **no automatic deletion**. The 30-day `capybara-pii-retention` cron inherited
+from the single-tenant schema is unscheduled and `delete_expired_pii` is dropped
+(`migrations-saas/20260726000500`) — on a product selling a study corpus and a searchable
+memory, a job that silently erases both after a month destroys what the customer pays for.
+
+Data therefore lives as long as the account does. `/delete_account` is the customer's own
+route out: owner-only, two-step, and it cancels the subscription, removes the Storage
+audio, then deletes the tenant row (which cascades to every table). That order is
+deliberate — if anything fails partway, the customer has stopped being charged.
+
 ## Known gaps
 
-- **No dunning.** A failed payment flips `status` and the bot stops, but nobody emails
-  them. Stripe's own retry emails cover most of this; a "your subscription lapsed"
-  Telegram message on `invoice.payment_failed` would be better.
-- **No self-serve deletion.** `ON DELETE CASCADE` from `tenants` means removing the row
-  removes the couple's data, but nothing in the product exposes it.
-- **Voice files are not deleted with a tenant.** They are tenant-prefixed in Storage, so
-  the cleanup is a recursive remove under `<tenant_id>/`, but it is manual.
-- **`delete_expired_pii` runs instance-wide on a 30-day cron**, inherited from the
-  single-tenant schema. On a paid product a customer losing history after 30 days is
-  probably not what you want — decide whether to keep it, lengthen it, or make it
-  per-tenant before launch.
+- **No card-expiry warning.** A failed payment now messages the couple in Telegram, but
+  nothing warns them *before* a card expires. Stripe can email that on its own.
+- **No operator view.** Tenant counts, usage and revenue are SQL queries, not a command.
+- **A cancelled customer keeps their data indefinitely** unless they run
+  `/delete_account`. If that becomes a storage or liability concern, a "deleted N days
+  after cancellation" job is the natural fix — deliberately not built, because it is the
+  same invisible-clock behaviour that was just removed.

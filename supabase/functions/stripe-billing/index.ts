@@ -28,7 +28,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-const BUILD_VERSION = "billing-v1";
+const BUILD_VERSION = "billing-v2";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -81,27 +81,6 @@ async function stripeGet(path: string): Promise<any | null> {
   });
   if (!resp.ok) {
     console.error(`stripe GET ${path} failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`);
-    return null;
-  }
-  return await resp.json();
-}
-
-async function stripePost(path: string, form: Record<string, string>): Promise<any | null> {
-  if (!STRIPE_SECRET_KEY) {
-    console.error("stripePost: STRIPE_SECRET_KEY is not set");
-    return null;
-  }
-  const resp = await fetch(`https://api.stripe.com/v1/${path}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
-      "Stripe-Version": "2024-06-20",
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams(form).toString(),
-  });
-  if (!resp.ok) {
-    console.error(`stripe POST ${path} failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`);
     return null;
   }
   return await resp.json();
@@ -252,10 +231,20 @@ async function provisionFromCheckoutSession(sessionId: string): Promise<string |
 // rather than collapsed. consume_message_quota treats 'active' and 'trialing' as
 // entitled and everything else as denied, which means a status Stripe adds later fails
 // closed instead of silently granting service.
+const ENTITLED_STATUSES = new Set(["active", "trialing"]);
+
 async function applySubscriptionEvent(sub: any): Promise<void> {
   const priceId: string | null = sub?.items?.data?.[0]?.price?.id ?? null;
   const { plan, quota } = planForPrice(priceId);
-  const patch: Record<string, unknown> = {
+
+  // Read the old status first so the notification below can fire on the TRANSITION
+  // rather than on every event. Stripe re-sends subscription.updated for many reasons
+  // (renewals, metadata edits, its own retries), and a message on each one would turn a
+  // single failed payment into a stream of identical warnings.
+  const { data: before } = await db.from("tenants")
+    .select("id, status").eq("stripe_subscription_id", sub.id).maybeSingle();
+
+  const { error } = await db.from("tenants").update({
     status: sub.status,
     stripe_price_id: priceId,
     plan,
@@ -263,12 +252,62 @@ async function applySubscriptionEvent(sub: any): Promise<void> {
     current_period_end: sub.current_period_end
       ? new Date(sub.current_period_end * 1000).toISOString()
       : null,
-  };
+  }).eq("stripe_subscription_id", sub.id);
 
-  const { error } = await db.from("tenants").update(patch)
-    .eq("stripe_subscription_id", sub.id);
-  if (error) console.error(`subscription update failed for ${sub.id}:`, error);
-  else console.log(`subscription ${sub.id} -> status=${sub.status} plan=${plan}`);
+  if (error) {
+    console.error(`subscription update failed for ${sub.id}:`, error);
+    return;
+  }
+  console.log(`subscription ${sub.id} -> status=${sub.status} plan=${plan}`);
+
+  if (!before) return;
+  const wasEntitled = ENTITLED_STATUSES.has(before.status);
+  const isEntitled = ENTITLED_STATUSES.has(sub.status);
+  if (wasEntitled === isEntitled) return;
+
+  // Without this the bot simply stops answering, and the couple's only clue is a refusal
+  // the next time one of them writes something. Telling them where the problem is, in
+  // the place they already use, is the difference between a lapsed card being fixed in a
+  // minute and a churned customer who thinks the product broke.
+  if (isEntitled) {
+    await notifyTenant(before.id, "Your Capybara subscription is active again — everything's back on. 🙂");
+  } else if (sub.status === "past_due" || sub.status === "unpaid") {
+    await notifyTenant(before.id,
+      "Capybara here — your last payment didn't go through, so I've paused translating.\n\n" +
+      "Nothing has been deleted. Send /billing to update your card and I'll pick straight back up.");
+  } else {
+    await notifyTenant(before.id,
+      "Your Capybara subscription has ended, so I've paused translating.\n\n" +
+      "Your messages and study decks are still here. Send /billing if you'd like to resubscribe.");
+  }
+}
+
+// Messages every member of a tenant. Best-effort: a delivery failure is logged, never
+// thrown, because a webhook that 500s over an undeliverable notification would have
+// Stripe retry the whole event and re-apply a state change that already succeeded.
+async function notifyTenant(tenantId: string, text: string): Promise<void> {
+  const token = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
+  if (!token) {
+    console.warn("notifyTenant: TELEGRAM_BOT_TOKEN not set; skipping billing notification");
+    return;
+  }
+  const { data: members, error } = await db.from("users")
+    .select("telegram_id").eq("tenant_id", tenantId);
+  if (error) { console.error("notifyTenant: member read failed:", error); return; }
+
+  for (const m of members ?? []) {
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: m.telegram_id, text }),
+      });
+      // A blocked bot or deleted account is normal and permanent; log and move on.
+      if (!resp.ok) console.error(`notifyTenant: send to ${m.telegram_id} failed: ${resp.status}`);
+    } catch (e) {
+      console.error(`notifyTenant: send to ${m.telegram_id} threw:`, e);
+    }
+  }
 }
 
 async function handleStripeEvent(event: any): Promise<void> {
@@ -307,6 +346,9 @@ Deno.serve(async (req) => {
       stripeConfigured: Boolean(STRIPE_SECRET_KEY) && Boolean(STRIPE_WEBHOOK_SECRET),
       botUsernameConfigured: Boolean(TELEGRAM_BOT_USERNAME),
       pricesConfigured: Boolean(PRICE_STANDARD) && Boolean(PRICE_HEAVY),
+      // Not smoke-tested as a hard failure: without it billing still works end to end,
+      // the couple just isn't told when their payment lapses.
+      notificationsConfigured: Boolean(Deno.env.get("TELEGRAM_BOT_TOKEN")),
     });
   }
 
