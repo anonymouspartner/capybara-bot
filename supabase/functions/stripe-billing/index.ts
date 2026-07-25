@@ -28,7 +28,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-const BUILD_VERSION = "billing-v2";
+const BUILD_VERSION = "billing-v3";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -49,11 +49,16 @@ const QUOTA_HEAVY = Number(Deno.env.get("QUOTA_HEAVY") ?? 10000);
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE);
 
-function planForPrice(priceId: string | null): { plan: string; quota: number } {
+// Returns null for anything that is not one of OUR prices. Deliberately not a fallback:
+// an earlier version defaulted an unrecognized price to the standard quota, which turned
+// "we don't know what this is" into "here is a full subscription". Combined with the
+// claim route accepting any paid Checkout session, that meant a customer who bought
+// anything at all through this Stripe account -- some other product, a one-off -- could
+// take their own session id, hit the claim URL, and be provisioned a Capybara tenant.
+function planForPrice(priceId: string | null): { plan: string; quota: number } | null {
   if (priceId && priceId === PRICE_HEAVY) return { plan: "heavy", quota: QUOTA_HEAVY };
   if (priceId && priceId === PRICE_STANDARD) return { plan: "standard", quota: QUOTA_STANDARD };
-  console.warn(`unrecognized price id ${priceId}; defaulting to standard quota`);
-  return { plan: "standard", quota: QUOTA_STANDARD };
+  return null;
 }
 
 // Deliberately excludes look-alike characters (0/O, 1/l/I). The code is read off a
@@ -168,6 +173,16 @@ async function provisionFromCheckoutSession(sessionId: string): Promise<string |
     console.warn(`session ${sessionId} not paid (payment_status=${session.payment_status})`);
     return null;
   }
+  // "Paid" is not the same as "paid for THIS". A Stripe account may sell other things,
+  // and the claim URL is discoverable -- it is the redirect target on the Payment Link,
+  // so every customer sees it. Requiring subscription mode rejects one-off purchases,
+  // which would otherwise provision a tenant with no subscription behind it: no
+  // current_period_end, so the quota never rolls, and nothing for a lifecycle event to
+  // ever deactivate.
+  if (session.mode !== "subscription") {
+    console.warn(`session ${sessionId} rejected: mode=${session.mode}, expected subscription`);
+    return null;
+  }
 
   const subscriptionId: string | null = typeof session.subscription === "string"
     ? session.subscription
@@ -186,7 +201,15 @@ async function provisionFromCheckoutSession(sessionId: string): Promise<string |
       ? new Date(sub.current_period_end * 1000).toISOString()
       : null;
   }
-  const { plan, quota } = planForPrice(priceId);
+
+  // The actual entitlement check: the money has to have been for one of our two prices.
+  const plan_ = planForPrice(priceId);
+  if (!plan_) {
+    console.error(
+      `session ${sessionId} rejected: price ${priceId} is not STRIPE_PRICE_STANDARD or STRIPE_PRICE_HEAVY`);
+    return null;
+  }
+  const { plan, quota } = plan_;
   const pairingCode = generatePairingCode();
 
   const { data: tenant, error } = await db.from("tenants").insert({
@@ -235,7 +258,7 @@ const ENTITLED_STATUSES = new Set(["active", "trialing"]);
 
 async function applySubscriptionEvent(sub: any): Promise<void> {
   const priceId: string | null = sub?.items?.data?.[0]?.price?.id ?? null;
-  const { plan, quota } = planForPrice(priceId);
+  const mapped = planForPrice(priceId);
 
   // Read the old status first so the notification below can fire on the TRANSITION
   // rather than on every event. Stripe re-sends subscription.updated for many reasons
@@ -244,21 +267,37 @@ async function applySubscriptionEvent(sub: any): Promise<void> {
   const { data: before } = await db.from("tenants")
     .select("id, status").eq("stripe_subscription_id", sub.id).maybeSingle();
 
-  const { error } = await db.from("tenants").update({
+  // Status and period always apply -- a cancellation has to deactivate the tenant even
+  // if the price on it is one we don't recognise, or an unknown price would become a way
+  // to keep service after cancelling.
+  //
+  // The plan and quota only move when the price maps to one of ours. An unmapped price
+  // leaves the existing entitlement untouched rather than granting a default one; the
+  // operator sees the log and fixes the mapping, and nobody is silently upgraded in the
+  // meantime.
+  const patch: Record<string, unknown> = {
     status: sub.status,
     stripe_price_id: priceId,
-    plan,
-    message_quota: quota,
     current_period_end: sub.current_period_end
       ? new Date(sub.current_period_end * 1000).toISOString()
       : null,
-  }).eq("stripe_subscription_id", sub.id);
+  };
+  if (mapped) {
+    patch.plan = mapped.plan;
+    patch.message_quota = mapped.quota;
+  } else {
+    console.error(
+      `subscription ${sub.id} has unmapped price ${priceId}; status/period updated, plan and quota left as-is`);
+  }
+
+  const { error } = await db.from("tenants").update(patch)
+    .eq("stripe_subscription_id", sub.id);
 
   if (error) {
     console.error(`subscription update failed for ${sub.id}:`, error);
     return;
   }
-  console.log(`subscription ${sub.id} -> status=${sub.status} plan=${plan}`);
+  console.log(`subscription ${sub.id} -> status=${sub.status} plan=${mapped?.plan ?? "(unchanged)"}`);
 
   if (!before) return;
   const wasEntitled = ENTITLED_STATUSES.has(before.status);

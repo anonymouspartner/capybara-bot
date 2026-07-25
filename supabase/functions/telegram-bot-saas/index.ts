@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v5";
+const BUILD_VERSION = "saas-v6";
 // Which of the repo's two edge functions THIS file is. Used for the /update version
 // check and, critically, for the deploy dispatch: deploy.yml's function_name input
 // defaults to "telegram-bot", so a dispatch that omits it ships the single-tenant build
@@ -660,6 +660,34 @@ async function handleOnboardingCallback(cq: any): Promise<void> {
     return;
   }
   const tenantId: string = row.tenant_id;
+  const seatsTaken: number = row.seats_taken ?? 0;
+
+  // WHICH seat this is decides which wizard the tap belongs to, and claim_tenant_seat
+  // answers "ok" for both the first and the second -- it only rejects a full tenant. So
+  // the branch has to check it too.
+  //
+  // Without this, the partner (who legitimately holds the pairing code, it is their
+  // invite link) could send an owner-flow payload and reach finishOnboarding with
+  // isOwner true, taking ownership of the subscription: the Stripe portal to cancel or
+  // change the payer's card, and /delete_account to erase the couple's corpus. Telegram's
+  // own clients only send callback_data the bot issued, but MTProto's
+  // getBotCallbackAnswer takes an arbitrary payload, so that is not a boundary to rely on.
+  //
+  // There is also a no-forgery version: if the code reaches the partner before the owner
+  // finishes the wizard, seats_taken is still 0 and both are legitimately handed the
+  // owner flow, with the last to finish overwriting the first.
+  const ownerSteps = step === "l" || step === "g" || step === "d";
+  if (ownerSteps && seatsTaken !== 0) {
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId,
+      "Your partner has already set this account up. Open your invite link again and I'll finish adding you.");
+    return;
+  }
+  if (step === "p" && seatsTaken !== 1) {
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId, "That setup step is no longer available. Open your invite link again.");
+    return;
+  }
 
   switch (step) {
     case "l": {
@@ -737,9 +765,26 @@ async function finishOnboarding(
 
   if (isOwner) {
     // Record the payer. Only they may manage the subscription.
-    const { error: ownErr } = await dbAdmin.from("tenants")
-      .update({ owner_user_id: created.id }).eq("id", tenantId);
-    if (ownErr) console.error("owner_user_id update failed:", ownErr);
+    //
+    // `.is("owner_user_id", null)` makes this write-once at the database: a second
+    // attempt matches no row rather than replacing the owner. The caller already checks
+    // the seat count, so this is the backstop -- ownership is the authority behind
+    // cancelling a card and deleting the couple's data, and it should not be possible to
+    // move it by any route that isn't deliberate.
+    const { data: owned, error: ownErr } = await dbAdmin.from("tenants")
+      .update({ owner_user_id: created.id })
+      .eq("id", tenantId).is("owner_user_id", null)
+      .select("id");
+
+    // Not silent any more. If this does not land the tenant has no owner, and since a
+    // null owner now DENIES /billing and /delete_account, the couple would be quietly
+    // locked out of managing their own subscription. Better they know immediately.
+    if (ownErr || !owned || owned.length === 0) {
+      console.error(`owner_user_id not set for tenant ${tenantId}:`, ownErr ?? "no row updated");
+      await sendMessage(chatId,
+        "You're set up and I can start translating — but I couldn't record you as the " +
+        "account holder, so /billing won't work yet. Contact support and we'll fix it.");
+    }
 
     const invite = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
     await sendMessage(chatId,
@@ -803,7 +848,11 @@ async function handleBilling(msg: any, user: any): Promise<void> {
     `Used this period: ${used}${quota ? ` of ${quota}` : " (unlimited)"}\n` +
     `Renews: ${renews}`;
 
-  if (tenant.owner_user_id && tenant.owner_user_id !== user.id) {
+  // Strict equality: a NULL owner denies everyone, rather than admitting everyone.
+  // `owner && owner !== user` reads as an ownership check but is really "deny only if
+  // someone else owns it" -- with no owner recorded it grants the Stripe portal, and
+  // below it grants irreversible deletion, to whichever partner asks first.
+  if (tenant.owner_user_id !== user.id) {
     await sendMessage(msg.chat.id,
       `${summary}\n\nBilling is managed by whoever set up the subscription — ask them to run /billing.`,
       "Markdown");
@@ -977,7 +1026,7 @@ async function handleDeleteAccount(msg: any, user: any): Promise<void> {
     await sendMessage(msg.chat.id, "I couldn't load your account just now. Try again shortly.");
     return;
   }
-  if (tenant.owner_user_id && tenant.owner_user_id !== user.id) {
+  if (tenant.owner_user_id !== user.id) {
     await sendMessage(msg.chat.id,
       "Only the person who set up the subscription can delete the account. " +
       "Ask them to run /delete_account.");
@@ -1011,7 +1060,7 @@ async function handleDeleteAccountConfirm(cq: any): Promise<void> {
   const { data: tenant } = await dbAdmin.from("tenants")
     .select("id, owner_user_id, stripe_subscription_id")
     .eq("id", user.tenant_id).maybeSingle();
-  if (!tenant || (tenant.owner_user_id && tenant.owner_user_id !== user.id)) {
+  if (!tenant || tenant.owner_user_id !== user.id) {
     await answerCallbackQuery(cq.id, "Not authorized.");
     return;
   }
