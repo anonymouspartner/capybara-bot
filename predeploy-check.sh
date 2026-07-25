@@ -23,25 +23,47 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # FUNCTION_NAME). Both builds share this gate so neither can be deployed as a stub.
 FUNCTION_NAME="${1:-${FUNCTION_NAME:-telegram-bot}}"
 INDEX_PATH="$SCRIPT_DIR/supabase/functions/$FUNCTION_NAME/index.ts"
-MIN_LINES=1500
-
-# Anchors both products must have: if these are gone, the file is not a Capybara bot.
-ANCHORS=(
-  "Deno.serve"
-  "handleUpdate"
-  "ADMIN_TELEGRAM_ID"
-  "handleRecap"
-  "handleReconcile"
-  "handlePinned"
-)
-
-# Per-build anchors. The multi-tenant gate additionally proves the tenant-scoping layer
-# is present, which is the one thing that must never be missing from a build shipped to
-# the shared project. Without it every query reads across all tenants -- and that build
-# would otherwise pass this gate, since it is a perfectly valid single-tenant bot.
+# The floor and the anchors are per-function: they exist to prove a specific file is
+# still itself, so a single shared set would either be too weak for the bots or reject
+# the billing function for being the size it is meant to be.
 case "$FUNCTION_NAME" in
+  telegram-bot)
+    MIN_LINES=1500
+    ANCHORS=(
+      "Deno.serve" "handleUpdate" "ADMIN_TELEGRAM_ID"
+      "handleRecap" "handleReconcile" "handlePinned"
+    )
+    ;;
   telegram-bot-saas)
-    ANCHORS+=("tenantDb" "dbAdmin" "tenant_id")
+    MIN_LINES=1500
+    ANCHORS=(
+      "Deno.serve" "handleUpdate" "ADMIN_TELEGRAM_ID"
+      "handleRecap" "handleReconcile" "handlePinned"
+      # The tenant-scoping layer. This is the one thing that must never be missing from a
+      # build shipped to the shared project: without it every query reads across all
+      # tenants, and such a build would otherwise pass every other check here, because it
+      # is a perfectly valid single-tenant bot.
+      "tenantDb" "dbAdmin" "tenant_id"
+      # The paid surface. A build missing these serves everyone for free.
+      "consume_message_quota" "claim_tenant_seat"
+    )
+    ;;
+  stripe-billing)
+    # Roughly a fifth of the real file. Small enough that a stub still fails, large
+    # enough that the floor never fights normal edits.
+    MIN_LINES=120
+    ANCHORS=(
+      "Deno.serve"
+      # Signature verification and its replay window. A billing webhook that has lost
+      # either one accepts forged events -- including "subscription reactivated" -- so
+      # these are the anchors that matter most in the whole repo.
+      "verifyStripeSignature" "timingSafeEqual" "stripe-signature"
+      "provisionFromCheckoutSession" "pairing_code"
+    )
+    ;;
+  *)
+    echo "FAIL  unknown function '$FUNCTION_NAME'"
+    exit 1
     ;;
 esac
 

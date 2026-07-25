@@ -14,6 +14,13 @@ const BUILD_VERSION = "saas-v3";
 // defaults to "telegram-bot", so a dispatch that omits it ships the single-tenant build
 // to whatever project it targets.
 const SELF_FUNCTION_NAME = "telegram-bot-saas";
+// This bot's @username, without the @. Used to build the partner invite deep link. The
+// bot cannot discover it reliably at boot (getMe would need a call on every cold start),
+// and onboarding degrades to "send them this code" if it is unset rather than failing.
+const BOT_USERNAME = (Deno.env.get("TELEGRAM_BOT_USERNAME") ?? "").replace(/^@/, "");
+// Only used to mint Stripe customer-portal links for /billing. Unset degrades /billing
+// to a read-only summary rather than breaking it.
+const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY") ?? "";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
@@ -344,10 +351,20 @@ async function handleUpdate(update: any) {
   if (!msg) return;
   const user = await lookupUser(msg.from);
   if (!user) {
+    // Not a member of any tenant. The single-tenant build's answer here was "ask the
+    // owner to add your id", which assumed a human operator doing manual seeding. The
+    // only way in now is a paid pairing code, so the one thing worth checking is whether
+    // they are arriving with one.
+    const startPayload = parseStartPayload(msg.text ?? "");
+    if (startPayload) { await beginOnboarding(msg, startPayload); return; }
     await sendMessage(msg.chat.id,
-      "Hi! This bot is private. Your Telegram ID hasn't been registered yet.\n\n" +
-      `Your Telegram user ID is: ${msg.from.id}\n` +
-      "Send this ID to the bot's owner so they can add you."
+      "Hi! Capybara is a private translation bot for couples — it translates between " +
+      "your two languages, builds a study deck from your own conversations, and remembers " +
+      "what you talked about.\n\n" +
+      "It's a paid subscription. Once you've subscribed you'll get a one-tap link that " +
+      "sets this up automatically.\n\n" +
+      "If you've already subscribed and have a setup link, open it again — or send " +
+      "/start followed by your setup code.",
     );
     return;
   }
@@ -355,6 +372,36 @@ async function handleUpdate(update: any) {
   // read that crosses the boundary; from here the tenant is known and fixed for the rest
   // of the update.
   const db = tenantDb(user.tenant_id);
+
+  // A second /start with a code, from someone already registered. Almost always the
+  // owner re-opening their own link; answering plainly beats treating it as a command.
+  const restart = parseStartPayload(msg.text ?? "");
+  if (restart) {
+    await sendMessage(msg.chat.id, "You're already set up — no need for the setup link. Type /help to see what I can do.");
+    return;
+  }
+
+  // Subscription + quota gate. Runs before anything that costs money, and before the
+  // command table, so a lapsed tenant can still reach /billing to fix it.
+  //
+  // Placed on the update rather than on individual handlers deliberately: the expensive
+  // paths (translate, annotate, /recap synthesis, Whisper) are spread across a dozen
+  // handlers, and a gate that has to be remembered in each of them is a gate that will
+  // eventually be forgotten in one.
+  if (!isSuperadmin(msg.from?.id) && !isCmd(msg.text ?? "", "billing")) {
+    const verdict = await consumeQuota(user.tenant_id);
+    if (!verdict.allowed) {
+      await sendMessage(msg.chat.id, quotaRefusalText(verdict), "Markdown");
+      return;
+    }
+    // One heads-up as they approach the cap, so the first they hear of it isn't a
+    // refusal. Fires on the single crossing message, not on every one after it.
+    if (verdict.quota && verdict.used === Math.floor(verdict.quota * 0.9)) {
+      await sendMessage(msg.chat.id,
+        `Heads up: you've used ${verdict.used} of your ${verdict.quota} messages this period. ` +
+        `Type /billing to change plan.`);
+    }
+  }
   // Command dispatch table — to add a command, append one entry here.
   type Cmd = { match: (t: string) => boolean; handle: (m: any, u: any) => Promise<void> };
   const COMMANDS: Cmd[] = [
@@ -369,6 +416,7 @@ async function handleUpdate(update: any) {
         await sendMessage(m.chat.id,
           `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
           media + tail); } },
+    { match: t => isCmd(t, "billing"),                                                  handle: handleBilling },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
@@ -413,6 +461,388 @@ async function handleUpdate(update: any) {
   else if (msg.contact) { await handleContactMessage(msg, user); }
   else if (msg.text) { await handleTextMessage(msg, user); }
   else { await sendMessage(msg.chat.id, "I can handle text, voice, photos, videos, files, stickers, GIFs, audio, locations, and contacts. Other types aren't supported yet."); }
+}
+
+// ---------------------------------------------------------------------------- Billing gate
+//
+// A tenant's entitlement is one atomic question -- is the subscription live, has the
+// period rolled, is there budget left, and claim one unit if so -- answered by
+// consume_message_quota (migrations-saas/20260726000400). Doing it in SQL rather than as
+// a read-then-write here is what stops two messages arriving together from both seeing
+// the last unit as available.
+//
+// Counted per INBOUND MESSAGE, not per API call. One message triggers a translation and
+// two annotation passes, so per-call accounting would be both harder to explain on an
+// invoice and easy to drift from the code as call sites change.
+
+type QuotaVerdict = {
+  allowed: boolean;
+  reason: string;
+  used: number;
+  quota: number | null;
+  periodEnd: string | null;
+};
+
+async function consumeQuota(tenantId: string): Promise<QuotaVerdict> {
+  const { data, error } = await dbAdmin.rpc("consume_message_quota", { p_tenant_id: tenantId });
+  if (error) {
+    // Fail OPEN. A database blip must not look to a paying customer like a billing
+    // problem, and the downside is bounded -- a handful of messages past the cap during
+    // an outage, versus telling everyone their subscription is broken.
+    console.error("consume_message_quota failed; allowing message:", error);
+    return { allowed: true, reason: "rpc_error", used: 0, quota: null, periodEnd: null };
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    allowed: Boolean(row?.allowed),
+    reason: row?.reason ?? "unknown",
+    used: row?.used ?? 0,
+    quota: row?.quota ?? null,
+    periodEnd: row?.period_end ?? null,
+  };
+}
+
+function quotaRefusalText(v: QuotaVerdict): string {
+  if (v.reason === "quota_exceeded") {
+    const resumes = v.periodEnd
+      ? ` Your allowance resets on ${new Date(v.periodEnd).toLocaleDateString("en-GB", { day: "numeric", month: "long" })}.`
+      : "";
+    return `You've used all ${v.quota} messages for this billing period.${resumes}\n\n` +
+      `Type /billing to move to a larger plan.`;
+  }
+  if (v.reason === "inactive_subscription") {
+    return `Your Capybara subscription isn't active right now, so I've paused translating.\n\n` +
+      `Type /billing to update your payment details — nothing is deleted in the meantime.`;
+  }
+  return `I can't verify your subscription at the moment. Type /billing to check it, or try again shortly.`;
+}
+
+// ---------------------------------------------------------------------------- Onboarding
+//
+// Replaces seed_couple.sql. Provisioning a couple used to mean collecting two Telegram
+// ids by hand, editing a SQL file and running it in the dashboard; here the couple does
+// it themselves in the chat, immediately after paying.
+//
+// The wizard is STATELESS. Each question is an inline keyboard whose buttons carry every
+// answer chosen so far in their callback_data, so the next tap arrives with the full
+// picture and nothing has to be remembered between updates. That matters more than it
+// might look: edge functions are per-invocation, so any in-memory state would be lost
+// between taps, and a table of half-finished signups would need its own expiry and
+// cleanup. Telegram's 64-byte callback_data budget is the constraint, and the longest
+// payload here ("ob|g|" + 12-char code + two language codes + a gender) is about 30.
+//
+// The one thing not asked is the display name, which comes from the Telegram profile.
+// A free-text answer is the only kind that cannot be a button, and it would have forced
+// exactly the state-machine this design avoids -- for a field the user can already see
+// and rarely wants to change.
+//
+// Every step re-validates the pairing code against the database rather than trusting the
+// callback payload. callback_data is client-supplied: without that check, anyone could
+// hand-craft a tap carrying a tenant id and add themselves to a stranger's subscription.
+
+const ONBOARD_GENDERS: { code: string; label: string }[] = [
+  { code: "female", label: "She/her" },
+  { code: "male", label: "He/him" },
+];
+
+// Telegram sends "/start <payload>" when a t.me/<bot>?start=<payload> link is opened.
+// Returns the payload, or null if this isn't a /start carrying one.
+function parseStartPayload(text: string): string | null {
+  const m = /^\/start(?:@\S+)?\s+(\S+)$/.exec(text.trim());
+  if (!m) return null;
+  // Same alphabet the billing function generates. Anything else is not a code we issued,
+  // and rejecting it here keeps junk out of the database lookup.
+  return /^[A-Za-z0-9_-]{6,64}$/.test(m[1]) ? m[1] : null;
+}
+
+function langPickerKeyboard(prefix: string, exclude?: string) {
+  const codes = Object.keys(LANGUAGES).filter((c) => c !== exclude);
+  const rows: any[] = [];
+  for (let i = 0; i < codes.length; i += 2) {
+    rows.push(codes.slice(i, i + 2).map((c) => ({
+      text: `${langMeta(c).flag} ${langMeta(c).nativeName}`,
+      callback_data: `${prefix}|${c}`,
+    })));
+  }
+  return { inline_keyboard: rows };
+}
+
+// Shared entry for "/start <code>": validates the code and asks the first question.
+// Which question depends on whether this is the first or second seat.
+async function beginOnboarding(msg: any, code: string): Promise<void> {
+  const { data, error } = await dbAdmin.rpc("claim_tenant_seat", { p_pairing_code: code });
+  if (error) {
+    console.error("claim_tenant_seat failed:", error);
+    await sendMessage(msg.chat.id, "Something went wrong checking that link. Please try again in a moment.");
+    return;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  const outcome: string = row?.outcome ?? "unknown_code";
+  if (outcome !== "ok") {
+    await sendMessage(msg.chat.id, onboardingRefusal(outcome));
+    return;
+  }
+
+  if ((row.seats_taken ?? 0) === 0) {
+    // First seat: the person who paid. They choose the language pair for the couple.
+    await sendMessage(msg.chat.id,
+      `Welcome to Capybara! Let's set up your account — two quick questions.\n\n` +
+      `First: which language do you speak natively?`,
+      undefined, langPickerKeyboard(`ob|l|${code}`));
+    return;
+  }
+
+  // Second seat: the partner. The pair is already fixed by the first person's choice, so
+  // asking again could only produce a contradiction. Confirm it and ask the one thing
+  // that is genuinely theirs.
+  const partnerLangs = await tenantLanguagePair(row.tenant_id);
+  if (!partnerLangs) {
+    await sendMessage(msg.chat.id, "Your partner hasn't finished setting up yet. Ask them to complete their setup, then open this link again.");
+    return;
+  }
+  await sendMessage(msg.chat.id,
+    `Welcome to Capybara! Your partner has set this up for ${langLabel(partnerLangs.native)} ↔ ${langLabel(partnerLangs.learning)}.\n\n` +
+    `You'll be writing in ${langLabel(partnerLangs.learning)}. How should I refer to you?`,
+    undefined,
+    { inline_keyboard: [ONBOARD_GENDERS.map((g) => ({ text: g.label, callback_data: `ob|p|${code}|${g.code}` }))] });
+}
+
+function onboardingRefusal(outcome: string): string {
+  switch (outcome) {
+    case "expired_code":
+      return "That setup link has expired. Open the billing portal from your receipt email, or contact support and we'll issue a new one.";
+    case "full":
+      return "Both seats on that subscription are already taken. If you think that's wrong, contact support.";
+    case "inactive_subscription":
+      return "That subscription isn't active. If you've just paid, give it a minute and try again; otherwise check your billing details.";
+    default:
+      return "I don't recognise that setup link. Check you've opened the most recent one from your receipt.";
+  }
+}
+
+// The couple's pair, read off whoever is already registered. Returns it from the
+// perspective of the SECOND person: their native language is the first person's learning
+// language, and vice versa.
+async function tenantLanguagePair(tenantId: string): Promise<{ native: string; learning: string } | null> {
+  const { data } = await dbAdmin.from("users")
+    .select("native_language, learning_language").eq("tenant_id", tenantId).limit(1).maybeSingle();
+  if (!data) return null;
+  return { native: data.learning_language, learning: data.native_language };
+}
+
+// Handles every "ob|..." callback. Shape:
+//   ob|l|<code>            -> native language chosen, ask learning language
+//   ob|g|<code>|<nat>      -> learning language chosen, ask gender
+//   ob|d|<code>|<nat>|<lrn>-> gender chosen, create the first user
+//   ob|p|<code>            -> partner's gender chosen, create the second user
+async function handleOnboardingCallback(cq: any): Promise<void> {
+  const parts = (cq.data ?? "").split("|");
+  const step = parts[1];
+  const code = parts[2];
+  const chatId = cq.message?.chat?.id;
+  if (!code || !chatId) { await answerCallbackQuery(cq.id); return; }
+
+  // Re-validated on EVERY step, never taken from the callback payload -- see the note at
+  // the top of this section. A stale keyboard (code since consumed or expired) also lands
+  // here, and gets a real explanation rather than a silent no-op.
+  const { data, error } = await dbAdmin.rpc("claim_tenant_seat", { p_pairing_code: code });
+  if (error) {
+    console.error("claim_tenant_seat failed mid-wizard:", error);
+    await answerCallbackQuery(cq.id, "Something went wrong.");
+    return;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  if (row?.outcome !== "ok") {
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId, onboardingRefusal(row?.outcome ?? "unknown_code"));
+    return;
+  }
+  const tenantId: string = row.tenant_id;
+
+  switch (step) {
+    case "l": {
+      const native = parts[3];
+      if (!LANGUAGES[native]) { await answerCallbackQuery(cq.id); return; }
+      await answerCallbackQuery(cq.id);
+      await editMessageReplyMarkup(chatId, cq.message.message_id);
+      await sendMessage(chatId,
+        `${langLabel(native)} it is. And which language are you learning — the one your partner speaks?`,
+        undefined, langPickerKeyboard(`ob|g|${code}|${native}`, native));
+      return;
+    }
+    case "g": {
+      const [native, learning] = [parts[3], parts[4]];
+      if (!LANGUAGES[native] || !LANGUAGES[learning] || native === learning) { await answerCallbackQuery(cq.id); return; }
+      await answerCallbackQuery(cq.id);
+      await editMessageReplyMarkup(chatId, cq.message.message_id);
+      await sendMessage(chatId,
+        `Last one. How should I refer to you? This isn't cosmetic — ${langLabel(learning)} and several other ` +
+        `languages change verb and adjective endings depending on who's speaking, so translations come out wrong without it.`,
+        undefined,
+        { inline_keyboard: [ONBOARD_GENDERS.map((gg) => ({ text: gg.label, callback_data: `ob|d|${code}|${native}|${learning}|${gg.code}` }))] });
+      return;
+    }
+    case "d": {
+      const [native, learning, gender] = [parts[3], parts[4], parts[5]];
+      if (!LANGUAGES[native] || !LANGUAGES[learning]) { await answerCallbackQuery(cq.id); return; }
+      await answerCallbackQuery(cq.id);
+      await editMessageReplyMarkup(chatId, cq.message.message_id);
+      await finishOnboarding(cq, tenantId, code, native, learning, gender, /* isOwner */ true);
+      return;
+    }
+    case "p": {
+      const gender = parts[3];
+      const pair = await tenantLanguagePair(tenantId);
+      if (!pair) { await answerCallbackQuery(cq.id, "Your partner hasn't finished setting up."); return; }
+      await answerCallbackQuery(cq.id);
+      await editMessageReplyMarkup(chatId, cq.message.message_id);
+      await finishOnboarding(cq, tenantId, code, pair.native, pair.learning, gender, /* isOwner */ false);
+      return;
+    }
+    default:
+      await answerCallbackQuery(cq.id);
+  }
+}
+
+async function finishOnboarding(
+  cq: any, tenantId: string, code: string,
+  native: string, learning: string, gender: string, isOwner: boolean,
+): Promise<void> {
+  const chatId = cq.message.chat.id;
+  const tgUser = cq.from;
+  const displayName = (tgUser?.first_name ?? "").trim() || "Partner";
+
+  const { data: created, error } = await dbAdmin.from("users").insert({
+    tenant_id: tenantId,
+    telegram_id: tgUser.id,
+    display_name: displayName,
+    native_language: native,
+    learning_language: learning,
+    gender: ONBOARD_GENDERS.some((g) => g.code === gender) ? gender : null,
+  }).select("id").single();
+
+  if (error) {
+    // users.telegram_id is globally unique, so the realistic failure is one Telegram
+    // account trying to join a second couple. Say so plainly -- it is a real situation
+    // (someone re-subscribing) and "something went wrong" would send them to support for
+    // no reason.
+    console.error("onboarding user insert failed:", error);
+    await sendMessage(chatId,
+      "This Telegram account is already linked to a Capybara subscription. " +
+      "Use a different account for this one, or contact support to move it.");
+    return;
+  }
+
+  if (isOwner) {
+    // Record the payer. Only they may manage the subscription.
+    const { error: ownErr } = await dbAdmin.from("tenants")
+      .update({ owner_user_id: created.id }).eq("id", tenantId);
+    if (ownErr) console.error("owner_user_id update failed:", ownErr);
+
+    const invite = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+    await sendMessage(chatId,
+      `You're all set, ${displayName}! I'll translate between ${langLabel(native)} and ${langLabel(learning)}.\n\n` +
+      `*Now invite your partner* — this link sets them up in one tap:\n` +
+      (invite ? `${invite}\n\n` : `send them your setup code: \`${code}\`\n\n`) +
+      `Until they join, you can still use me solo: write in either language and I'll translate, ` +
+      `and everything you send builds your study deck.\n\nType /help to see everything.`,
+      "Markdown");
+    return;
+  }
+
+  // Second seat filled: retire the code so a forwarded link is inert from here on.
+  const { error: clearErr } = await dbAdmin.from("tenants")
+    .update({ pairing_code: null, pairing_code_expires_at: null }).eq("id", tenantId);
+  if (clearErr) console.error("pairing_code clear failed:", clearErr);
+
+  await sendMessage(chatId,
+    `You're all set, ${displayName}! Write in ${langLabel(native)} or ${langLabel(learning)} and I'll ` +
+    `translate for both of you.\n\nType /help to see everything.`);
+
+  // Tell the first person their partner arrived -- they have been waiting on it, and it
+  // is the only signal that the couple is now fully set up.
+  const { data: others } = await dbAdmin.from("users")
+    .select("telegram_id, display_name").eq("tenant_id", tenantId).neq("id", created.id);
+  for (const o of others ?? []) {
+    await sendMessage(o.telegram_id, `${displayName} just joined. You're both set up — send a message and I'll translate it.`);
+  }
+}
+
+// ---------------------------------------------------------------------------- /billing
+//
+// Stripe's hosted customer portal does the actual work -- card updates, plan changes,
+// invoices, cancellation -- so none of that has to be rebuilt in a chat window, and no
+// payment details ever touch this code.
+//
+// Portal links are short-lived and single-customer, so one is minted per request rather
+// than stored. Anyone with the link can manage the subscription, which is why it is only
+// ever sent to the OWNER: the partner is a member of the couple, not the account holder,
+// and giving them a cancel button for someone else's card would be a support incident
+// waiting to happen.
+async function handleBilling(msg: any, user: any): Promise<void> {
+  const { data: tenant, error } = await dbAdmin.from("tenants")
+    .select("stripe_customer_id, owner_user_id, plan, status, message_quota, messages_used, current_period_end")
+    .eq("id", user.tenant_id).maybeSingle();
+  if (error || !tenant) {
+    console.error("billing: tenant read failed:", error);
+    await sendMessage(msg.chat.id, "I couldn't load your subscription just now. Try again shortly.");
+    return;
+  }
+
+  const used = tenant.messages_used ?? 0;
+  const quota = tenant.message_quota;
+  const renews = tenant.current_period_end
+    ? new Date(tenant.current_period_end).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })
+    : "—";
+  const summary =
+    `*Your Capybara subscription*\n` +
+    `Plan: ${tenant.plan}\n` +
+    `Status: ${tenant.status}\n` +
+    `Used this period: ${used}${quota ? ` of ${quota}` : " (unlimited)"}\n` +
+    `Renews: ${renews}`;
+
+  if (tenant.owner_user_id && tenant.owner_user_id !== user.id) {
+    await sendMessage(msg.chat.id,
+      `${summary}\n\nBilling is managed by whoever set up the subscription — ask them to run /billing.`,
+      "Markdown");
+    return;
+  }
+  if (!STRIPE_SECRET_KEY || !tenant.stripe_customer_id) {
+    await sendMessage(msg.chat.id, `${summary}\n\nSelf-service billing isn't configured on this instance yet.`, "Markdown");
+    return;
+  }
+
+  const portalUrl = await createBillingPortalSession(tenant.stripe_customer_id);
+  if (!portalUrl) {
+    await sendMessage(msg.chat.id, `${summary}\n\nI couldn't open the billing portal just now. Try again shortly.`, "Markdown");
+    return;
+  }
+  await sendMessage(msg.chat.id,
+    `${summary}\n\nManage your card, plan or cancellation here — the link is private and expires shortly.`,
+    "Markdown",
+    { inline_keyboard: [[{ text: "Manage subscription", url: portalUrl }]] });
+}
+
+async function createBillingPortalSession(customerId: string): Promise<string | null> {
+  try {
+    const resp = await fetch("https://api.stripe.com/v1/billing_portal/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+        "Stripe-Version": "2024-06-20",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ customer: customerId }).toString(),
+    });
+    if (!resp.ok) {
+      console.error(`billing portal session failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`);
+      return null;
+    }
+    return (await resp.json())?.url ?? null;
+  } catch (e) {
+    console.error("billing portal session threw:", e);
+    return null;
+  }
 }
 
 async function lookupUser(tgUser: any) {
@@ -1356,6 +1786,10 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "pin", description: "Pin a message to memory" },
   { command: "unpin", description: "Unpin a message" },
   { command: "pinned", description: "List pinned messages" },
+  // Last in the list but the one a customer needs findable without asking: a lapsed card
+  // or an exhausted allowance both dead-end here, so it must not be a command you have to
+  // already know about.
+  { command: "billing", description: "Subscription, usage and payment details" },
 ];
 // Only the two commands an admin uses on a live instance appear in the menu. The
 // one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
@@ -2959,6 +3393,12 @@ async function handleUpdateCommand(msg: any, user: any) {
 }
 
 async function handleCallbackQuery(cq: any) {
+  // Onboarding taps come from people who are not yet in the users table and are
+  // certainly not the operator, so they are routed before the superadmin gate below.
+  // Their authorisation is the pairing code, which handleOnboardingCallback revalidates
+  // against the database on every step rather than trusting the callback payload.
+  if ((cq.data ?? "").startsWith("ob|")) { await handleOnboardingCallback(cq); return; }
+
   // Auth by Telegram sender id, independent of the users table. The button is only
   // ever shown in the admin's own chat, but we re-check here for defense in depth.
   if (!isSuperadmin(cq.from?.id)) {

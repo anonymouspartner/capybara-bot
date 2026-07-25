@@ -1,0 +1,186 @@
+# Launching the paid service — runbook
+
+Everything in the repo is built. This is the wiring that has to happen outside it, in
+order. Nothing here is automatable: BotFather is interactive-only, and Stripe keys and
+webhook secrets are created by hand.
+
+Target project: the **commercial** Supabase project (not the personal one). Its schema is
+already applied — `supabase/migrations/` followed by `supabase/migrations-saas/`.
+
+---
+
+## What the customer experiences
+
+```
+Payment Link  →  Stripe Checkout  →  success_url hits stripe-billing
+                                          │  verifies the session, creates the tenant
+                                          ▼
+                                     302 → t.me/<bot>?start=<code>
+                                          │  Telegram sends "/start <code>"
+                                          ▼
+                                   2 taps: languages, then he/she
+                                          │
+                                          ▼
+                                   invite link for their partner
+                                          │  partner taps, picks he/she
+                                          ▼
+                                     both set up, code retired
+```
+
+No website, no email, no manual step from you. The only thing you hand out is the Payment
+Link.
+
+---
+
+## Step 1 — Create the bot *(Telegram / @BotFather)*
+
+One bot serves **every** tenant, unlike the single-tenant product where each couple gets
+their own.
+
+1. `/newbot` → display name + a username ending in `bot`. Save the token.
+2. `/setprivacy` → **Disable**. The bot must see all messages in a group; with privacy on
+   it only sees commands and replies.
+3. Note the **username without the @** — it becomes `TELEGRAM_BOT_USERNAME`, and the
+   partner invite link is built from it.
+
+> Use a *different* bot from your personal Capybara. Same token in two places means both
+> projects receive every update.
+
+## Step 2 — Stripe products and prices *(Stripe dashboard, test mode first)*
+
+1. Create one product, **two recurring monthly prices** — standard and heavy. Copy both
+   price ids (`price_…`).
+2. Decide the quotas. For calibration: your own traffic is ~1,650 messages/month, which
+   costs about **$25/month** in Anthropic + OpenAI spend. Annotation is ~85% of that. Set
+   the price above the quota's worst-case API cost, not above the average.
+3. **Create a Payment Link** for each price. Under *After payment* → **Redirect to a page
+   you specify**, set:
+
+   ```
+   https://<commercial-ref>.supabase.co/functions/v1/stripe-billing?session_id={CHECKOUT_SESSION_ID}
+   ```
+
+   `{CHECKOUT_SESSION_ID}` is substituted by Stripe. That URL is the whole onboarding
+   handoff — get it wrong and paying customers land nowhere.
+
+4. **Enable the customer portal** (*Settings → Billing → Customer portal*), allowing plan
+   switching and cancellation. `/billing` mints links into it; without it that command
+   degrades to a read-only summary.
+
+## Step 3 — Function secrets *(Supabase → commercial project → Edge Functions → Secrets)*
+
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected automatically — do not set them.
+
+| Secret | Used by | Notes |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | bot | From step 1 |
+| `TELEGRAM_BOT_USERNAME` | bot + billing | No `@`. Builds the deep links |
+| `WEBHOOK_SECRET` | bot | Any long random string; also goes in the setWebhook call |
+| `ANTHROPIC_API_KEY` | bot | |
+| `OPENAI_API_KEY` | bot | Whisper + embeddings |
+| `SUPERADMIN_TELEGRAM_ID` | bot | **You.** Gates deploys, the grinds, and diagnostics. Not a customer |
+| `STRIPE_SECRET_KEY` | billing + bot | `sk_test_…` first |
+| `STRIPE_WEBHOOK_SECRET` | billing | `whsec_…`, from step 5 |
+| `STRIPE_PRICE_STANDARD` | billing | `price_…` |
+| `STRIPE_PRICE_HEAVY` | billing | `price_…` |
+| `QUOTA_STANDARD` | billing | Messages/period. Defaults to 3000 |
+| `QUOTA_HEAVY` | billing | Defaults to 10000 |
+
+Optional (`/update` self-deploy, inert if unset): `GITHUB_DEPLOY_TOKEN`, `GITHUB_REPO`,
+`GITHUB_DEPLOY_BRANCH`.
+
+## Step 4 — Deploy both functions
+
+Actions → **deploy** → Run workflow, type `deploy`, and **set `project_ref` to the
+commercial ref every time**. Run it twice:
+
+- `function_name: telegram-bot-saas`
+- `function_name: stripe-billing`
+
+The gate, the CLI-from-disk deploy and the health smoke test all run per function. The
+billing smoke test fails unless the Stripe secrets, the bot username and both price ids
+are set — so a half-configured deploy is caught rather than discovered by a customer.
+
+> Never dispatch with `project_ref` pointing at the personal project. That would put a
+> schema expecting `tenant_id` on top of the live personal database.
+
+## Step 5 — Register the Stripe webhook *(Stripe dashboard)*
+
+Endpoint URL:
+
+```
+https://<commercial-ref>.supabase.co/functions/v1/stripe-billing
+```
+
+Events: `checkout.session.completed`, `customer.subscription.created`,
+`customer.subscription.updated`, `customer.subscription.deleted`.
+
+Copy the signing secret into `STRIPE_WEBHOOK_SECRET`, then **redeploy `stripe-billing`**
+so it picks the secret up.
+
+## Step 6 — Point the Telegram webhook at the bot
+
+```bash
+curl -sS "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+  -d "url=https://<commercial-ref>.supabase.co/functions/v1/telegram-bot-saas" \
+  -d "secret_token=<WEBHOOK_SECRET>"
+```
+
+## Step 7 — End-to-end test, in test mode
+
+1. Pay through the Payment Link with card `4242 4242 4242 4242`.
+2. You should be redirected into Telegram with the code pre-filled. Complete the two taps.
+3. Send a message — it should translate.
+4. Open the invite link from a **second Telegram account**, complete the one tap, and
+   confirm both accounts now see each other's messages.
+5. `/billing` → confirm plan, usage, and that the portal link opens.
+6. Cancel in the portal → confirm the bot stops translating and points at `/billing`.
+
+Then check isolation directly, because it is the one failure that is invisible from
+inside a single account:
+
+```sql
+-- Every tenant-owned table should show one row per tenant, never a shared row.
+select tenant_id, count(*) from public.messages group by 1;
+-- Expect zero: a row belonging to nobody.
+select count(*) from public.messages m
+  left join public.tenants t on t.id = m.tenant_id where t.id is null;
+```
+
+## Step 8 — Go live
+
+Swap Stripe to live mode: new `sk_live_…`, new price ids, a new webhook endpoint and
+signing secret, new Payment Links. Update the secrets, redeploy `stripe-billing`, and run
+step 7 once with a real card.
+
+---
+
+## Operating notes
+
+**Quota is counted per inbound message**, not per API call, and consumed before any model
+call. One message is one translation plus two annotation passes, so a tenant at the cap
+has cost you roughly `quota × $0.015`.
+
+**Comping an account:** set `message_quota = NULL` on the tenant. NULL means uncapped;
+`status` still has to be `active`.
+
+**Refunds and disputes** flow through the subscription events, so a refunded customer
+loses access on the next message without you doing anything.
+
+**A customer changing plan mid-period** keeps their usage count — the quota changes, the
+counter does not reset. The reset happens on the first message after
+`current_period_end`, which stays aligned with what Stripe bills.
+
+## Known gaps
+
+- **No dunning.** A failed payment flips `status` and the bot stops, but nobody emails
+  them. Stripe's own retry emails cover most of this; a "your subscription lapsed"
+  Telegram message on `invoice.payment_failed` would be better.
+- **No self-serve deletion.** `ON DELETE CASCADE` from `tenants` means removing the row
+  removes the couple's data, but nothing in the product exposes it.
+- **Voice files are not deleted with a tenant.** They are tenant-prefixed in Storage, so
+  the cleanup is a recursive remove under `<tenant_id>/`, but it is manual.
+- **`delete_expired_pii` runs instance-wide on a 30-day cron**, inherited from the
+  single-tenant schema. On a paid product a customer losing history after 30 days is
+  probably not what you want — decide whether to keep it, lengthen it, or make it
+  per-tenant before launch.

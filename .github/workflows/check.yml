@@ -31,6 +31,12 @@ jobs:
       - name: Pre-deploy sanity gate (telegram-bot-saas)
         run: bash ./predeploy-check.sh telegram-bot-saas
 
+      # The Stripe webhook is a third deployable. Its gate asserts that signature
+      # verification and the replay window are still present -- a billing endpoint that
+      # loses either one accepts forged subscription events.
+      - name: Pre-deploy sanity gate (stripe-billing)
+        run: bash ./predeploy-check.sh stripe-billing
+
       # Type-check the setup wizard too, so a broken setup.ts is caught here.
       - name: Type-check the setup wizard
         run: deno check setup.ts

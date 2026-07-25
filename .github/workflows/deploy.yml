@@ -23,13 +23,14 @@ on:
         required: false
         default: ""
       function_name:
-        description: 'Which edge function to deploy: telegram-bot (the single-tenant bot) or telegram-bot-saas (the multi-tenant service).'
+        description: 'Which edge function to deploy: telegram-bot (the single-tenant bot), telegram-bot-saas (the multi-tenant service), or stripe-billing (the multi-tenant service Stripe webhook + claim route).'
         required: false
         default: "telegram-bot"
         type: choice
         options:
           - telegram-bot
           - telegram-bot-saas
+          - stripe-billing
 
 jobs:
   deploy:
@@ -50,9 +51,9 @@ jobs:
           set -euo pipefail
           fn="${INPUT_FUNCTION:-telegram-bot}"
           # Allowlist: the deploy step interpolates this into a CLI call, and only these
-          # two functions exist in the repo.
+          # three functions exist in the repo.
           case "$fn" in
-            telegram-bot|telegram-bot-saas) : ;;
+            telegram-bot|telegram-bot-saas|stripe-billing) : ;;
             *) echo "FAIL: unknown function '$fn'"; exit 1 ;;
           esac
           echo "FUNCTION_NAME=$fn" >> "$GITHUB_ENV"
@@ -120,5 +121,25 @@ jobs:
           body=$(curl -fsS "https://${ref}.supabase.co/functions/v1/${FUNCTION_NAME}?health")
           echo "health: $body"
           echo "$body" | grep -q "\"version\":\"${ver}\"" || { echo "FAIL: live version != ${ver}"; exit 1; }
-          echo "$body" | grep -q '"adminConfigured":true'  || { echo "FAIL: adminConfigured not true"; exit 1; }
-          echo "Smoke test passed: version ${ver}, adminConfigured true."
+          # Beyond the version, assert the secrets that decide whether this build can do
+          # its job at all. A function that boots but is missing them looks healthy and
+          # silently fails on first real use, which is exactly what a smoke test is for.
+          # The flags differ per function, so the assertion does too.
+          case "$FUNCTION_NAME" in
+            telegram-bot|telegram-bot-saas)
+              echo "$body" | grep -q '"adminConfigured":true' \
+                || { echo "FAIL: adminConfigured not true"; exit 1; }
+              echo "Smoke test passed: version ${ver}, adminConfigured true."
+              ;;
+            stripe-billing)
+              # Without these the claim route cannot verify a payment and the webhook
+              # cannot authenticate Stripe -- so a customer who has paid gets nothing.
+              echo "$body" | grep -q '"stripeConfigured":true' \
+                || { echo "FAIL: stripeConfigured not true (STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET)"; exit 1; }
+              echo "$body" | grep -q '"botUsernameConfigured":true' \
+                || { echo "FAIL: botUsernameConfigured not true (TELEGRAM_BOT_USERNAME)"; exit 1; }
+              echo "$body" | grep -q '"pricesConfigured":true' \
+                || { echo "FAIL: pricesConfigured not true (STRIPE_PRICE_STANDARD / STRIPE_PRICE_HEAVY)"; exit 1; }
+              echo "Smoke test passed: version ${ver}, Stripe fully configured."
+              ;;
+          esac

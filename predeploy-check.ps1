@@ -17,31 +17,44 @@ param(
     # Which edge function to gate. Defaults to the original single-tenant bot; pass
     # "telegram-bot-saas" to gate the multi-tenant fork. Mirrors predeploy-check.sh's
     # first positional argument.
-    [ValidateSet("telegram-bot", "telegram-bot-saas")]
+    [ValidateSet("telegram-bot", "telegram-bot-saas", "stripe-billing")]
     [string]$FunctionName = "telegram-bot"
 )
 
 $ErrorActionPreference = "Stop"
 
 $IndexPath = Join-Path $PSScriptRoot "supabase/functions/$FunctionName/index.ts"
-$MinLines  = 1500
 
-# Anchors both products must have: if these are gone, the file is not a Capybara bot.
-$Anchors   = @(
-    "Deno.serve",
-    "handleUpdate",
-    "ADMIN_TELEGRAM_ID",
-    "handleRecap",
-    "handleReconcile",
-    "handlePinned"
-)
-
-# Per-build anchors. The multi-tenant gate additionally proves the tenant-scoping layer
-# is present, which is the one thing that must never be missing from a build shipped to
-# the shared project. Without it every query reads across all tenants -- and that build
-# would otherwise pass this gate, since it is a perfectly valid single-tenant bot.
-if ($FunctionName -eq "telegram-bot-saas") {
-    $Anchors += @("tenantDb", "dbAdmin", "tenant_id")
+# The floor and the anchors are per-function: they exist to prove a specific file is
+# still itself, so a single shared set would either be too weak for the bots or reject
+# the billing function for being the size it is meant to be.
+# Keep in step with predeploy-check.sh.
+switch ($FunctionName) {
+    "telegram-bot" {
+        $MinLines = 1500
+        $Anchors  = @("Deno.serve", "handleUpdate", "ADMIN_TELEGRAM_ID",
+                      "handleRecap", "handleReconcile", "handlePinned")
+    }
+    "telegram-bot-saas" {
+        $MinLines = 1500
+        $Anchors  = @("Deno.serve", "handleUpdate", "ADMIN_TELEGRAM_ID",
+                      "handleRecap", "handleReconcile", "handlePinned",
+                      # The tenant-scoping layer -- the one thing that must never be
+                      # missing from a build shipped to the shared project. Without it
+                      # every query reads across all tenants, and such a build would
+                      # otherwise pass every other check here.
+                      "tenantDb", "dbAdmin", "tenant_id",
+                      # The paid surface. A build missing these serves everyone free.
+                      "consume_message_quota", "claim_tenant_seat")
+    }
+    "stripe-billing" {
+        $MinLines = 120
+        $Anchors  = @("Deno.serve",
+                      # Signature verification and its replay window. A billing webhook
+                      # that has lost either one accepts forged events.
+                      "verifyStripeSignature", "timingSafeEqual", "stripe-signature",
+                      "provisionFromCheckoutSession", "pairing_code")
+    }
 }
 
 $failures = @()

@@ -25,6 +25,8 @@ couple (not multi-tenant).
 |---|---|
 | `supabase/functions/telegram-bot/index.ts` | The single-tenant bot — one canonical file per product. |
 | `supabase/functions/telegram-bot-saas/index.ts` | The multi-tenant paid service (Stripe, quotas, onboarding). Its own Supabase project. |
+| `supabase/functions/stripe-billing/index.ts` | Commercial project only: Stripe webhook + the Checkout claim route that provisions a tenant and deep-links into Telegram. |
+| `LAUNCH_SAAS.md` | Runbook for wiring up the paid service (BotFather, Stripe, secrets, deploy order). |
 | `setup.ts` | Guided cross-platform setup wizard (`deno run -A setup.ts`). |
 | `supabase/migrations/` | Base DB migrations, applied to **both** projects; the init migration builds the database from zero. |
 | `supabase/migrations-saas/` | Multi-tenant migrations, applied to the **commercial project only**. Never run these against the personal project. |
@@ -47,6 +49,10 @@ couple (not multi-tenant).
   moment.
 - **Do not touch Supabase** (no migrations, SQL, function deploys, dashboard changes) without an
   explicit, in-the-moment request.
+- **The commercial product is three deployables, not one.** `telegram-bot-saas` and
+  `stripe-billing` ship to the *same* project and depend on each other: the billing function
+  provisions tenants the bot then serves. Deploy both after any change that touches the tenant
+  or billing schema, and never point either at the personal project.
 - **Two products, two files. Within a product, never fork.**
   - `supabase/functions/telegram-bot/index.ts` — the original **single-tenant** bot. One
     file deploys to every couple's own project unchanged. Edit it in place.
