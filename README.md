@@ -92,6 +92,11 @@ them in a single turn.
   The note is never forwarded to the other person, and your message still translates and
   relays exactly as normal. Each person toggles their own (`/capybara`, `/capybara on|off`);
   it's off by default. Text messages for now.
+- **Your mistakes become flashcards.** Every correction is stored and exported by
+  `/export` as a third **`Capybara::Grammar`** deck: the front is the sentence you
+  actually wrote, the back is the corrected version plus the explanation. Because Anki
+  matches on the first field, repeating a mistake updates that card instead of
+  duplicating it — so the deck tracks the errors you keep making.
 
 **3. Private shared memory.**
 - `/ask <question>` answers questions about your shared history using hybrid
@@ -180,6 +185,7 @@ connects as the service role.
 | `vocabulary` | Deduplicated lemmas with gloss, part of speech, cross-language translation, occurrence count. |
 | `flashcards` | A user's chosen study cards (vocabulary + example message). |
 | `notes` | `/remember` notes (private to their author). |
+| `grammar_corrections` | Mistakes the `/capybara` assistant caught, with the fix and explanation (added by a later migration). |
 | `message_pins` | Pinned (meaningful) messages. |
 | `message_reconciles` | Messages excluded from `/recap`. |
 | `recap_embeddings` | Vector + text content for messages and notes, powering `/recap`. |
@@ -424,7 +430,7 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 | `/vocab` | Top still-unlearned words in each deck |
 | `/learn <word>` · `/learn top N [uk\|en]` | Add a word (or the top N) to a deck |
 | `/forget <word>` | Remove a word from the matching deck |
-| `/export` | Export both decks as a single Anki CSV |
+| `/export` | Export vocabulary decks **and your grammar corrections** as a single Anki CSV |
 | `/capybara` · `/capybara on\|off` | Toggle a private grammar coach for your learning language (per person, off by default) |
 | `/help` · `/start` | Help / welcome |
 
