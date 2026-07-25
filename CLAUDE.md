@@ -23,7 +23,8 @@ couple (not multi-tenant).
 
 | Path | What it is |
 |---|---|
-| `supabase/functions/telegram-bot/index.ts` | The entire bot — one canonical file. **Never fork it.** |
+| `supabase/functions/telegram-bot/index.ts` | The single-tenant bot — one canonical file per product. |
+| `supabase/functions/telegram-bot-saas/index.ts` | The multi-tenant paid service (Stripe, quotas, onboarding). Its own Supabase project. |
 | `setup.ts` | Guided cross-platform setup wizard (`deno run -A setup.ts`). |
 | `supabase/migrations/` | Versioned DB migrations; the init migration builds the database from zero. |
 | `seed_couple.sql` | Seeds the two users + default conversation. |
@@ -45,7 +46,16 @@ couple (not multi-tenant).
   moment.
 - **Do not touch Supabase** (no migrations, SQL, function deploys, dashboard changes) without an
   explicit, in-the-moment request.
-- **Never fork `index.ts`.** One file deploys to every instance unchanged. Edit it in place.
+- **Two products, two files. Within a product, never fork.**
+  - `supabase/functions/telegram-bot/index.ts` — the original **single-tenant** bot. One
+    file deploys to every couple's own project unchanged. Edit it in place.
+  - `supabase/functions/telegram-bot-saas/index.ts` — the **multi-tenant** paid service:
+    one shared bot and database serving many subscribing couples, with Stripe billing,
+    usage quotas, and in-chat onboarding. Runs on its own Supabase project.
+  - The fork was deliberate: these are different products, not different instances. The
+    cost is that ~90% of the code is shared core (translation, annotation, `/recap`, the
+    language registry), so **a fix to one is not a fix to the other** — port it, and say
+    in the commit which file you ported from.
 - **No secrets in code or git.** All credentials are read via `Deno.env.get(...)` and set as
   function secrets. `.env` is gitignored. Never hardcode a token/key, never commit one.
 
@@ -59,7 +69,11 @@ couple (not multi-tenant).
    (side-effect-free; no DB/API/messaging).
 5. **`git tag vNN`** after a good deploy as the rollback point; redeploy a prior tag to roll back.
 
-**Primary (default): GitHub Actions.** Actions → **deploy** → **Run workflow**, type `deploy` to confirm.
+**Primary (default): GitHub Actions.** Actions → **deploy** → **Run workflow**, type `deploy` to confirm,
+and pick which function to ship — `telegram-bot` (single-tenant) or `telegram-bot-saas` (paid service).
+Each targets its own Supabase project via the `project_ref` input, so confirm BOTH before dispatching:
+shipping the multi-tenant build to the personal project (or vice versa) would point the wrong schema at
+live data.
 Runs the same gate → CLI-from-disk deploy → health smoke, no local machine needed. Requires repo secrets
 `SUPABASE_ACCESS_TOKEN` and `SUPABASE_PROJECT_REF` (see README "Deploying").
 

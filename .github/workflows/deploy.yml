@@ -22,6 +22,14 @@ on:
         description: 'Target Supabase project ref (optional; defaults to the SUPABASE_PROJECT_REF repo secret). Lets one bot per couple self-deploy to its own project.'
         required: false
         default: ""
+      function_name:
+        description: 'Which edge function to deploy: telegram-bot (the single-tenant bot) or telegram-bot-saas (the multi-tenant service).'
+        required: false
+        default: "telegram-bot"
+        type: choice
+        options:
+          - telegram-bot
+          - telegram-bot-saas
 
 jobs:
   deploy:
@@ -35,8 +43,23 @@ jobs:
         with:
           deno-version: v2.x
 
+      - name: Resolve target function
+        env:
+          INPUT_FUNCTION: ${{ github.event.inputs.function_name }}
+        run: |
+          set -euo pipefail
+          fn="${INPUT_FUNCTION:-telegram-bot}"
+          # Allowlist: the deploy step interpolates this into a CLI call, and only these
+          # two functions exist in the repo.
+          case "$fn" in
+            telegram-bot|telegram-bot-saas) : ;;
+            *) echo "FAIL: unknown function '$fn'"; exit 1 ;;
+          esac
+          echo "FUNCTION_NAME=$fn" >> "$GITHUB_ENV"
+          echo "Deploying function: $fn"
+
       - name: Pre-deploy sanity gate
-        run: bash ./predeploy-check.sh
+        run: bash ./predeploy-check.sh "$FUNCTION_NAME"
 
       - name: Install the Supabase CLI
         uses: supabase/setup-cli@v1
@@ -70,10 +93,10 @@ jobs:
       - name: Verify BUILD_VERSION was bumped
         run: |
           set -euo pipefail
-          file_ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' supabase/functions/telegram-bot/index.ts | head -1)
+          file_ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' "supabase/functions/$FUNCTION_NAME/index.ts" | head -1)
           if [ -z "$file_ver" ]; then echo "FAIL: could not find BUILD_VERSION in index.ts"; exit 1; fi
           # Fetch live version from health endpoint (gracefully skipped on first deploy)
-          live_json=$(curl -fsS "https://${TARGET_REF}.supabase.co/functions/v1/telegram-bot?health" 2>/dev/null || echo '{}')
+          live_json=$(curl -fsS "https://${TARGET_REF}.supabase.co/functions/v1/${FUNCTION_NAME}?health" 2>/dev/null || echo '{}')
           live_ver=$(echo "$live_json" | grep -o '"version":"[^"]*"' | head -1 | sed 's/"version":"//;s/"//')
           if [ -z "$live_ver" ]; then
             echo "Health endpoint unreachable (first deploy?). Skipping version bump check."
@@ -87,14 +110,14 @@ jobs:
       - name: Deploy the function (committed file only)
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-        run: supabase functions deploy telegram-bot --project-ref "$TARGET_REF" --no-verify-jwt
+        run: supabase functions deploy "$FUNCTION_NAME" --project-ref "$TARGET_REF" --no-verify-jwt
 
       - name: Smoke-test the health route
         run: |
           set -euo pipefail
           ref="$TARGET_REF"
-          ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' supabase/functions/telegram-bot/index.ts | head -1)
-          body=$(curl -fsS "https://${ref}.supabase.co/functions/v1/telegram-bot?health")
+          ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' "supabase/functions/$FUNCTION_NAME/index.ts" | head -1)
+          body=$(curl -fsS "https://${ref}.supabase.co/functions/v1/${FUNCTION_NAME}?health")
           echo "health: $body"
           echo "$body" | grep -q "\"version\":\"${ver}\"" || { echo "FAIL: live version != ${ver}"; exit 1; }
           echo "$body" | grep -q '"adminConfigured":true'  || { echo "FAIL: adminConfigured not true"; exit 1; }

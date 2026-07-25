@@ -18,7 +18,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INDEX_PATH="$SCRIPT_DIR/supabase/functions/telegram-bot/index.ts"
+# Which edge function to gate. Defaults to the original single-tenant bot; the
+# multi-tenant fork is gated by passing "telegram-bot-saas" (as an argument or via
+# FUNCTION_NAME). Both builds share this gate so neither can be deployed as a stub.
+FUNCTION_NAME="${1:-${FUNCTION_NAME:-telegram-bot}}"
+INDEX_PATH="$SCRIPT_DIR/supabase/functions/$FUNCTION_NAME/index.ts"
 MIN_LINES=1500
 ANCHORS=(
   "Deno.serve"
