@@ -93,10 +93,14 @@ them in a single turn.
   relays exactly as normal. Each person toggles their own (`/capybara`, `/capybara on|off`);
   it's off by default. Text messages for now.
 - **Your mistakes become flashcards.** Every correction is stored and exported by
-  `/export` as a third **`Capybara::Grammar`** deck: the front is the sentence you
-  actually wrote, the back is the corrected version plus the explanation. Because Anki
-  matches on the first field, repeating a mistake updates that card instead of
-  duplicating it — so the deck tracks the errors you keep making.
+  `/export` as a third **`Capybara::Grammar`** deck. Where the mistake was a single word,
+  the card is **fill-in-the-blank**: the front is the *corrected* sentence with that word
+  removed, so you recall the right form rather than re-reading your own error, and the
+  wrong form appears on the back as contrast. Where it wasn't (word order, a missing
+  word), the card falls back to showing the whole sentence and its correction. Cards are
+  tagged `capybara::grammar::<error type>` — *case*, *aspect*, *gender*, *spelling* and
+  so on — so you can build a filtered deck for whichever mistake you make most, and see
+  at a glance where your errors actually cluster.
 
 **3. Private shared memory.**
 - `/ask <question>` answers questions about your shared history using hybrid
