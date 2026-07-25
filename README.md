@@ -96,11 +96,20 @@ them in a single turn.
   `/export` as a third **`Capybara::Grammar`** deck. Where the mistake was a single word,
   the card is **fill-in-the-blank**: the front is the *corrected* sentence with that word
   removed, so you recall the right form rather than re-reading your own error, and the
-  wrong form appears on the back as contrast. Where it wasn't (word order, a missing
-  word), the card falls back to showing the whole sentence and its correction. Cards are
-  tagged `capybara::grammar::<error type>` — *case*, *aspect*, *gender*, *spelling* and
-  so on — so you can build a filtered deck for whichever mistake you make most, and see
-  at a glance where your errors actually cluster.
+  wrong form appears on the back as contrast. The blank is captioned with the word's
+  dictionary form and meaning, so the card is answerable — you're told *which* word is
+  wanted and asked to produce the right **form**, which is the skill being tested:
+
+  ```
+  Front:  Я дуже _____ тобою.  (пишатися — to be proud · agreement)
+  Back:   пишаюся    …must agree with «я»  (you wrote: пишаємося)
+  ```
+
+  Where the mistake wasn't a single word (word order, a missing word), the card falls
+  back to showing the whole sentence and its correction. Cards are tagged
+  `capybara::grammar::<error type>` — *case*, *aspect*, *gender*, *spelling* and so on —
+  so you can build a filtered deck for whichever mistake you make most, and see at a
+  glance where your errors actually cluster.
 
 **3. Private shared memory.**
 - `/ask <question>` answers questions about your shared history using hybrid
@@ -121,7 +130,7 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
                                                             +  OpenAI     (Whisper voice transcription + embeddings)
 ```
 
-- **One canonical file.** The entire bot is a single ~3,000-line
+- **One canonical file.** The entire bot is a single ~3,500-line
   `supabase/functions/telegram-bot/index.ts`. It is **instance-agnostic** — nothing about
   a specific pair is in the code; identity lives in secrets and seed data. **Never
   fork it.**
@@ -189,7 +198,7 @@ connects as the service role.
 | `vocabulary` | Deduplicated lemmas with gloss, part of speech, cross-language translation, occurrence count. |
 | `flashcards` | A user's chosen study cards (vocabulary + example message). |
 | `notes` | `/remember` notes (private to their author). |
-| `grammar_corrections` | Mistakes the `/capybara` assistant caught, with the fix and explanation (added by a later migration). |
+| `grammar_corrections` | Mistakes the `/capybara` assistant caught: the fix, the explanation, the wrong and corrected forms, that word's dictionary form and meaning, and the error category (added by later migrations). |
 | `message_pins` | Pinned (meaningful) messages. |
 | `message_reconciles` | Messages excluded from `/recap`. |
 | `recap_embeddings` | Vector + text content for messages and notes, powering `/recap`. |
@@ -463,7 +472,10 @@ an existing corpus** — new instances can ignore them.
 | `/diag` | Ping Anthropic, Whisper, and embeddings; report recent DB activity |
 | `/backfill` | Annotate one batch of un-annotated messages |
 | `/backfill_translations` | Fill in missing cross-language lemma translations, one batch |
+| `/backfill_senses` | Re-derive flashcard translations so each matches its example sentence |
+| `/backfill_grammar` | Fill in card fields (blank target, dictionary form, meaning) for older corrections |
 | `/recap_backfill` | Embed one batch of existing messages for `/recap` |
+| `/annotate_ab` | Compare annotation models on recent messages — reports quality, tokens, cost. Writes nothing |
 
 Each backfill command is **idempotent and batched** — run it repeatedly until it reports
 zero remaining.
