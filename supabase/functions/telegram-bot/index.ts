@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v77";
+const BUILD_VERSION = "v78";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1588,7 +1588,17 @@ function csvEscape(value: string | null | undefined): string {
   return s;
 }
 
+// Building the export reads the whole corpus -- every flashcard with its vocabulary and
+// example message, plus every stored correction -- and only gets slower as that corpus
+// grows. Run it in the background so it can never approach the window Telegram waits
+// before retrying an update: a retry would re-run the whole build and deliver the file
+// twice. The user gets an immediate acknowledgement instead of a silent pause.
 async function handleExport(msg: any, user: any) {
+  await sendMessage(msg.chat.id, "\u23f3 Building your export\u2026");
+  scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user));
+}
+
+async function exportRun(chatId: number, user: any) {
   const { data: cards, error } = await supabase
     .from("flashcards")
     .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
@@ -1596,7 +1606,7 @@ async function handleExport(msg: any, user: any) {
 
   if (error) {
     console.error("export query failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't build the export. Check function logs.");
+    await sendMessage(chatId, "Couldn't build the export. Check function logs.");
     return;
   }
 
@@ -1612,7 +1622,7 @@ async function handleExport(msg: any, user: any) {
   const grammarRows = corrections ?? [];
 
   if ((!cards || cards.length === 0) && grammarRows.length === 0) {
-    await sendMessage(msg.chat.id, "Nothing to export yet.\n\nUse /vocab and /learn to add words, or turn on /capybara so your corrections build a grammar deck.");
+    await sendMessage(chatId, "Nothing to export yet.\n\nUse /vocab and /learn to add words, or turn on /capybara so your corrections build a grammar deck.");
     return;
   }
 
@@ -1720,7 +1730,7 @@ async function handleExport(msg: any, user: any) {
   const grammarCount = rows.length - Object.values(deckCounts).reduce((a, b) => a + b, 0);
 
   if (rows.length === 0) {
-    await sendMessage(msg.chat.id, "Nothing has exportable rows yet (vocabulary records may be missing).");
+    await sendMessage(chatId, "Nothing has exportable rows yet (vocabulary records may be missing).");
     return;
   }
 
@@ -1764,7 +1774,7 @@ async function handleExport(msg: any, user: any) {
         ` Tagged capybara::grammar::<error type>, so you can build a filtered deck for whichever mistake you make most.`
       : "") +
     blankedNote;
-  await sendDocument(msg.chat.id, filename, csv, "text/csv", caption);
+  await sendDocument(chatId, filename, csv, "text/csv", caption);
 }
 
 async function refreshVocabularyCounts() {
