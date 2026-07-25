@@ -26,7 +26,8 @@ couple (not multi-tenant).
 | `supabase/functions/telegram-bot/index.ts` | The single-tenant bot — one canonical file per product. |
 | `supabase/functions/telegram-bot-saas/index.ts` | The multi-tenant paid service (Stripe, quotas, onboarding). Its own Supabase project. |
 | `setup.ts` | Guided cross-platform setup wizard (`deno run -A setup.ts`). |
-| `supabase/migrations/` | Versioned DB migrations; the init migration builds the database from zero. |
+| `supabase/migrations/` | Base DB migrations, applied to **both** projects; the init migration builds the database from zero. |
+| `supabase/migrations-saas/` | Multi-tenant migrations, applied to the **commercial project only**. Never run these against the personal project. |
 | `seed_couple.sql` | Seeds the two users + default conversation. |
 | `storage_setup.sql` | Creates the private `voice-messages` Storage bucket. |
 | `PROVISION_NEW_COUPLE.md` | The setup runbook — start here for a new instance. |
