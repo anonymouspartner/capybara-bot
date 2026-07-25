@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v78";
+const BUILD_VERSION = "v79";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -741,6 +741,11 @@ type GrammarVerdict =
       // Kept separate because inflection means neither can be derived from the other.
       errorFocus: string | null;
       correctionFocus: string | null;
+      // Dictionary form of the corrected word and a short gloss of it in the learner's
+      // native language. Shown together on the card front so the blank identifies which
+      // word is wanted while still leaving the inflection to be produced.
+      correctionLemma: string | null;
+      correctionGloss: string | null;
       category: string | null;
     };
 
@@ -760,7 +765,7 @@ async function checkGrammar(text: string, learnLang: LangCode, nativeLang: LangC
       system: `You are a patient ${learnName} tutor for a ${nativeName}-speaking learner. The user's message is a sentence they wrote in ${learnName} as practice. Assess ONLY its ${learnName} grammar, spelling, agreement, and word choice.\n\n` +
         `Reply with a single raw JSON object and nothing else:\n` +
         `{"correct": true}  -- if the sentence is correct and natural.\n` +
-        `{"correct": false, "corrected": "<the full corrected ${learnName} sentence>", "explanation": "<1-2 sentences in ${nativeName} explaining the single most important mistake>", "error_focus": "<the one word that was wrong, verbatim as the user wrote it>", "correction_focus": "<that same word corrected, verbatim as it appears in \\"corrected\\">", "category": "<one of: ${GRAMMAR_CATEGORIES.join(", ")}>"}\n\n` +
+        `{"correct": false, "corrected": "<the full corrected ${learnName} sentence>", "explanation": "<1-2 sentences in ${nativeName} explaining the single most important mistake>", "error_focus": "<the one word that was wrong, verbatim as the user wrote it>", "correction_focus": "<that same word corrected, verbatim as it appears in \\"corrected\\">", "correction_lemma": "<dictionary form of that corrected word>", "correction_gloss": "<what that word means, in ${nativeName}, at most 4 words>", "category": "<one of: ${GRAMMAR_CATEGORIES.join(", ")}>"}\n\n` +
         `Focus on the main error; do not list every minor nitpick. Keep "explanation" under 40 words. Preserve the user's meaning in "corrected" -- fix the ${learnName}, do not rewrite what they were trying to say.\n\n` +
         `"error_focus" and "correction_focus" must each be a SINGLE word copied character-for-character from the sentence it belongs to -- "error_focus" from the user's message, "correction_focus" from your "corrected" sentence. They are used to build a fill-in-the-blank card, so an approximate or reworded value is worse than none: use null for both if the mistake is not a single-word substitution (for example a word-order or missing-word error).\n\n` +
         `Output ONLY raw JSON. Do NOT wrap it in markdown code fences and do NOT add any preamble or commentary.\n\n` +
@@ -793,6 +798,8 @@ async function checkGrammar(text: string, learnLang: LangCode, nativeLang: LangC
     explanation: typeof parsed.explanation === "string" ? parsed.explanation.trim() : "",
     errorFocus: str(parsed.error_focus),
     correctionFocus: str(parsed.correction_focus),
+    correctionLemma: str(parsed.correction_lemma),
+    correctionGloss: str(parsed.correction_gloss),
     // Reject anything outside the fixed set so the Anki tag tree cannot fragment.
     category: category && (GRAMMAR_CATEGORIES as readonly string[]).includes(category) ? category : null,
   };
@@ -820,6 +827,8 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
     explanation: verdict.explanation || null,
     error_focus: verdict.errorFocus,
     correction_focus: verdict.correctionFocus,
+    correction_lemma: verdict.correctionLemma,
+    correction_gloss: verdict.correctionGloss,
     category: verdict.category,
   });
   if (error) console.error("grammar correction insert failed:", error);
@@ -1615,7 +1624,7 @@ async function exportRun(chatId: number, user: any) {
   // vocabulary-only export rather than losing the whole thing.
   const { data: corrections, error: corrError } = await supabase
     .from("grammar_corrections")
-    .select("original_text, corrected_text, explanation, error_focus, correction_focus, category, language")
+    .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
     .eq("user_id", user.id)
     .order("created_at", { ascending: true });
   if (corrError) console.error("export: grammar_corrections read failed:", corrError);
@@ -1700,8 +1709,17 @@ async function exportRun(chatId: number, user: any) {
     if (cloze) {
       clozeCards++;
       const wrote = g.error_focus ? ` (you wrote: ${g.error_focus})` : "";
+      // The blanked sentence alone is not answerable -- "Я дуже ____ тобою." could take
+      // any of several verbs -- so the front also names the word, via its dictionary form
+      // and meaning, leaving only the inflection to produce. This is appended to field 1
+      // because that field IS the card front; the notetype's template is not ours to
+      // change. Each part is optional and the clue is omitted entirely when none is
+      // present, so an older row still yields a usable card.
+      const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
+      const clueParts = [word, g.category].filter(Boolean);
+      const front = clueParts.length ? `${cloze}  (${clueParts.join(" · ")})` : cloze;
       rows.push([
-        csvEscape(cloze),
+        csvEscape(front),
         csvEscape(g.category ?? ""),
         csvEscape(g.correction_focus),
         csvEscape("grammar"),
