@@ -165,9 +165,16 @@ function tenantDb(tenantId: string) {
       : { ...rows, tenant_id: tenantId };
   return {
     tenantId,
-    from(table: string) {
+    // Both type parameters are load-bearing, not decoration. supabase-js computes a
+    // query's row type from the table name and the column string as LITERAL types; widen
+    // either to plain `string` and GetResult degrades to GenericStringError, so every
+    // downstream property access (`partner.telegram_id`, `row.original_text`) stops
+    // compiling. Forwarding T and Q keeps the literals intact through the wrapper, so
+    // scoped queries infer exactly what the unscoped ones did.
+    from<T extends string>(table: T) {
       return {
-        select: (...args: any[]) => dbAdmin.from(table).select(...args).eq("tenant_id", tenantId),
+        select: <Q extends string = "*">(columns?: Q, options?: { count?: "exact" | "planned" | "estimated"; head?: boolean }) =>
+          dbAdmin.from(table).select(columns, options).eq("tenant_id", tenantId),
         // Stamped rather than filtered: the caller's payload never carries tenant_id, so
         // the column is set here or the NOT NULL constraint rejects the insert.
         insert: (rows: any) => dbAdmin.from(table).insert(stamp(rows)),
