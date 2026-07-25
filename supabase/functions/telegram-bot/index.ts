@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v73";
+const BUILD_VERSION = "v74";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -29,6 +29,22 @@ const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // parser (structured-JSON classification).
 const CLAUDE_MODEL = "claude-sonnet-5";
 const CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
+
+// Which model annotates messages. Annotation is ~85% of this instance's API spend --
+// it runs twice per message (once per side) with the largest prompt and the largest
+// output -- so it is the one call worth trying on the cheap tier. Set to
+// CLAUDE_HAIKU_MODEL to cut that spend by roughly two thirds; the risk is weaker
+// lemmatization/glossing on a morphologically rich language, so compare first with
+// /annotate_ab (admin) and re-check existing cards with /backfill_senses afterwards.
+// Defaults to CLAUDE_MODEL, i.e. no behavior change until deliberately switched.
+const ANNOTATION_MODEL: string = CLAUDE_MODEL;
+
+// USD per million tokens, used only by the /annotate_ab cost report. Standard
+// (post-introductory) rates, so the projection reflects steady-state spend.
+const MODEL_RATES: Record<string, { input: number; output: number }> = {
+  "claude-sonnet-5": { input: 3, output: 15 },
+  "claude-haiku-4-5-20251001": { input: 1, output: 5 },
+};
 
 const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));
 
@@ -249,6 +265,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
     { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
+    { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
@@ -851,6 +868,49 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
   );
 }
 
+// One annotation pass against an explicit model. Returns the parsed JSON (null on
+// API / no-text-block / parse failure) plus token usage and latency, so /annotate_ab can
+// compare models on cost and speed as well as on output quality. Shared by
+// annotateMessage, which persists the result, and by the A/B harness, which does not.
+type AnnotationRun = { parsed: any | null; inputTokens: number; outputTokens: number; ms: number };
+
+async function runAnnotation(
+  model: string, text: string, language: LangCode, otherLanguage: LangCode,
+  parallelText?: string, label = "",
+): Promise<AnnotationRun> {
+  const started = Date.now();
+  let result;
+  try {
+    result = await withRetry(() => anthropic.messages.create({
+      model,
+      max_tokens: 8192,
+      thinking: { type: "disabled" },
+      system: buildAnnotationPrompt(language, otherLanguage, parallelText),
+      messages: [{ role: "user", content: text }],
+    }));
+  } catch (e) {
+    console.error(`annotation API call failed (${model}) ${label}:`, e);
+    return { parsed: null, inputTokens: 0, outputTokens: 0, ms: Date.now() - started };
+  }
+  const usage = {
+    inputTokens: result.usage?.input_tokens ?? 0,
+    outputTokens: result.usage?.output_tokens ?? 0,
+    ms: Date.now() - started,
+  };
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") return { parsed: null, ...usage };
+  if (result.stop_reason === "max_tokens") {
+    console.warn(`runAnnotation: max_tokens hit (${model}) ${label} (lang=${language}, input length=${text.length}); annotations may be incomplete.`);
+  }
+  try {
+    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    return { parsed: JSON.parse(cleaned), ...usage };
+  } catch (e) {
+    console.error(`annotation JSON parse failed (${model}) ${label}:`, block.text);
+    return { parsed: null, ...usage };
+  }
+}
+
 async function annotateMessage(messageId: string, text: string, language: LangCode, otherLanguage: LangCode, parallelText?: string) {
   const writeFallbackRow = async () => {
     const { error } = await supabase.from("message_annotations").upsert(
@@ -858,34 +918,8 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
       { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
     if (error) console.error("fallback row insert failed:", error);
   };
-  let result;
-  try {
-    result = await withRetry(() => anthropic.messages.create({
-      model: CLAUDE_MODEL,
-      max_tokens: 8192,
-      thinking: { type: "disabled" },
-      system: buildAnnotationPrompt(language, otherLanguage, parallelText),
-      messages: [{ role: "user", content: text }],
-    }));
-  } catch (e) {
-    console.error("anthropic API call failed for", messageId, e);
-    await writeFallbackRow();
-    return;
-  }
-  const block = result.content.find((b) => b.type === "text");
-  if (block?.type !== "text") { await writeFallbackRow(); return; }
-  if (result.stop_reason === "max_tokens") {
-    console.warn(`annotateMessage: max_tokens hit on ${messageId} (lang=${language}, input length=${text.length}); annotations may be incomplete.`);
-  }
-  let parsed: any;
-  try {
-    const cleaned = block.text.trim().replace(/^\u0060\u0060\u0060(?:json)?\s*/i, "").replace(/\s*\u0060\u0060\u0060$/, "");
-    parsed = JSON.parse(cleaned);
-  } catch (e) {
-    console.error("annotation JSON parse failed:", block.text);
-    await writeFallbackRow();
-    return;
-  }
+  const { parsed } = await runAnnotation(ANNOTATION_MODEL, text, language, otherLanguage, parallelText, messageId);
+  if (!parsed) { await writeFallbackRow(); return; }
   const vocabRows = (parsed.vocabulary ?? [])
     .filter((v: any) => v.lemma && v.part_of_speech)
     .map((v: any) => ({
@@ -1625,6 +1659,7 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /backfill \u2014 Annotate one batch of unprocessed messages");
     lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
     lines.push("\u2022 /backfill\\_senses \u2014 Re-fix flashcard translations to match their example sentence");
+    lines.push("\u2022 /annotate\\_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)");
     lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
     lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
     lines.push("\u2022 /update \u2014 Check GitHub for a newer build; deploy with one tap");
@@ -2255,6 +2290,120 @@ async function handleBackfillSenses(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   await sendMessage(msg.chat.id, "⏳ Re-deriving flashcard translations against each card's example sentence — I'll report when this run finishes.");
   scheduleBackgroundWork("resenseGrind", resenseGrind(msg.chat.id));
+}
+
+// --- /annotate_ab: compare annotation models before switching ANNOTATION_MODEL ------
+// Annotation dominates this instance's API spend, and the cheap tier is only worth
+// taking if its lemmas and glosses hold up. This runs recent real messages through two
+// models with the identical prompt, writes nothing, and reports the vocabulary each
+// produced alongside measured tokens, latency, and projected monthly cost.
+
+// Telegram rejects messages over ~4096 chars, and an A/B report grows with the sample
+// size, so emit it in order as several messages rather than truncating the tail.
+async function sendChunked(chatId: number, blocks: string[], limit = 3500) {
+  let buf = "";
+  for (const b of blocks) {
+    if (buf && buf.length + b.length + 2 > limit) { await sendMessage(chatId, buf); buf = b; }
+    else buf = buf ? `${buf}\n\n${b}` : b;
+  }
+  if (buf) await sendMessage(chatId, buf);
+}
+
+function costUsd(model: string, inputTokens: number, outputTokens: number): number {
+  const rate = MODEL_RATES[model];
+  if (!rate) return 0;
+  return (inputTokens * rate.input + outputTokens * rate.output) / 1_000_000;
+}
+
+function lemmaSummary(run: AnnotationRun, max = 8): string {
+  if (!run.parsed) return "(failed)";
+  const vocab = (run.parsed.vocabulary ?? []) as any[];
+  if (vocab.length === 0) return "(no vocabulary)";
+  const shown = vocab.slice(0, max)
+    .map((v) => `${v.lemma}→${v.lemma_translation ?? v.gloss ?? "?"}`)
+    .join(", ");
+  return vocab.length > max ? `${shown} … +${vocab.length - max} more` : shown;
+}
+
+// Two model passes per sampled message run to tens of seconds, well past the window
+// Telegram waits before retrying the webhook, so acknowledge first and grind in the
+// background (same shape as /backfill_senses).
+async function handleAnnotateAb(msg: any, user: any) {
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  const arg = msg.text.replace(/^\/annotate_ab(@\S+)?/i, "").trim();
+  const sampleSize = Math.min(Math.max(parseInt(arg, 10) || 5, 1), 15);
+  scheduleBackgroundWork("annotateAbRun", annotateAbRun(msg.chat.id, user, sampleSize));
+}
+
+async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
+  const { data: rows, error } = await supabase
+    .from("messages")
+    .select("id, original_text, original_language, translated_text")
+    .not("original_text", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(sampleSize * 4);
+  if (error) { await sendMessage(chatId, `⚠️ Couldn't read messages: ${error.message}`); return; }
+
+  // Skip trivially short texts (greetings, emoji) -- they don't discriminate between models.
+  const sample = (rows ?? [])
+    .filter((r: any) => (r.original_text ?? "").trim().length >= 15 && isInstanceLang(r.original_language, user))
+    .slice(0, sampleSize);
+  if (sample.length === 0) { await sendMessage(chatId, "No suitable messages found to compare."); return; }
+
+  const challenger = ANNOTATION_MODEL === CLAUDE_MODEL ? CLAUDE_HAIKU_MODEL : CLAUDE_MODEL;
+  await sendMessage(chatId,
+    `⏳ Annotating ${sample.length} recent message(s) with both ${ANNOTATION_MODEL} (current) and ${challenger} (challenger). Nothing is written to the database.`);
+
+  const blocks: string[] = [];
+  const totals: Record<string, { input: number; output: number; ms: number; failures: number }> = {
+    [ANNOTATION_MODEL]: { input: 0, output: 0, ms: 0, failures: 0 },
+    [challenger]: { input: 0, output: 0, ms: 0, failures: 0 },
+  };
+
+  for (const [i, row] of sample.entries()) {
+    const lang = row.original_language as LangCode;
+    const other = otherLang(lang, user);
+    const parallel = row.translated_text ?? undefined;
+    // Sequential per model so the latency figures aren't skewed by contending with each other.
+    const current = await runAnnotation(ANNOTATION_MODEL, row.original_text, lang, other, parallel, row.id);
+    const alt = await runAnnotation(challenger, row.original_text, lang, other, parallel, row.id);
+    for (const [model, run] of [[ANNOTATION_MODEL, current], [challenger, alt]] as [string, AnnotationRun][]) {
+      totals[model].input += run.inputTokens;
+      totals[model].output += run.outputTokens;
+      totals[model].ms += run.ms;
+      if (!run.parsed) totals[model].failures += 1;
+    }
+    const preview = row.original_text.length > 70 ? `${row.original_text.slice(0, 70)}…` : row.original_text;
+    blocks.push(
+      `${i + 1}. "${preview}"\n` +
+      `current: ${lemmaSummary(current)}\n` +
+      `challenger: ${lemmaSummary(alt)}`,
+    );
+  }
+
+  // Project steady-state spend from the last 30 days of real traffic. Annotation runs
+  // once per side, so a message costs two passes.
+  const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const { count: monthlyMessages } = await supabase
+    .from("messages").select("id", { count: "exact", head: true }).gte("created_at", since);
+
+  const summary: string[] = ["— Totals —"];
+  for (const model of [ANNOTATION_MODEL, challenger]) {
+    const t = totals[model];
+    const spend = costUsd(model, t.input, t.output);
+    const perPass = sample.length ? spend / sample.length : 0;
+    const monthly = perPass * 2 * (monthlyMessages ?? 0);
+    const role = model === ANNOTATION_MODEL ? "current" : "challenger";
+    summary.push(
+      `${model} (${role})\n` +
+      `  ${t.input} in / ${t.output} out, avg ${Math.round(t.ms / sample.length)}ms/pass` +
+      (t.failures ? `, ${t.failures} failed` : "") + "\n" +
+      `  $${spend.toFixed(4)} for this run → ~$${monthly.toFixed(2)}/mo at ${monthlyMessages ?? 0} msg/mo`,
+    );
+  }
+  summary.push("Rates are standard (post-introductory). Switch by setting ANNOTATION_MODEL in index.ts, then redeploy.");
+
+  await sendChunked(chatId, [...blocks, summary.join("\n")]);
 }
 
 // --- /update: check GitHub for a newer build, and (admin) deploy it with one tap ---
