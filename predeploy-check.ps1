@@ -13,18 +13,36 @@
 #
 # Does NOT deploy anything. Read-only.
 
+param(
+    # Which edge function to gate. Defaults to the original single-tenant bot; pass
+    # "telegram-bot-saas" to gate the multi-tenant fork. Mirrors predeploy-check.sh's
+    # first positional argument.
+    [ValidateSet("telegram-bot", "telegram-bot-saas")]
+    [string]$FunctionName = "telegram-bot"
+)
+
 $ErrorActionPreference = "Stop"
 
-$IndexPath = Join-Path $PSScriptRoot "supabase/functions/telegram-bot/index.ts"
+$IndexPath = Join-Path $PSScriptRoot "supabase/functions/$FunctionName/index.ts"
 $MinLines  = 1500
+
+# Anchors both products must have: if these are gone, the file is not a Capybara bot.
 $Anchors   = @(
     "Deno.serve",
     "handleUpdate",
-    "BACKFILL_ADMIN_TELEGRAM_ID",
+    "ADMIN_TELEGRAM_ID",
     "handleRecap",
     "handleReconcile",
     "handlePinned"
 )
+
+# Per-build anchors. The multi-tenant gate additionally proves the tenant-scoping layer
+# is present, which is the one thing that must never be missing from a build shipped to
+# the shared project. Without it every query reads across all tenants -- and that build
+# would otherwise pass this gate, since it is a perfectly valid single-tenant bot.
+if ($FunctionName -eq "telegram-bot-saas") {
+    $Anchors += @("tenantDb", "dbAdmin", "tenant_id")
+}
 
 $failures = @()
 

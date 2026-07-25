@@ -24,14 +24,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUNCTION_NAME="${1:-${FUNCTION_NAME:-telegram-bot}}"
 INDEX_PATH="$SCRIPT_DIR/supabase/functions/$FUNCTION_NAME/index.ts"
 MIN_LINES=1500
+
+# Anchors both products must have: if these are gone, the file is not a Capybara bot.
 ANCHORS=(
   "Deno.serve"
   "handleUpdate"
-  "BACKFILL_ADMIN_TELEGRAM_ID"
+  "ADMIN_TELEGRAM_ID"
   "handleRecap"
   "handleReconcile"
   "handlePinned"
 )
+
+# Per-build anchors. The multi-tenant gate additionally proves the tenant-scoping layer
+# is present, which is the one thing that must never be missing from a build shipped to
+# the shared project. Without it every query reads across all tenants -- and that build
+# would otherwise pass this gate, since it is a perfectly valid single-tenant bot.
+case "$FUNCTION_NAME" in
+  telegram-bot-saas)
+    ANCHORS+=("tenantDb" "dbAdmin" "tenant_id")
+    ;;
+esac
 
 failures=()
 
