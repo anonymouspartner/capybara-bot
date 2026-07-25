@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v75";
+const BUILD_VERSION = "v76";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -686,8 +686,39 @@ async function translate(
   return null;
 }
 
-// Sentinel the grammar model returns when the learner's sentence has no meaningful
-// error. Anything else is treated as a correction to show them.
+// Chrome around the grammar note, in the reader's own language -- the correction text
+// itself already comes back in their native language from checkGrammar. A language with
+// no entry falls back to English, the same English-fallback convention the rest of the
+// bot's UI text uses.
+type GrammarUi = {
+  correct: string;
+  noteHeader: string;
+  saveFailed: string;
+  on: (learnName: string) => string;
+  off: (learnName: string) => string;
+};
+const GRAMMAR_UI: Record<string, GrammarUi> = {
+  en: {
+    correct: "✅ Looks correct.",
+    noteHeader: "📝 Grammar note:",
+    saveFailed: "⚠️ Couldn't save that setting — please try again.",
+    on: (l) => `✅ Grammar assistant ON. When you write in ${l}, I'll check it and privately explain any mistakes (just to you — your partner never sees the note). Turn it off with /capybara off.`,
+    off: (l) => `Grammar assistant OFF. I'll stop checking your ${l}. Turn it back on with /capybara on.`,
+  },
+  uk: {
+    correct: "✅ Виглядає правильно.",
+    noteHeader: "📝 Граматична нотатка:",
+    saveFailed: "⚠️ Не вдалося зберегти налаштування — спробуй ще раз.",
+    // Language names in the registry are English and don't decline in Ukrainian, so
+    // these refer to the studied language indirectly rather than naming it inline.
+    on: () => "✅ Помічник з граматики УВІМКНЕНО. Коли ти пишеш мовою, яку вивчаєш, я перевірю текст і приватно поясню помилки (тільки тобі — партнер їх не бачить). Вимкнути: /capybara off.",
+    off: () => "Помічник з граматики ВИМКНЕНО. Більше не перевірятиму. Увімкнути: /capybara on.",
+  },
+};
+function grammarUi(nativeLang: LangCode): GrammarUi {
+  return GRAMMAR_UI[nativeLang] ?? GRAMMAR_UI.en;
+}
+
 // A grammar verdict. `correct: true` means nothing to fix (and nothing to store --
 // there is no card in a sentence that was already right). Otherwise the pieces are kept
 // apart rather than as one blob of prose, because /export needs the corrected sentence
@@ -751,8 +782,9 @@ async function checkGrammar(text: string, learnLang: LangCode, nativeLang: LangC
 async function grammarAssist(chatId: number, text: string, user: any, messageId?: string) {
   const verdict = await checkGrammar(text, user.learning_language, user.native_language);
   if (verdict === null) return; // API/parse failed -- stay silent rather than nag.
+  const ui = grammarUi(user.native_language);
   if (verdict.correct) {
-    await sendMessage(chatId, "✅ Looks correct.");
+    await sendMessage(chatId, ui.correct);
     return;
   }
   const { error } = await supabase.from("grammar_corrections").insert({
@@ -767,7 +799,7 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
   if (error) console.error("grammar correction insert failed:", error);
 
   const explanation = verdict.explanation ? `\n${verdict.explanation}` : "";
-  await sendMessage(chatId, `📝 Grammar note:\n${verdict.corrected}${explanation}`);
+  await sendMessage(chatId, `${ui.noteHeader}\n${verdict.corrected}${explanation}`);
 }
 
 // /capybara [on|off] -- per-user toggle for the grammar assistant. Bare /capybara
@@ -775,16 +807,15 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
 async function handleCapybara(msg: any, user: any) {
   const arg = msg.text.replace(/^\/capybara(@\S+)?/i, "").trim().toLowerCase();
   const enabled = arg === "on" ? true : arg === "off" ? false : !user.grammar_assist;
+  const ui = grammarUi(user.native_language);
   const { error } = await supabase.from("users").update({ grammar_assist: enabled }).eq("id", user.id);
   if (error) {
     console.error("grammar toggle failed:", error);
-    await sendMessage(msg.chat.id, "⚠️ Couldn't save that setting — please try again.");
+    await sendMessage(msg.chat.id, ui.saveFailed);
     return;
   }
   const learnName = langLabel(user.learning_language);
-  await sendMessage(msg.chat.id, enabled
-    ? `✅ Grammar assistant ON. When you write in ${learnName}, I'll check it and privately explain any mistakes (just to you — your partner never sees the note). Turn it off with /capybara off.`
-    : `Grammar assistant OFF. I'll stop checking your ${learnName}. Turn it back on with /capybara on.`);
+  await sendMessage(msg.chat.id, enabled ? ui.on(learnName) : ui.off(learnName));
 }
 
 type WhisperResult =
