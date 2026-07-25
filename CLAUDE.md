@@ -93,6 +93,13 @@ below are set.
 `ADMIN_TELEGRAM_ID` (the English-native partner's numeric Telegram ID).
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are auto-injected by Supabase — don't set them.
 
+**Commercial build only:** `SUPERADMIN_TELEGRAM_ID` — the *operator*, not a customer. On the
+single-tenant bot "admin" and "the couple who owns the instance" are the same person; on the paid
+service they are different roles. Tenant membership needs no secret (a user row carries its
+`tenant_id`, and every query goes through `tenantDb`), but deploying builds, running the
+API-spend grinds, and reading instance-wide diagnostics are gated on this id. Falls back to
+`ADMIN_TELEGRAM_ID` if unset.
+
 Optional (enable the admin `/update` self-deploy command; the feature is inert if unset):
 `GITHUB_DEPLOY_TOKEN` (GitHub PAT with `Actions: write` — dispatches `deploy.yml`; without it
 `/update` only reports version status, no deploy button), `GITHUB_REPO` (`owner/name`),

@@ -8,7 +8,12 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v2";
+const BUILD_VERSION = "saas-v3";
+// Which of the repo's two edge functions THIS file is. Used for the /update version
+// check and, critically, for the deploy dispatch: deploy.yml's function_name input
+// defaults to "telegram-bot", so a dispatch that omits it ships the single-tenant build
+// to whatever project it targets.
+const SELF_FUNCTION_NAME = "telegram-bot-saas";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
@@ -45,7 +50,32 @@ const MODEL_RATES: Record<string, { input: number; output: number }> = {
   "claude-haiku-4-5-20251001": { input: 1, output: 5 },
 };
 
-const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));
+// The OPERATOR -- the person who runs the service, not a customer. On the single-tenant
+// build "admin" and "the couple who owns the instance" were the same person, so one
+// Telegram id covered both. Here they are different roles entirely: every tenant has
+// members, and exactly one person across the whole instance may deploy builds, run the
+// API-spend grinds, or read instance-wide diagnostics.
+//
+// Reads SUPERADMIN_TELEGRAM_ID, falling back to the single-tenant build's
+// ADMIN_TELEGRAM_ID so an existing deployment keeps working without re-setting secrets.
+const SUPERADMIN_TELEGRAM_ID = Number(
+  Deno.env.get("SUPERADMIN_TELEGRAM_ID") ?? Deno.env.get("ADMIN_TELEGRAM_ID"),
+);
+
+// Tenant membership needs no check of its own: a user row carries its tenant_id, and
+// every query goes through tenantDb, so a member can only ever reach their own couple's
+// data. What still needs an explicit gate is the operator-only surface below.
+function isSuperadmin(telegramId: number | undefined): boolean {
+  return !Number.isNaN(SUPERADMIN_TELEGRAM_ID) && telegramId === SUPERADMIN_TELEGRAM_ID;
+}
+
+// Uniform denial. Deliberately says nothing about whether the command exists or what
+// would make it work -- a customer probing operator commands learns nothing.
+async function denyUnlessSuperadmin(msg: any): Promise<boolean> {
+  if (isSuperadmin(msg.from?.id)) return false;
+  await sendMessage(msg.chat.id, "Not authorized.");
+  return true;
+}
 
 // --- /update (self-deploy) config; all optional. The feature is INERT unless these
 // are set as function secrets: with none, /update is unavailable to deploy and only
@@ -246,7 +276,7 @@ Deno.serve(async (req) => {
     const body: Record<string, unknown> = {
       status: "ok",
       version: BUILD_VERSION,
-      adminConfigured: !Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID),
+      adminConfigured: !Number.isNaN(SUPERADMIN_TELEGRAM_ID),
     };
     // Opt-in seed check (?seed): a read-only count so a post-deploy smoke test can
     // catch an instance that cannot serve anyone. Kept off the default probe so plain
@@ -1371,8 +1401,8 @@ async function ensureCommandsRegistered(): Promise<void> {
   if (commandsRegistered) return;
   const okPublic = await setMyCommands(PUBLIC_COMMANDS);
   let okAdmin = true;
-  if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
-    okAdmin = await setMyCommands(ADMIN_COMMANDS, { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
+  if (!Number.isNaN(SUPERADMIN_TELEGRAM_ID)) {
+    okAdmin = await setMyCommands(ADMIN_COMMANDS, { type: "chat", chat_id: SUPERADMIN_TELEGRAM_ID });
   }
   const okMenuButton = await setChatMenuButtonToCommands();
   if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
@@ -1917,7 +1947,7 @@ async function refreshVocabularyCounts(db: TenantDb) {
 
 async function handleHelp(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
-  const isAdmin = msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID;
+  const isAdmin = isSuperadmin(msg.from?.id);
   const viewerLang = user.native_language === "uk" ? "uk" : "en";
   const solo = !(await lookupPartner(db, user.id));
   const lines: string[] = [];
@@ -2335,7 +2365,7 @@ async function handleForget(msg: any, user: any) {
 
 async function handleBackfill(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
   // 1-row probe so an empty backlog replies instantly without kicking off a background run.
   const { data: probe, error: probeErr } = await db.rpc("backfill_pending_sides", { p_batch_size: 1 });
   if (probeErr) {
@@ -2461,7 +2491,7 @@ async function translateLemmasBatch(
 
 async function handleBackfillTranslations(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
   const { data: rows, error } = await db
     .from("vocabulary")
     .select("id, lemma, part_of_speech, gloss, language")
@@ -2626,7 +2656,7 @@ async function resenseGrind(db: TenantDb, chatId: number) {
 
 async function handleBackfillSenses(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
   await sendMessage(msg.chat.id, "⏳ Re-deriving flashcard translations against each card's example sentence — I'll report when this run finishes.");
   scheduleBackgroundWork("resenseGrind", resenseGrind(db, msg.chat.id));
 }
@@ -2695,7 +2725,7 @@ async function grammarBackfillGrind(db: TenantDb, chatId: number) {
 
 async function handleBackfillGrammar(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
   await sendMessage(msg.chat.id, "⏳ Re-deriving card fields for stored corrections — I'll report when this run finishes.");
   scheduleBackgroundWork("grammarBackfillGrind", grammarBackfillGrind(db, msg.chat.id));
 }
@@ -2737,7 +2767,7 @@ function lemmaSummary(run: AnnotationRun, max = 8): string {
 // Telegram waits before retrying the webhook, so acknowledge first and grind in the
 // background (same shape as /backfill_senses).
 async function handleAnnotateAb(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
   const arg = msg.text.replace(/^\/annotate_ab(@\S+)?/i, "").trim();
   const sampleSize = Math.min(Math.max(parseInt(arg, 10) || 5, 1), 15);
   scheduleBackgroundWork("annotateAbRun", annotateAbRun(msg.chat.id, user, sampleSize));
@@ -2826,7 +2856,11 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
 async function fetchLatestVersion(): Promise<string | null> {
   if (!GITHUB_REPO) return null;
   // Cache-bust + no-store: raw.githubusercontent is CDN-cached up to a few minutes.
-  const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_DEPLOY_BRANCH}/supabase/functions/telegram-bot/index.ts?t=${Date.now()}`;
+  // SELF_FUNCTION_NAME, not a hardcoded "telegram-bot": the fork left this pointing at
+  // the single-tenant file, so /update compared this build's saas-vN against the other
+  // product's vNN. Those version lines are unrelated, so it reported an update whenever
+  // the single-tenant build moved and stayed silent when this one did.
+  const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_DEPLOY_BRANCH}/supabase/functions/${SELF_FUNCTION_NAME}/index.ts?t=${Date.now()}`;
   try {
     const resp = await fetch(url, { cache: "no-store" });
     if (!resp.ok) { console.error(`fetchLatestVersion HTTP ${resp.status}`); return null; }
@@ -2862,9 +2896,18 @@ async function triggerDeploy(): Promise<{ ok: boolean; status: number; body?: st
     },
     body: JSON.stringify({
       ref: GITHUB_DEPLOY_BRANCH,
-      // Target THIS instance's project; omit when unparseable so the workflow falls
-      // back to its default SUPABASE_PROJECT_REF secret (prior single-project behavior).
-      inputs: { confirm: "deploy", ...(SELF_PROJECT_REF ? { project_ref: SELF_PROJECT_REF } : {}) },
+      // function_name is NOT optional here. deploy.yml defaults it to "telegram-bot",
+      // so omitting it would build the single-tenant function and deploy it over this
+      // multi-tenant one -- pointing a schema that knows nothing about tenant_id at a
+      // database full of other people's couples. Always name this build explicitly.
+      //
+      // project_ref targets THIS instance's project; omitted when unparseable so the
+      // workflow falls back to its default SUPABASE_PROJECT_REF secret.
+      inputs: {
+        confirm: "deploy",
+        function_name: SELF_FUNCTION_NAME,
+        ...(SELF_PROJECT_REF ? { project_ref: SELF_PROJECT_REF } : {}),
+      },
     }),
   });
   if (resp.status === 204) return { ok: true, status: 204 };
@@ -2874,7 +2917,7 @@ async function triggerDeploy(): Promise<{ ok: boolean; status: number; body?: st
 }
 
 async function handleUpdateCommand(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
 
   const running = BUILD_VERSION;
   if (!GITHUB_REPO) {
@@ -2918,7 +2961,7 @@ async function handleUpdateCommand(msg: any, user: any) {
 async function handleCallbackQuery(cq: any) {
   // Auth by Telegram sender id, independent of the users table. The button is only
   // ever shown in the admin's own chat, but we re-check here for defense in depth.
-  if (cq.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) {
+  if (!isSuperadmin(cq.from?.id)) {
     await answerCallbackQuery(cq.id, "Not authorized.");
     return;
   }
@@ -2952,7 +2995,7 @@ async function handleCallbackQuery(cq: any) {
 
 async function handleDiag(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
   const lines: string[] = ["\ud83d\udd0d Diagnostic check..."];
 
   const anthropicStart = Date.now();
@@ -3580,7 +3623,7 @@ async function recapBackfillRemaining(db: TenantDb): Promise<number | null> {
 
 async function handleRecapBackfill(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
 
   const remaining = await recapBackfillRemaining(db);
   if (remaining === null) { await sendMessage(msg.chat.id, "Couldn't query backfill remaining. Check logs."); return; }
