@@ -28,15 +28,33 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-const BUILD_VERSION = "billing-v3";
+const BUILD_VERSION = "billing-v4";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY") ?? "";
 const STRIPE_WEBHOOK_SECRET = Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "";
-// Username without the @, e.g. "capybara_translate_bot". Only used to build the deep
-// link the customer is redirected to.
-const TELEGRAM_BOT_USERNAME = Deno.env.get("TELEGRAM_BOT_USERNAME") ?? "";
+// The bot's @username, used to build the deep link the customer is redirected to after
+// paying. Normalized and then VALIDATED, because this is the single most brittle string
+// in the product: it is set by hand, and a wrong one breaks the handoff at the worst
+// possible moment -- seconds after a successful payment, with the customer watching.
+//
+// Accepts what a person actually pastes: "@name", "name", or a full t.me URL. Anything
+// that is not a legal Telegram username after that is treated as UNSET, so the deploy
+// smoke test's botUsernameConfigured check fails on a malformed value instead of
+// reporting healthy and emitting broken links.
+const TELEGRAM_BOT_USERNAME = (() => {
+  const raw = (Deno.env.get("TELEGRAM_BOT_USERNAME") ?? "").trim();
+  const name = raw
+    .replace(/^https?:\/\/(t\.me|telegram\.me)\//i, "")
+    .replace(/^@/, "")
+    .replace(/\/+$/, "");
+  if (!/^[A-Za-z0-9_]{5,32}$/.test(name)) {
+    if (raw) console.error(`TELEGRAM_BOT_USERNAME is not a valid Telegram username: ${JSON.stringify(raw)}`);
+    return "";
+  }
+  return name;
+})();
 
 // Price -> plan mapping lives here rather than in the database so prices can be
 // re-pointed, renamed or superseded without a migration. These two ids are the whole

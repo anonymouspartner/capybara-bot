@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v6";
+const BUILD_VERSION = "saas-v7";
 // Which of the repo's two edge functions THIS file is. Used for the /update version
 // check and, critically, for the deploy dispatch: deploy.yml's function_name input
 // defaults to "telegram-bot", so a dispatch that omits it ships the single-tenant build
@@ -17,7 +17,23 @@ const SELF_FUNCTION_NAME = "telegram-bot-saas";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
-const BOT_USERNAME = (Deno.env.get("TELEGRAM_BOT_USERNAME") ?? "").replace(/^@/, "");
+// Normalized and validated the same way stripe-billing does it -- both build t.me links
+// from this and they must agree, or the partner invite and the post-payment redirect
+// would point at different places. Accepts "@name", "name", or a full t.me URL; anything
+// that is not a legal Telegram username is treated as unset, which degrades onboarding to
+// "here is your code" rather than handing out a broken link.
+const BOT_USERNAME = (() => {
+  const raw = (Deno.env.get("TELEGRAM_BOT_USERNAME") ?? "").trim();
+  const name = raw
+    .replace(/^https?:\/\/(t\.me|telegram\.me)\//i, "")
+    .replace(/^@/, "")
+    .replace(/\/+$/, "");
+  if (!/^[A-Za-z0-9_]{5,32}$/.test(name)) {
+    if (raw) console.error(`TELEGRAM_BOT_USERNAME is not a valid Telegram username: ${JSON.stringify(raw)}`);
+    return "";
+  }
+  return name;
+})();
 // Only used to mint Stripe customer-portal links for /billing. Unset degrades /billing
 // to a read-only summary rather than breaking it.
 const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY") ?? "";
