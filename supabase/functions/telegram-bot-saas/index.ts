@@ -2578,6 +2578,9 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /pin \u2014 \u041f\u043e\u0437\u043d\u0430\u0447\u0438\u0442\u0438 \u044f\u043a \u0432\u0430\u0436\u043b\u0438\u0432\u0435",
       "\u2022 /unpin \u2014 \u0417\u043d\u044f\u0442\u0438 \u043f\u043e\u0437\u043d\u0430\u0447\u043a\u0443",
       "\u2022 /pinned \u2014 \u0421\u043f\u0438\u0441\u043e\u043a \u0437\u0430\u043a\u0440\u0456\u043f\u043b\u0435\u043d\u0438\u0445",
+      "",
+      "\u2022 /billing \u2014 \u041f\u0456\u0434\u043f\u0438\u0441\u043a\u0430, \u0432\u0438\u043a\u043e\u0440\u0438\u0441\u0442\u0430\u043d\u043d\u044f \u0442\u0430 \u043e\u043f\u043b\u0430\u0442\u0430",
+      "\u2022 /delete\\_account \u2014 \u0412\u0438\u0434\u0430\u043b\u0438\u0442\u0438 \u0430\u043a\u0430\u0443\u043d\u0442 \u0456 \u0432\u0441\u0456 \u0434\u0430\u043d\u0456 (\u043d\u0430\u0437\u0430\u0432\u0436\u0434\u0438)",
     );
   } else {
     lines.push(
@@ -2608,6 +2611,9 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /pin \u2014 Reply to a message to mark it meaningful (small /ask boost)",
       "\u2022 /unpin \u2014 Reply to a pinned message to remove the pin",
       "\u2022 /pinned \u2014 List all pinned messages chronologically",
+      "",
+      "\u2022 /billing \u2014 Your subscription, usage this period, and payment details",
+      "\u2022 /delete\\_account \u2014 Permanently delete your account and all its data",
     );
   }
   if (isAdmin) {
