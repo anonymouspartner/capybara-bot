@@ -73,6 +73,7 @@ COMMENT ON TABLE public.tenants IS
 DO $$
 DECLARE
   tbl text;
+  has_rows boolean;
 BEGIN
   IF EXISTS (SELECT 1 FROM public.tenants) THEN
     RAISE EXCEPTION
@@ -88,7 +89,23 @@ BEGIN
       RAISE EXCEPTION
         'public.% is missing -- apply every migration in supabase/migrations/ before this one', tbl;
     END IF;
+    -- Checked up front, before any DDL. An empty tenants table does NOT imply an empty
+    -- database: a project can carry a whole single-tenant corpus and still have no
+    -- tenants row. Without this the loop gets partway through, hits SET NOT NULL on the
+    -- first populated table, and aborts -- correct, but it reports a constraint error
+    -- rather than the actual problem.
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM public.%I)', tbl) INTO has_rows;
+    IF has_rows THEN
+      RAISE EXCEPTION
+        'public.% has rows -- this migration is clean-slate only. Either wipe the tenant-owned tables first, or write a backfill migration that assigns the existing rows to a tenant before setting NOT NULL.', tbl;
+    END IF;
+  END LOOP;
 
+  FOREACH tbl IN ARRAY ARRAY[
+    'users', 'conversations', 'messages', 'message_annotations', 'vocabulary',
+    'flashcards', 'notes', 'message_pins', 'message_reconciles', 'recap_embeddings',
+    'grammar_corrections', 'pending_media_group'
+  ] LOOP
     EXECUTE format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS tenant_id uuid', tbl);
     -- Safe only because the database is empty; asserted above.
     EXECUTE format('ALTER TABLE public.%I ALTER COLUMN tenant_id SET NOT NULL', tbl);

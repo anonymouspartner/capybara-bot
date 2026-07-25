@@ -15,6 +15,12 @@
 --
 -- Bodies are otherwise unchanged from supabase/migrations/ -- same CTEs, same joins,
 -- same ordering and limits. The only edits are the new parameter and its predicates.
+--
+-- Grants are narrower than the single-tenant originals: service_role only. The bot
+-- connects as service_role, and the anon key is public -- on a shared instance, an anon
+-- grant on a SECURITY DEFINER search function is a tenant-id-guessing oracle. The base
+-- schema already revoked anon/authenticated on the two backfill functions for the same
+-- reason (20260621000000); this extends that to all seven.
 
 -- ============================================================================
 -- recap_keyword_search
@@ -83,8 +89,6 @@ end;
 $$;
 
 ALTER FUNCTION "public"."recap_keyword_search"("p_tenant_id" "uuid", "p_query" "text", "p_limit" integer, "p_start" "date", "p_end" "date") OWNER TO "postgres";
-GRANT ALL ON FUNCTION "public"."recap_keyword_search"("p_tenant_id" "uuid", "p_query" "text", "p_limit" integer, "p_start" "date", "p_end" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."recap_keyword_search"("p_tenant_id" "uuid", "p_query" "text", "p_limit" integer, "p_start" "date", "p_end" "date") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."recap_keyword_search"("p_tenant_id" "uuid", "p_query" "text", "p_limit" integer, "p_start" "date", "p_end" "date") TO "service_role";
 
 
@@ -153,8 +157,6 @@ end;
 $$;
 
 ALTER FUNCTION "public"."recap_semantic_search"("p_tenant_id" "uuid", "p_query_embedding" "public"."vector", "p_limit" integer, "p_start" "date", "p_end" "date") OWNER TO "postgres";
-GRANT ALL ON FUNCTION "public"."recap_semantic_search"("p_tenant_id" "uuid", "p_query_embedding" "public"."vector", "p_limit" integer, "p_start" "date", "p_end" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."recap_semantic_search"("p_tenant_id" "uuid", "p_query_embedding" "public"."vector", "p_limit" integer, "p_start" "date", "p_end" "date") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."recap_semantic_search"("p_tenant_id" "uuid", "p_query_embedding" "public"."vector", "p_limit" integer, "p_start" "date", "p_end" "date") TO "service_role";
 
 
@@ -184,8 +186,6 @@ CREATE OR REPLACE FUNCTION "public"."vocab_top_unlearned"("p_tenant_id" "uuid", 
 $$;
 
 ALTER FUNCTION "public"."vocab_top_unlearned"("p_tenant_id" "uuid", "p_language" "text", "p_user_id" "uuid", "p_limit" integer) OWNER TO "postgres";
-GRANT ALL ON FUNCTION "public"."vocab_top_unlearned"("p_tenant_id" "uuid", "p_language" "text", "p_user_id" "uuid", "p_limit" integer) TO "anon";
-GRANT ALL ON FUNCTION "public"."vocab_top_unlearned"("p_tenant_id" "uuid", "p_language" "text", "p_user_id" "uuid", "p_limit" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."vocab_top_unlearned"("p_tenant_id" "uuid", "p_language" "text", "p_user_id" "uuid", "p_limit" integer) TO "service_role";
 
 
@@ -222,8 +222,6 @@ end;
 $$;
 
 ALTER FUNCTION "public"."refresh_vocabulary_counts"("p_tenant_id" "uuid") OWNER TO "postgres";
-GRANT ALL ON FUNCTION "public"."refresh_vocabulary_counts"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."refresh_vocabulary_counts"("p_tenant_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."refresh_vocabulary_counts"("p_tenant_id" "uuid") TO "service_role";
 
 
@@ -266,8 +264,6 @@ as $$
 $$;
 
 ALTER FUNCTION "public"."backfill_pending_sides"("p_tenant_id" "uuid", "p_batch_size" integer) OWNER TO "postgres";
-GRANT ALL ON FUNCTION "public"."backfill_pending_sides"("p_tenant_id" "uuid", "p_batch_size" integer) TO "anon";
-GRANT ALL ON FUNCTION "public"."backfill_pending_sides"("p_tenant_id" "uuid", "p_batch_size" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."backfill_pending_sides"("p_tenant_id" "uuid", "p_batch_size" integer) TO "service_role";
 
 
@@ -298,8 +294,6 @@ CREATE OR REPLACE FUNCTION "public"."recap_backfill_batch"("p_tenant_id" "uuid",
 $$;
 
 ALTER FUNCTION "public"."recap_backfill_batch"("p_tenant_id" "uuid", "p_limit" integer) OWNER TO "postgres";
-GRANT ALL ON FUNCTION "public"."recap_backfill_batch"("p_tenant_id" "uuid", "p_limit" integer) TO "anon";
-GRANT ALL ON FUNCTION "public"."recap_backfill_batch"("p_tenant_id" "uuid", "p_limit" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."recap_backfill_batch"("p_tenant_id" "uuid", "p_limit" integer) TO "service_role";
 
 
@@ -321,6 +315,4 @@ CREATE OR REPLACE FUNCTION "public"."recap_backfill_remaining"("p_tenant_id" "uu
 $$;
 
 ALTER FUNCTION "public"."recap_backfill_remaining"("p_tenant_id" "uuid") OWNER TO "postgres";
-GRANT ALL ON FUNCTION "public"."recap_backfill_remaining"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."recap_backfill_remaining"("p_tenant_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."recap_backfill_remaining"("p_tenant_id" "uuid") TO "service_role";

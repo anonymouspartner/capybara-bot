@@ -16,8 +16,15 @@ deployed single-tenant build calls.
 Migrations are applied by hand — no workflow applies them. Run **all** of
 `supabase/migrations/` first, oldest to newest, then this directory in filename order.
 
-`20260726000000_tenants.sql` fails loudly if any expected table is missing, so a partially
-migrated base schema is caught at apply time rather than silently leaving a table unscoped.
+`20260726000000_tenants.sql` refuses to run unless the base schema is complete **and every
+tenant-owned table is empty**. Both are checked before any DDL runs, so a partially migrated
+or already-populated project is rejected with a message naming the actual problem rather than
+leaving some tables scoped and others not.
+
+An empty `tenants` table does not imply an empty database — a project can carry a whole
+single-tenant corpus and still have no tenants row. If the target project has data, either
+clear the twelve tenant-owned tables first or write a backfill migration that assigns the
+existing rows to a tenant before `SET NOT NULL`.
 
 ## Why `tenant_id` is denormalized onto every table
 
