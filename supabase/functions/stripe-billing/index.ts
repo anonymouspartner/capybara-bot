@@ -39,9 +39,9 @@ const STRIPE_WEBHOOK_SECRET = Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "";
 const TELEGRAM_BOT_USERNAME = Deno.env.get("TELEGRAM_BOT_USERNAME") ?? "";
 
 // Price -> plan mapping lives here rather than in the database so prices can be
-// re-pointed, renamed or superseded without a migration. A price id that matches
-// neither falls back to the standard quota rather than to unlimited: an unrecognized
-// price should cost the operator a support ticket, not an unbounded inference bill.
+// re-pointed, renamed or superseded without a migration. These two ids are the whole
+// definition of what this service sells: a Checkout session for anything else is not a
+// Capybara purchase and is refused (see planForPrice).
 const PRICE_STANDARD = Deno.env.get("STRIPE_PRICE_STANDARD") ?? "";
 const PRICE_HEAVY = Deno.env.get("STRIPE_PRICE_HEAVY") ?? "";
 const QUOTA_STANDARD = Number(Deno.env.get("QUOTA_STANDARD") ?? 3000);
