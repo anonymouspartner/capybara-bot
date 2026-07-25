@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v79";
+const BUILD_VERSION = "v80";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -265,6 +265,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
     { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
+    { match: t => isCmd(t, "backfill_grammar"),                                          handle: handleBackfillGrammar },
     { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
@@ -1716,8 +1717,10 @@ async function exportRun(chatId: number, user: any) {
       // change. Each part is optional and the clue is omitted entirely when none is
       // present, so an older row still yields a usable card.
       const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
-      const clueParts = [word, g.category].filter(Boolean);
-      const front = clueParts.length ? `${cloze}  (${clueParts.join(" · ")})` : cloze;
+      // The category is only shown alongside the word. On its own it names the KIND of
+      // mistake, not the missing word -- "(agreement)" reads as a hint but leads nowhere,
+      // which is worse than no parenthetical at all.
+      const front = word ? `${cloze}  (${[word, g.category].filter(Boolean).join(" · ")})` : cloze;
       rows.push([
         csvEscape(front),
         csvEscape(g.category ?? ""),
@@ -1871,6 +1874,7 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /backfill \u2014 Annotate one batch of unprocessed messages");
     lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
     lines.push("\u2022 /backfill\\_senses \u2014 Re-fix flashcard translations to match their example sentence");
+    lines.push("\u2022 /backfill\\_grammar \u2014 Fill in card fields for older grammar corrections");
     lines.push("\u2022 /annotate\\_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)");
     lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
     lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
@@ -2502,6 +2506,74 @@ async function handleBackfillSenses(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   await sendMessage(msg.chat.id, "⏳ Re-deriving flashcard translations against each card's example sentence — I'll report when this run finishes.");
   scheduleBackgroundWork("resenseGrind", resenseGrind(msg.chat.id));
+}
+
+// --- /backfill_grammar: fill in the card fields older corrections never captured -----
+// Corrections stored before v77/v79 have no correction_focus (so they export as a whole
+// sentence instead of a blank) and no lemma/gloss (so the blank has no clue). Re-running
+// the check on the original sentence recovers all of them.
+//
+// Every derived field is rewritten together rather than patched individually: a fresh
+// correction_focus has to be locatable in the corrected_text it came from, so mixing a
+// new focus word with an old sentence could leave a row whose cloze silently fails.
+async function grammarBackfillGrind(chatId: number) {
+  const startedAt = Date.now();
+  const { data: rows, error } = await supabase
+    .from("grammar_corrections")
+    .select("id, user_id, language, original_text")
+    .or("correction_focus.is.null,correction_lemma.is.null,correction_gloss.is.null")
+    .order("created_at", { ascending: true });
+  if (error) {
+    console.error("grammar backfill fetch failed:", error);
+    await sendMessage(chatId, "Couldn't fetch corrections. Check logs.");
+    return;
+  }
+  const pending = (rows ?? []) as any[];
+  if (pending.length === 0) { await sendMessage(chatId, "✅ Every correction already has its card fields."); return; }
+
+  // The correction stores the language being learned; the explanation language comes
+  // from the author's own row, so corrections stay per-user correct in both directions.
+  const userIds = [...new Set(pending.map((r) => r.user_id))];
+  const { data: users } = await supabase.from("users").select("id, native_language, learning_language").in("id", userIds);
+  const userById = new Map<string, any>((users ?? []).map((u: any) => [u.id, u]));
+
+  let updated = 0, skipped = 0;
+  for (let i = 0; i < pending.length; i += BACKFILL_CONCURRENCY) {
+    if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
+    const chunk = pending.slice(i, i + BACKFILL_CONCURRENCY);
+    const results = await Promise.all(chunk.map(async (row) => {
+      const u = userById.get(row.user_id);
+      if (!u) return "skip";
+      const verdict = await checkGrammar(row.original_text, row.language, u.native_language);
+      // A re-run that fails, or now judges the sentence correct, leaves the row alone --
+      // the stored correction is still better than nothing.
+      if (verdict === null || verdict.correct) return "skip";
+      const { error: upErr } = await supabase.from("grammar_corrections").update({
+        corrected_text: verdict.corrected,
+        explanation: verdict.explanation || null,
+        error_focus: verdict.errorFocus,
+        correction_focus: verdict.correctionFocus,
+        correction_lemma: verdict.correctionLemma,
+        correction_gloss: verdict.correctionGloss,
+        category: verdict.category,
+      }).eq("id", row.id);
+      if (upErr) { console.error("grammar backfill update failed:", upErr); return "skip"; }
+      return "ok";
+    }));
+    updated += results.filter((r) => r === "ok").length;
+    skipped += results.filter((r) => r === "skip").length;
+  }
+  const remaining = pending.length - updated - skipped;
+  await sendMessage(chatId,
+    `📝 Grammar backfill: ${updated} updated, ${skipped} skipped` +
+    (remaining > 0 ? `, ${remaining} left (budget reached — run again)` : "") +
+    `.\n\nRe-run /export, and delete the Capybara::Grammar deck in Anki first — the card fronts change, so old cards would duplicate instead of updating.`);
+}
+
+async function handleBackfillGrammar(msg: any, user: any) {
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  await sendMessage(msg.chat.id, "⏳ Re-deriving card fields for stored corrections — I'll report when this run finishes.");
+  scheduleBackgroundWork("grammarBackfillGrind", grammarBackfillGrind(msg.chat.id));
 }
 
 // --- /annotate_ab: compare annotation models before switching ANNOTATION_MODEL ------
