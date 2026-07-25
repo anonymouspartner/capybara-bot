@@ -48,6 +48,20 @@ their own.
 
 ## Step 2 — Stripe products and prices *(Stripe dashboard, test mode first)*
 
+> **Test mode is not an alternative to creating things — it is a separate world.** Stripe
+> keeps two of everything: products, prices, Payment Links, webhook endpoints and API
+> keys all exist independently in test and live mode, and nothing is ever promoted from
+> one to the other. So you create real objects here, while the **Test mode** toggle
+> (top-right) is on, and then create them all again in live mode at Step 8.
+>
+> A test-mode Payment Link is a real, shareable URL; it simply refuses real cards and
+> accepts `4242 4242 4242 4242`. Test price ids look exactly like live ones
+> (`price_1abc…`) but only work with an `sk_test_…` key — if a price id ever appears not
+> to exist, a test/live mismatch is almost always the reason.
+>
+> Build everything with the toggle ON. Creating it in the wrong mode is harmless but
+> leaves half the configuration in the world you are not using.
+
 1. Create one product, **two recurring monthly prices** — standard and heavy. Copy both
    price ids (`price_…`).
 2. Decide the quotas. For calibration: your own traffic is ~1,650 messages/month, which
