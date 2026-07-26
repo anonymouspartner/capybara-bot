@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v83";
+const BUILD_VERSION = "v84";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -416,6 +416,28 @@ function hasAnnotatableWord(text: string): boolean {
   return ANNOTATABLE_WORD.test(text ?? "");
 }
 
+// Annotate only what a human wrote, not what the bot wrote back.
+//
+// Every message used to get two annotation passes: one on the original text, one on the
+// translation. Both fed flashcards -- your partner's cards come from your originals,
+// yours come from the translations of your own messages -- but the two halves are not
+// equal. The second pass mines vocabulary out of the model's own output, which is also
+// where a wrong-sense card is most likely, since it re-analyzes text that was itself
+// generated under sense pressure.
+//
+// Measured over 90 days before this was turned off: both partners write overwhelmingly in
+// their native language (87% and 91%), so dropping the machine side retains 53.4% of
+// Ukrainian and 47.7% of English card supply, every card of it sourced from human
+// writing. Annotation is ~83% of API spend and this halves it.
+//
+// Flipping this back on is not sufficient on its own: migration 20260726010000 stopped
+// backfill_pending_sides from offering translation sides, so re-enabling here without
+// reverting that leaves the newly annotated sides invisible to /backfill. The commercial
+// build has no such constant and still annotates both sides.
+// Typed as boolean, not inferred as the literal `false`, so the guarded call sites stay
+// live code to the type checker and a flip back to true type-checks without edits.
+const ANNOTATE_TRANSLATION_SIDE: boolean = false;
+
 // The instance's two languages are the sender's native and learning languages (one
 // couple, two complementary languages). otherLang flips between them; isInstanceLang
 // tests membership.
@@ -551,7 +573,7 @@ async function handleTextMessage(msg: any, user: any) {
 
   if (inserted) {
     if (isInstanceLang(originalLang, user)) scheduleAnnotation(inserted.id, originalText, originalLang, translationTargetLang, "text-original", translationOk ? translated! : undefined);
-    if (translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
+    if (ANNOTATE_TRANSLATION_SIDE && translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
     if (isInstanceLang(originalLang, user)) {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, originalText, originalLang));
     }
@@ -637,7 +659,7 @@ async function handleVoiceMessage(msg: any, user: any) {
 
   if (inserted) {
     if (isInstanceLang(originalLang, user)) scheduleAnnotation(inserted.id, transcript, originalLang, targetLang, "voice-original", translationOk ? translated! : undefined);
-    if (translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
+    if (ANNOTATE_TRANSLATION_SIDE && translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
     if (isInstanceLang(originalLang, user)) {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, transcript, originalLang));
     }
@@ -1518,7 +1540,7 @@ async function translateCaptionToPartner(user: any, senderChatId: number, captio
 
   if (inserted) {
     scheduleAnnotation(inserted.id, caption, originalLang, translationTargetLang, "caption-original", translationOk ? translated! : undefined);
-    if (translationOk) scheduleAnnotation(inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
+    if (ANNOTATE_TRANSLATION_SIDE && translationOk) scheduleAnnotation(inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
     scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, caption, originalLang));
   }
 }
