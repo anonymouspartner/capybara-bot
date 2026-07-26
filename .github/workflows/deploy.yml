@@ -104,10 +104,17 @@ jobs:
           echo "TARGET_REF=$ref" >> "$GITHUB_ENV"
           echo "Resolved deploy target."
 
+      # The sed is anchored to ^const deliberately. Unanchored, it also matches the
+      # /update command's own regex literal further down the file, which contains the
+      # text `const BUILD_VERSION = "`. That second match is garbage, and worse: with
+      # pipefail set, `head -1` exits after the first line and sed then writes the second
+      # into a closed pipe, taking the whole step down with SIGPIPE and no error message.
+      # Racy, so it passed for a long time before failing on a first deploy. The real
+      # declaration is at column 0; the regex literal is indented.
       - name: Verify BUILD_VERSION was bumped
         run: |
           set -euo pipefail
-          file_ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' "supabase/functions/$FUNCTION_NAME/index.ts" | head -1)
+          file_ver=$(sed -n 's/^const BUILD_VERSION = "\([^"]*\)".*/\1/p' "supabase/functions/$FUNCTION_NAME/index.ts" | head -1)
           if [ -z "$file_ver" ]; then echo "FAIL: could not find BUILD_VERSION in index.ts"; exit 1; fi
           # Fetch live version from health endpoint (gracefully skipped on first deploy)
           live_json=$(curl -fsS "https://${TARGET_REF}.supabase.co/functions/v1/${FUNCTION_NAME}?health" 2>/dev/null || echo '{}')
@@ -130,7 +137,7 @@ jobs:
         run: |
           set -euo pipefail
           ref="$TARGET_REF"
-          ver=$(sed -n 's/.*const BUILD_VERSION = "\([^"]*\)".*/\1/p' "supabase/functions/$FUNCTION_NAME/index.ts" | head -1)
+          ver=$(sed -n 's/^const BUILD_VERSION = "\([^"]*\)".*/\1/p' "supabase/functions/$FUNCTION_NAME/index.ts" | head -1)
           body=$(curl -fsS "https://${ref}.supabase.co/functions/v1/${FUNCTION_NAME}?health")
           echo "health: $body"
           echo "$body" | grep -q "\"version\":\"${ver}\"" || { echo "FAIL: live version != ${ver}"; exit 1; }
