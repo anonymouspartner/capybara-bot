@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v80";
+const BUILD_VERSION = "v81";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -399,6 +399,23 @@ function detectScriptRatios(text: string): { cyrillicRatio: number; letters: num
   return { cyrillicRatio: letters === 0 ? 0 : cyrillic / letters, letters };
 }
 
+// Does this text contain anything a model could annotate or grammar-check?
+//
+// Cost control, not correctness: annotation is ~85% of API spend, and a couple's real
+// traffic is full of "ok", "так", "haha", "❤️", "👍" — each of which costs a full
+// annotation pass (two, counting the translation side) and yields nothing. Every part of
+// speech the annotator is asked to KEEP (noun, verb, adjective, adverb, phrase) is at
+// least three letters in both scripts; the 2-letter words are the pronouns, prepositions,
+// particles and conjunctions the prompt already tells it to SKIP. So a message with no
+// 3-letter run has no vocabulary to find, and the call is pure spend.
+//
+// The letter ranges deliberately match detectScriptRatios above: Latin A-Z/a-z plus
+// Latin-1 Supplement and Extended-A, Cyrillic plus its Supplement.
+const ANNOTATABLE_WORD = /[A-Za-zÀ-ſЀ-ԯ]{3,}/;
+function hasAnnotatableWord(text: string): boolean {
+  return ANNOTATABLE_WORD.test(text ?? "");
+}
+
 // The instance's two languages are the sender's native and learning languages (one
 // couple, two complementary languages). otherLang flips between them; isInstanceLang
 // tests membership.
@@ -481,6 +498,14 @@ function scheduleAnnotation(messageId: string, text: string, language: LangCode,
     scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(messageId, language));
     return;
   }
+  // Nothing a model could find. Retire the side with the same language-keyed row the
+  // wrong-script path writes -- writing NOTHING would leave it pending forever, and
+  // /backfill would re-annotate it on every run, spending exactly what was saved here.
+  if (!hasAnnotatableWord(text)) {
+    console.log(`skip annotation: ${source} ${messageId} no annotatable word (${language})`);
+    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(messageId, language));
+    return;
+  }
   scheduleBackgroundWork(`annotateMessage (${source}, ${messageId})`, annotateMessage(messageId, text, language, otherLanguage, parallelText));
 }
 
@@ -535,7 +560,9 @@ async function handleTextMessage(msg: any, user: any) {
   // Grammar coaching: if the learner has /capybara on and wrote in the language they're
   // studying, check it and reply privately with a short correction. Runs in the
   // background (after the translation) and is never forwarded to the partner.
-  if (user.grammar_assist && originalLang === user.learning_language) {
+  // hasAnnotatableWord for the same reason as annotation: a grammar check on "ok" or a
+  // bare emoji costs a full model call to answer "looks correct".
+  if (user.grammar_assist && originalLang === user.learning_language && hasAnnotatableWord(originalText)) {
     scheduleBackgroundWork(`grammarAssist (${inserted?.id ?? "?"})`, grammarAssist(msg.chat.id, originalText, user, inserted?.id));
   }
 }
@@ -936,6 +963,14 @@ async function transcribeWithWhisper(audioBlob: Blob, user: any): Promise<Whispe
     : { ok: true, text: first.text, language: first.language };
 }
 
+// The schema deliberately no longer asks for "grammar" (a list of grammatical features
+// like "instrumental case", "imperfective aspect"). Those rows were written on every
+// annotation and read by nothing: the only consumer of message_annotations anywhere is
+// annotation_type = 'vocabulary' (the vocabulary view). Output tokens are ~70% of the
+// cost of an annotation pass, and that array was the largest field nobody looked at.
+// Existing 'grammar' rows are left in place and the CHECK constraint still permits the
+// type, so restoring it is a prompt change with no migration. langMeta.grammarExamples is
+// kept for the same reason.
 function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, parallelText?: string): string {
   const langName = langMeta(language).englishName;
   const otherLangName = langMeta(otherLanguage).englishName;
@@ -951,9 +986,8 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
       `(e.g. if "afraid" is rendered as a form of "боятися", lemma_translation is "боятися", never "наляканий").`
     : "";
   const oppositeScript = langMeta(language).script === "cyrillic"
-    ? `If the MAJORITY of letter characters in the input are Latin-script, return {"vocabulary":[],"grammar":[],"idioms":[],"register":"neutral"}.`
-    : `If the MAJORITY of letter characters in the input are Cyrillic-script, return {"vocabulary":[],"grammar":[],"idioms":[],"register":"neutral"}.`;
-  const grammarExamples = langMeta(language).grammarExamples ?? `"tense", "case", "aspect", "mood"`;
+    ? `If the MAJORITY of letter characters in the input are Latin-script, return {"vocabulary":[],"idioms":[],"register":"neutral"}.`
+    : `If the MAJORITY of letter characters in the input are Cyrillic-script, return {"vocabulary":[],"idioms":[],"register":"neutral"}.`;
   return (
     `Analyze the ${langName} text and return a JSON object with these keys:\n` +
     `- "vocabulary": array of {lemma, part_of_speech, gloss, lemma_translation} for content words only.\n` +
@@ -966,7 +1000,6 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
     `    - The gloss and lemma_translation may be identical; that's fine \u2014 return both.\n` +
     `  * SKIP: prepositions, conjunctions, particles, interjections, pronouns, numerals, proper nouns (names of people/places).\n` +
     `  * For homographs (same lemma, different part of speech), return separate entries.\n` +
-    `- "grammar": array of grammatical features used (e.g., ${grammarExamples})\n` +
     `- "idioms": array of any idiomatic expressions\n` +
     `- "register": one of "formal", "informal", "neutral"\n\n` +
     `${oppositeScript}${senseAnchor}\n` +
@@ -1017,6 +1050,91 @@ async function runAnnotation(
   }
 }
 
+// Annotating the same text twice costs two model calls and produces the same answer, so
+// a repeat is served from what the first one already wrote. Couples repeat themselves
+// constantly -- "добраніч", "i love you", "дякую", "haha" -- and short repeats are exactly
+// the messages the 3-letter guard above is too blunt to catch.
+//
+// This is a reuse of a deterministic result, not a cache with its own truth: the rows
+// copied are the rows the model produced for identical text in the same language, and the
+// vocabulary rows are rebuilt from those same annotations so /vocab, occurrence_count
+// (refresh_vocabulary_counts counts annotation rows) and a re-add after /forget all behave
+// exactly as they would on a fresh call. Every failure path falls through to the model.
+const ANNOTATION_REUSE_MAX_CHARS = 120;
+
+async function reuseAnnotationsForIdenticalText(
+  messageId: string, text: string, language: LangCode, parallelText?: string,
+): Promise<boolean> {
+  // Long texts effectively never repeat verbatim; skipping them keeps the lookup off the
+  // path where it could never pay for itself (messages.original_text is unindexed).
+  if (text.length > ANNOTATION_REUSE_MAX_CHARS) return false;
+  try {
+    // Pin the OTHER side too when we know it. Identical source text can legitimately get
+    // two different translations ("hard" -> важкий / твердий), and the annotator's
+    // lemma_translation is anchored to the translation actually accepted -- reusing across
+    // a different translation would reintroduce exactly the wrong-sense card the SENSE
+    // ANCHOR exists to prevent. Matching the pair makes reuse provably equivalent.
+    const ids: string[] = [];
+    let asOriginalQ = supabase.from("messages").select("id")
+      .eq("original_language", language).eq("original_text", text).neq("id", messageId);
+    if (parallelText) asOriginalQ = asOriginalQ.eq("translated_text", parallelText);
+    const { data: asOriginal } = await asOriginalQ.limit(5);
+    for (const r of asOriginal ?? []) ids.push((r as any).id);
+
+    let asTranslationQ = supabase.from("messages").select("id")
+      .eq("translated_language", language).eq("translated_text", text).neq("id", messageId);
+    if (parallelText) asTranslationQ = asTranslationQ.eq("original_text", parallelText);
+    const { data: asTranslation } = await asTranslationQ.limit(5);
+    for (const r of asTranslation ?? []) ids.push((r as any).id);
+    if (ids.length === 0) return false;
+
+    // language is the generated column on message_annotations (20260703000000), so this
+    // cannot pick up the other side's annotations for the same message.
+    const { data: rows } = await supabase.from("message_annotations")
+      .select("annotation_type, annotation_value, details")
+      .in("message_id", ids).eq("language", language);
+    if (!rows || rows.length === 0) return false;
+
+    // Several prior messages may carry the same finding; the unique key is
+    // (message_id, annotation_type, annotation_value, language), so collapse first.
+    const seen = new Map<string, any>();
+    for (const r of rows as any[]) {
+      if (!r.annotation_value) continue;
+      seen.set(`${r.annotation_type} ${r.annotation_value}`, r);
+    }
+    if (seen.size === 0) return false;
+
+    const vocabRows = [...seen.values()]
+      .filter((r) => r.annotation_type === "vocabulary" && r.details?.part_of_speech)
+      .map((r) => ({
+        lemma: r.annotation_value,
+        part_of_speech: r.details.part_of_speech,
+        gloss: r.details.gloss ?? null,
+        lemma_translation: r.details.lemma_translation ?? null,
+        first_seen_message_id: messageId,
+        language: language,
+      }));
+    if (vocabRows.length > 0) {
+      await supabase.from("vocabulary").upsert(vocabRows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
+    }
+
+    const copies = [...seen.values()].map((r) => ({
+      message_id: messageId,
+      annotation_type: r.annotation_type,
+      annotation_value: r.annotation_value,
+      details: r.details,
+    }));
+    const { error } = await supabase.from("message_annotations").upsert(copies,
+      { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
+    if (error) { console.error("annotation reuse insert failed:", error); return false; }
+    console.log(`annotation reuse: ${messageId} (${language}) reused ${copies.length} row(s), no model call`);
+    return true;
+  } catch (e) {
+    console.error("annotation reuse failed, falling through to the model:", e);
+    return false;
+  }
+}
+
 async function annotateMessage(messageId: string, text: string, language: LangCode, otherLanguage: LangCode, parallelText?: string) {
   const writeFallbackRow = async () => {
     const { error } = await supabase.from("message_annotations").upsert(
@@ -1024,6 +1142,10 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
       { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
     if (error) console.error("fallback row insert failed:", error);
   };
+  // Also checked here, not only in scheduleAnnotation: the /backfill grind calls this
+  // directly, and the backlog already in the database predates the live-path guard.
+  if (!hasAnnotatableWord(text)) { await writeFallbackRow(); return; }
+  if (await reuseAnnotationsForIdenticalText(messageId, text, language, parallelText)) return;
   const { parsed } = await runAnnotation(ANNOTATION_MODEL, text, language, otherLanguage, parallelText, messageId);
   if (!parsed) { await writeFallbackRow(); return; }
   const vocabRows = (parsed.vocabulary ?? [])
@@ -1043,9 +1165,6 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
   for (const v of parsed.vocabulary ?? []) {
     if (!v.lemma) continue;
     annotations.push({ message_id: messageId, annotation_type: "vocabulary", annotation_value: v.lemma, details: { ...v, language } });
-  }
-  for (const g of parsed.grammar ?? []) {
-    annotations.push({ message_id: messageId, annotation_type: "grammar", annotation_value: g, details: { language } });
   }
   for (const i of parsed.idioms ?? []) {
     annotations.push({ message_id: messageId, annotation_type: "idiom", annotation_value: i, details: { language } });
