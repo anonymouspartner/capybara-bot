@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v10";
+const BUILD_VERSION = "saas-v11";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -3662,6 +3662,66 @@ function costUsd(model: string, inputTokens: number, outputTokens: number): numb
   return (inputTokens * rate.input + outputTokens * rate.output) / 1_000_000;
 }
 
+// Quality side of /annotate_ab. Cost was already measured precisely; quality was left to
+// eyeballing N side-by-side blocks, which is exactly the judgement a cheaper model has to
+// survive before it ships. These are AGREEMENT metrics, not correctness ones -- the
+// current model is the reference, not ground truth -- but a challenger that agrees on the
+// lemma set and its flashcard answers is not quietly degrading the deck, and every
+// disagreement is printed so a human can say which one is actually right.
+//
+// lemma_translation is called out separately because it is the flashcard ANSWER. A
+// disagreement there is a card whose back is different; a part_of_speech disagreement is
+// usually cosmetic, and a lemma-set difference is coverage rather than wrongness.
+type AgreementTally = {
+  shared: number; currentOnly: number; challengerOnly: number;
+  posDiff: number; translationDiff: number; examples: string[];
+};
+
+function vocabByKey(run: AnnotationRun): Map<string, any> {
+  const m = new Map<string, any>();
+  if (!run.parsed) return m;
+  for (const v of (run.parsed.vocabulary ?? []) as any[]) {
+    if (v?.lemma) m.set(String(v.lemma).toLocaleLowerCase(), v);
+  }
+  return m;
+}
+
+function tallyAgreement(tally: AgreementTally, current: AnnotationRun, challenger: AnnotationRun) {
+  // A failed pass is a cost/failure signal, already counted; scoring it as total
+  // disagreement would smear a reliability problem across the quality numbers.
+  if (!current.parsed || !challenger.parsed) return;
+  const a = vocabByKey(current), b = vocabByKey(challenger);
+  for (const [k, va] of a) {
+    const vb = b.get(k);
+    if (!vb) { tally.currentOnly++; continue; }
+    tally.shared++;
+    if ((va.part_of_speech ?? "") !== (vb.part_of_speech ?? "")) tally.posDiff++;
+    const ta = String(va.lemma_translation ?? va.gloss ?? "").trim().toLocaleLowerCase();
+    const tb = String(vb.lemma_translation ?? vb.gloss ?? "").trim().toLocaleLowerCase();
+    if (ta !== tb) {
+      tally.translationDiff++;
+      if (tally.examples.length < 12) tally.examples.push(`${va.lemma}: ${ta || "?"} vs ${tb || "?"}`);
+    }
+  }
+  for (const k of b.keys()) if (!a.has(k)) tally.challengerOnly++;
+}
+
+function agreementReport(t: AgreementTally): string[] {
+  const union = t.shared + t.currentOnly + t.challengerOnly;
+  if (union === 0) return ["— Agreement —", "no vocabulary found by either model"];
+  const pct = (n: number, d: number) => d === 0 ? "n/a" : `${Math.round((n / d) * 100)}%`;
+  const out = [
+    "— Agreement (challenger vs current) —",
+    `lemma set: ${pct(t.shared, union)} overlap (${t.shared} shared, ${t.currentOnly} current-only, ${t.challengerOnly} challenger-only)`,
+    `flashcard answer differs: ${t.translationDiff}/${t.shared} shared lemmas (${pct(t.translationDiff, t.shared)})`,
+    `part_of_speech differs: ${t.posDiff}/${t.shared} (${pct(t.posDiff, t.shared)})`,
+  ];
+  if (t.examples.length) {
+    out.push("", "differing answers (current vs challenger) — judge these:", ...t.examples.map((e) => `  ${e}`));
+  }
+  return out;
+}
+
 function lemmaSummary(run: AnnotationRun, max = 8): string {
   if (!run.parsed) return "(failed)";
   const vocab = (run.parsed.vocabulary ?? []) as any[];
@@ -3703,6 +3763,7 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
     `⏳ Annotating ${sample.length} recent message(s) with both ${ANNOTATION_MODEL} (current) and ${challenger} (challenger). Nothing is written to the database.`);
 
   const blocks: string[] = [];
+  const agreement: AgreementTally = { shared: 0, currentOnly: 0, challengerOnly: 0, posDiff: 0, translationDiff: 0, examples: [] };
   const totals: Record<string, { input: number; output: number; ms: number; failures: number }> = {
     [ANNOTATION_MODEL]: { input: 0, output: 0, ms: 0, failures: 0 },
     [challenger]: { input: 0, output: 0, ms: 0, failures: 0 },
@@ -3721,6 +3782,7 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
       totals[model].ms += run.ms;
       if (!run.parsed) totals[model].failures += 1;
     }
+    tallyAgreement(agreement, current, alt);
     const preview = row.original_text.length > 70 ? `${row.original_text.slice(0, 70)}…` : row.original_text;
     blocks.push(
       `${i + 1}. "${preview}"\n` +
@@ -3749,7 +3811,8 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
       `  $${spend.toFixed(4)} for this run → ~$${monthly.toFixed(2)}/mo at ${monthlyMessages ?? 0} msg/mo`,
     );
   }
-  summary.push("Rates are standard (post-introductory). Switch by setting ANNOTATION_MODEL in index.ts, then redeploy.");
+  summary.push("", ...agreementReport(agreement));
+  summary.push("", "Rates are standard (post-introductory). Switch by setting ANNOTATION_MODEL in index.ts, then redeploy.");
 
   await sendChunked(chatId, [...blocks, summary.join("\n")]);
 }
