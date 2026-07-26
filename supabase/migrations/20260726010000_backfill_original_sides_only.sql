@@ -39,4 +39,12 @@ as $$
   limit p_batch_size;
 $$;
 
+-- CREATE OR REPLACE preserves an existing function's privileges, so on a project that
+-- already has this function the line below changes nothing. It matters where the function
+-- is created fresh -- a newly provisioned couple, or the commercial project, where
+-- migrations-saas/20260726000100 dropped the 1-argument version. Postgres grants EXECUTE
+-- to PUBLIC on every new function, and this one returns message TEXT: left at the default,
+-- anyone holding the project's anon key could read the corpus straight out of it. The
+-- service_role grant below is what the edge function actually connects as.
+revoke execute on function public.backfill_pending_sides(integer) from public, anon, authenticated;
 grant execute on function public.backfill_pending_sides(integer) to service_role;
