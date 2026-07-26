@@ -109,8 +109,24 @@ their own.
 | `STRIPE_WEBHOOK_SECRET` | billing | `whsec_…`, from step 5 |
 | `STRIPE_PRICE_STANDARD` | billing | `price_…` |
 | `STRIPE_PRICE_ULTIMATE` | billing | `price_…` |
-| `QUOTA_STANDARD` | billing | Messages/period. Defaults to 750 |
-| `QUOTA_ULTIMATE` | billing | Messages/period. Defaults to 2500 |
+| `QUOTA_STANDARD` | billing | Messages/period. Defaults to 750. **Omit unless you mean to override** |
+| `QUOTA_ULTIMATE` | billing | Messages/period. Defaults to 2500. **Omit unless you mean to override** |
+
+> **The two `QUOTA_*` secrets are the only ones that silently win over the code.** Set them
+> once and a later change to the defaults deploys cleanly, reports healthy, and keeps
+> provisioning tenants at the old cap — and Supabase will not show you a secret's value, so
+> nothing contradicts it until the bill does. Prefer leaving them unset and letting
+> `stripe-billing` carry the numbers.
+>
+> Either way, don't try to remember which state you're in — ask:
+>
+> ```bash
+> curl -s "https://<commercial-ref>.supabase.co/functions/v1/stripe-billing?health" \
+>   | grep -o '"quota[^,]*'
+> ```
+>
+> `quotaStandard` / `quotaUltimate` are the numbers new tenants will actually be
+> provisioned with, and `quotaSource` says whether each came from the code or a secret.
 
 There is no `/update` self-deploy command in this build and no `GITHUB_*` secrets to set.
 The single-tenant bot has one; here a single tap would redeploy the function serving every

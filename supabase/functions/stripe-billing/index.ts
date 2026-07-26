@@ -28,7 +28,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-const BUILD_VERSION = "billing-v7";
+const BUILD_VERSION = "billing-v8";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -412,6 +412,19 @@ Deno.serve(async (req) => {
       stripeConfigured: Boolean(STRIPE_SECRET_KEY) && Boolean(STRIPE_WEBHOOK_SECRET),
       botUsernameConfigured: Boolean(TELEGRAM_BOT_USERNAME),
       pricesConfigured: Boolean(PRICE_STANDARD) && Boolean(PRICE_ULTIMATE),
+      // The EFFECTIVE quotas -- code defaults unless a QUOTA_* secret overrides them.
+      // Reported because the override is otherwise invisible: a stale secret silently
+      // keeps provisioning new tenants at an old cap, a deploy that changes the defaults
+      // looks like it worked, and nothing contradicts it until a customer's bill does.
+      // Secrets cannot be read back from the dashboard either, so this route is the only
+      // place the real numbers can be seen. Not secret: a quota is a published product
+      // limit, and quotaSource is the value's provenance, never the value of anything.
+      quotaStandard: QUOTA_STANDARD,
+      quotaUltimate: QUOTA_ULTIMATE,
+      quotaSource: {
+        standard: Deno.env.get("QUOTA_STANDARD") ? "secret" : "default",
+        ultimate: Deno.env.get("QUOTA_ULTIMATE") ? "secret" : "default",
+      },
       // Not smoke-tested as a hard failure: without it billing still works end to end,
       // the couple just isn't told when their payment lapses.
       notificationsConfigured: Boolean(Deno.env.get("TELEGRAM_BOT_TOKEN")),
