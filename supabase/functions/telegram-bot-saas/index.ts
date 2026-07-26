@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v7";
+const BUILD_VERSION = "saas-v8";
 // Which of the repo's two edge functions THIS file is. Used for the /update version
 // check and, critically, for the deploy dispatch: deploy.yml's function_name input
 // defaults to "telegram-bot", so a dispatch that omits it ships the single-tenant build
@@ -831,6 +831,25 @@ async function finishOnboarding(
   }
 }
 
+// Customer-facing name for a stored plan id. The database keeps a lowercase slug
+// ("standard", "ultimate") because that is what the price mapping produces and what is
+// stable to query; the customer sees what Stripe charged them for. Those must agree --
+// someone reading "ultimate" in the bot and "Capybara Ultimate" on their receipt has to
+// work out for themselves that they are the same thing, and the moment they doubt it
+// they open a support ticket.
+//
+// Unknown slugs fall through capitalized rather than being hidden, so a plan added later
+// still reads sensibly before anyone remembers to update this.
+const PLAN_LABELS: Record<string, string> = {
+  standard: "Capybara",
+  ultimate: "Capybara Ultimate",
+  comped: "Complimentary",
+};
+function planLabel(plan: string | null | undefined): string {
+  if (!plan) return "\u2014";
+  return PLAN_LABELS[plan] ?? (plan.charAt(0).toUpperCase() + plan.slice(1));
+}
+
 // ---------------------------------------------------------------------------- /billing
 //
 // Stripe's hosted customer portal does the actual work -- card updates, plan changes,
@@ -859,7 +878,7 @@ async function handleBilling(msg: any, user: any): Promise<void> {
     : "—";
   const summary =
     `*Your Capybara subscription*\n` +
-    `Plan: ${tenant.plan}\n` +
+    `Plan: ${planLabel(tenant.plan)}\n` +
     `Status: ${tenant.status}\n` +
     `Used this period: ${used}${quota ? ` of ${quota}` : " (unlimited)"}\n` +
     `Renews: ${renews}`;
@@ -1000,7 +1019,7 @@ async function handleTenants(msg: any, _user: any): Promise<void> {
   if (byPlan.size) {
     lines.push("", "*Active plans*");
     for (const [plan, n] of [...byPlan.entries()].sort((a, b) => b[1] - a[1])) {
-      lines.push(`• ${plan}: ${n}`);
+      lines.push(`• ${planLabel(plan)}: ${n}`);
     }
   }
 

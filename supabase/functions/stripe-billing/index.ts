@@ -28,7 +28,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-const BUILD_VERSION = "billing-v4";
+const BUILD_VERSION = "billing-v5";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -61,9 +61,9 @@ const TELEGRAM_BOT_USERNAME = (() => {
 // definition of what this service sells: a Checkout session for anything else is not a
 // Capybara purchase and is refused (see planForPrice).
 const PRICE_STANDARD = Deno.env.get("STRIPE_PRICE_STANDARD") ?? "";
-const PRICE_HEAVY = Deno.env.get("STRIPE_PRICE_HEAVY") ?? "";
-const QUOTA_STANDARD = Number(Deno.env.get("QUOTA_STANDARD") ?? 3000);
-const QUOTA_HEAVY = Number(Deno.env.get("QUOTA_HEAVY") ?? 10000);
+const PRICE_ULTIMATE = Deno.env.get("STRIPE_PRICE_ULTIMATE") ?? "";
+const QUOTA_STANDARD = Number(Deno.env.get("QUOTA_STANDARD") ?? 1500);
+const QUOTA_ULTIMATE = Number(Deno.env.get("QUOTA_ULTIMATE") ?? 4000);
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE);
 
@@ -74,7 +74,7 @@ const db = createClient(SUPABASE_URL, SERVICE_ROLE);
 // anything at all through this Stripe account -- some other product, a one-off -- could
 // take their own session id, hit the claim URL, and be provisioned a Capybara tenant.
 function planForPrice(priceId: string | null): { plan: string; quota: number } | null {
-  if (priceId && priceId === PRICE_HEAVY) return { plan: "heavy", quota: QUOTA_HEAVY };
+  if (priceId && priceId === PRICE_ULTIMATE) return { plan: "ultimate", quota: QUOTA_ULTIMATE };
   if (priceId && priceId === PRICE_STANDARD) return { plan: "standard", quota: QUOTA_STANDARD };
   return null;
 }
@@ -224,7 +224,7 @@ async function provisionFromCheckoutSession(sessionId: string): Promise<string |
   const plan_ = planForPrice(priceId);
   if (!plan_) {
     console.error(
-      `session ${sessionId} rejected: price ${priceId} is not STRIPE_PRICE_STANDARD or STRIPE_PRICE_HEAVY`);
+      `session ${sessionId} rejected: price ${priceId} is not STRIPE_PRICE_STANDARD or STRIPE_PRICE_ULTIMATE`);
     return null;
   }
   const { plan, quota } = plan_;
@@ -402,7 +402,7 @@ Deno.serve(async (req) => {
       version: BUILD_VERSION,
       stripeConfigured: Boolean(STRIPE_SECRET_KEY) && Boolean(STRIPE_WEBHOOK_SECRET),
       botUsernameConfigured: Boolean(TELEGRAM_BOT_USERNAME),
-      pricesConfigured: Boolean(PRICE_STANDARD) && Boolean(PRICE_HEAVY),
+      pricesConfigured: Boolean(PRICE_STANDARD) && Boolean(PRICE_ULTIMATE),
       // Not smoke-tested as a hard failure: without it billing still works end to end,
       // the couple just isn't told when their payment lapses.
       notificationsConfigured: Boolean(Deno.env.get("TELEGRAM_BOT_TOKEN")),

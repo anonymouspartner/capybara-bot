@@ -152,7 +152,7 @@ jobs:
               echo "$body" | grep -q '"botUsernameConfigured":true' \
                 || { echo "FAIL: botUsernameConfigured not true (TELEGRAM_BOT_USERNAME)"; exit 1; }
               echo "$body" | grep -q '"pricesConfigured":true' \
-                || { echo "FAIL: pricesConfigured not true (STRIPE_PRICE_STANDARD / STRIPE_PRICE_HEAVY)"; exit 1; }
+                || { echo "FAIL: pricesConfigured not true (STRIPE_PRICE_STANDARD / STRIPE_PRICE_ULTIMATE)"; exit 1; }
               echo "Smoke test passed: version ${ver}, Stripe fully configured."
               ;;
           esac

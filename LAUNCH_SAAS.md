@@ -62,8 +62,8 @@ their own.
 > Build everything with the toggle ON. Creating it in the wrong mode is harmless but
 > leaves half the configuration in the world you are not using.
 
-1. Create one product, **two recurring monthly prices** — standard and heavy. Copy both
-   price ids (`price_…`).
+1. Create one product, **two recurring monthly prices** — Capybara and Capybara Ultimate.
+   Copy both price ids (`price_…`).
 2. Decide the quotas. For calibration: your own traffic is ~1,650 messages/month, which
    costs about **$25/month** in Anthropic + OpenAI spend. Annotation is ~85% of that. Set
    the price above the quota's worst-case API cost, not above the average.
@@ -96,9 +96,9 @@ their own.
 | `STRIPE_SECRET_KEY` | billing + bot | `sk_test_…` first. Also used by `/delete_account` to cancel the subscription |
 | `STRIPE_WEBHOOK_SECRET` | billing | `whsec_…`, from step 5 |
 | `STRIPE_PRICE_STANDARD` | billing | `price_…` |
-| `STRIPE_PRICE_HEAVY` | billing | `price_…` |
-| `QUOTA_STANDARD` | billing | Messages/period. Defaults to 3000 |
-| `QUOTA_HEAVY` | billing | Defaults to 10000 |
+| `STRIPE_PRICE_ULTIMATE` | billing | `price_…` |
+| `QUOTA_STANDARD` | billing | Messages/period. Defaults to 1500 |
+| `QUOTA_ULTIMATE` | billing | Messages/period. Defaults to 4000 |
 
 Optional (`/update` self-deploy, inert if unset): `GITHUB_DEPLOY_TOKEN`, `GITHUB_REPO`,
 `GITHUB_DEPLOY_BRANCH`.
