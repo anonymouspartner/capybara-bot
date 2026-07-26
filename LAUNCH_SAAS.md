@@ -64,9 +64,21 @@ their own.
 
 1. Create one product, **two recurring monthly prices** — Capybara and Capybara Ultimate.
    Copy both price ids (`price_…`).
-2. Decide the quotas. For calibration: your own traffic is ~1,650 messages/month, which
-   costs about **$25/month** in Anthropic + OpenAI spend. Annotation is ~85% of that. Set
-   the price above the quota's worst-case API cost, not above the average.
+2. Decide the quotas. Defaults are **750** (Standard) and **2500** (Ultimate); the
+   `QUOTA_*` secrets below override them.
+
+   Calibration: your own traffic is ~1,650 messages/month. That cost about **$25/month**
+   before the annotation work, and runs at **~$0.012/message** on `saas-v12` — a figure
+   calibrated against real spend, since the cost model came in 20% under the actual bill.
+   Annotation is ~83% of it. So a tenant sitting at the cap costs roughly **$9**
+   (Standard) or **$30** (Ultimate) in inference.
+
+   Add ~$3/month per tenant for Stripe (2.9% + $0.30) and amortized Supabase Pro, and
+   price above the *cap* cost rather than the average — a quota exists so customers may
+   reach it. At these quotas $15 and $39 clear the cap with margin.
+
+   Re-derive `$/message` from the Anthropic console after a month of real traffic rather
+   than trusting the figure above; divide real spend by real message count.
 3. **Create a Payment Link** for each price. Under *After payment* → **Redirect to a page
    you specify**, set:
 
@@ -97,8 +109,8 @@ their own.
 | `STRIPE_WEBHOOK_SECRET` | billing | `whsec_…`, from step 5 |
 | `STRIPE_PRICE_STANDARD` | billing | `price_…` |
 | `STRIPE_PRICE_ULTIMATE` | billing | `price_…` |
-| `QUOTA_STANDARD` | billing | Messages/period. Defaults to 1500 |
-| `QUOTA_ULTIMATE` | billing | Messages/period. Defaults to 4000 |
+| `QUOTA_STANDARD` | billing | Messages/period. Defaults to 750 |
+| `QUOTA_ULTIMATE` | billing | Messages/period. Defaults to 2500 |
 
 There is no `/update` self-deploy command in this build and no `GITHUB_*` secrets to set.
 The single-tenant bot has one; here a single tap would redeploy the function serving every
@@ -190,7 +202,21 @@ step 7 once with a real card.
 
 **Quota is counted per inbound message**, not per API call, and consumed before any model
 call. One message is one translation plus two annotation passes, so a tenant at the cap
-has cost you roughly `quota × $0.015`.
+has cost you roughly `quota × $0.012`.
+
+That rate is for `saas-v12`, which annotates **both** sides of every message. The
+single-tenant build stopped annotating the machine-translated side (`v84`), which takes it
+to roughly `quota × $0.007` — the paid build deliberately did not follow, because halving
+the flashcards a subscriber receives is a product decision rather than a cost one. If it
+ever should, the honest place for it is the plan tier (Standard annotates what you write;
+Ultimate annotates both sides) rather than a global constant, so price tracks cost.
+
+**Changing a `QUOTA_*` secret does not move existing customers.** The quota is copied onto
+`tenants.message_quota` at provisioning and rewritten only on a plan change, so a new value
+applies to new subscribers and to anyone who switches plan. To move everyone already on a
+plan, update the rows directly:
+`update public.tenants set message_quota = 750 where plan = 'standard' and message_quota is not null;`
+(`NULL` means uncapped — a comped account — so the `is not null` guard matters.)
 
 **Comping an account:** set `message_quota = NULL` on the tenant. NULL means uncapped;
 `status` still has to be `active`.

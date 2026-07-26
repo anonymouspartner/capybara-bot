@@ -28,7 +28,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-const BUILD_VERSION = "billing-v6";
+const BUILD_VERSION = "billing-v7";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -62,8 +62,17 @@ const TELEGRAM_BOT_USERNAME = (() => {
 // Capybara purchase and is refused (see planForPrice).
 const PRICE_STANDARD = Deno.env.get("STRIPE_PRICE_STANDARD") ?? "";
 const PRICE_ULTIMATE = Deno.env.get("STRIPE_PRICE_ULTIMATE") ?? "";
-const QUOTA_STANDARD = Number(Deno.env.get("QUOTA_STANDARD") ?? 1500);
-const QUOTA_ULTIMATE = Number(Deno.env.get("QUOTA_ULTIMATE") ?? 4000);
+// Quotas are the only thing standing between a heavy couple and an unbounded API bill, so
+// they are set from measured cost, not from a round number. At ~$0.012/message on
+// saas-v12 (calibrated against real spend, not modelled), a tenant at these caps costs
+// roughly $9 and $30 of inference respectively, plus ~$3/month of Stripe and Supabase
+// overhead -- which leaves both plans profitable at the cap rather than merely on average.
+//
+// 750/month is ~25 messages a day. That is deliberately below the ~55/day of a very
+// active couple: Standard is sized for ordinary use and Ultimate is where heavy users are
+// expected to land, rather than Standard being sized so generously that nobody upgrades.
+const QUOTA_STANDARD = Number(Deno.env.get("QUOTA_STANDARD") ?? 750);
+const QUOTA_ULTIMATE = Number(Deno.env.get("QUOTA_ULTIMATE") ?? 2500);
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE);
 
