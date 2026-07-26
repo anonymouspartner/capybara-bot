@@ -103,7 +103,27 @@ their own.
 Optional (`/update` self-deploy, inert if unset): `GITHUB_DEPLOY_TOKEN`, `GITHUB_REPO`,
 `GITHUB_DEPLOY_BRANCH`.
 
-## Step 4 — Deploy both functions
+## Step 4 — Register the Stripe webhook *(Stripe dashboard, test mode)*
+
+**Before deploying, not after.** stripe-billing's health route reports
+`stripeConfigured` only when BOTH `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are
+set, and the deploy smoke test asserts it — so deploying first guarantees a red run.
+Stripe does not check that an endpoint URL responds when you create it, so the endpoint
+can be registered while the function does not yet exist.
+
+Endpoint URL:
+
+```
+https://<commercial-ref>.supabase.co/functions/v1/stripe-billing
+```
+
+Events: `checkout.session.completed`, `customer.subscription.created`,
+`customer.subscription.updated`, `customer.subscription.deleted`.
+
+Copy the signing secret (`whsec_…`) into the `STRIPE_WEBHOOK_SECRET` function secret.
+That completes the twelve secrets, and the deploy below can pass.
+
+## Step 5 — Deploy both functions
 
 Actions → **deploy** → Run workflow, type `deploy`, and **set `project_ref` to the
 commercial ref every time**. Run it twice:
@@ -118,19 +138,9 @@ are set — so a half-configured deploy is caught rather than discovered by a cu
 > Never dispatch with `project_ref` pointing at the personal project. That would put a
 > schema expecting `tenant_id` on top of the live personal database.
 
-## Step 5 — Register the Stripe webhook *(Stripe dashboard)*
-
-Endpoint URL:
-
-```
-https://<commercial-ref>.supabase.co/functions/v1/stripe-billing
-```
-
-Events: `checkout.session.completed`, `customer.subscription.created`,
-`customer.subscription.updated`, `customer.subscription.deleted`.
-
-Copy the signing secret into `STRIPE_WEBHOOK_SECRET`, then **redeploy `stripe-billing`**
-so it picks the secret up.
+Delete the stale `telegram-bot` function from this project while you are here: it is the
+single-tenant build left over from an earlier experiment, and leaving it beside
+`telegram-bot-saas` invites deploying to the wrong one.
 
 ## Step 6 — Point the Telegram webhook at the bot
 
