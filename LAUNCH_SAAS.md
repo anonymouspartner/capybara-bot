@@ -111,6 +111,10 @@ their own.
 | `STRIPE_PRICE_ULTIMATE` | billing | `price_…` |
 | `QUOTA_STANDARD` | billing | Messages/period. Defaults to 750. **Omit unless you mean to override** |
 | `QUOTA_ULTIMATE` | billing | Messages/period. Defaults to 2500. **Omit unless you mean to override** |
+| `STRIPE_PAYMENT_LINK_STANDARD` | bot | The Payment Link from step 2. Without it the intro shows no Standard button |
+| `STRIPE_PAYMENT_LINK_ULTIMATE` | bot | Same, for Ultimate |
+| `STRIPE_PRICE_STANDARD` | **bot** + billing | The bot reads the live amount so displayed price always matches what is charged |
+| `STRIPE_PRICE_ULTIMATE` | **bot** + billing | Same |
 
 > **The two `QUOTA_*` secrets are the only ones that silently win over the code.** Set them
 > once and a later change to the defaults deploys cleanly, reports healthy, and keeps
@@ -249,6 +253,45 @@ loses access on the next message without you doing anything.
 **A customer changing plan mid-period** keeps their usage count — the quota changes, the
 counter does not reset. The reset happens on the first message after
 `current_period_end`, which stays aligned with what Stripe bills.
+
+## The free trial
+
+A stranger who finds the bot on Telegram gets an intro (what it does, both plans with
+**live prices read from Stripe**, and buttons) plus **5 free messages**. It exists because
+the bot used to describe the product and then dead-end — there was no way to subscribe from
+inside Telegram at all, so the only route in was a Payment Link pasted by hand.
+
+This is the one path where somebody who has never paid causes API spend, so it is fenced:
+
+| Limit | Where |
+|---|---|
+| 5 messages per Telegram id, **lifetime** | `TRIAL_MESSAGE_LIMIT`, enforced in `consume_trial_message` |
+| Instance-wide ceiling per day | `TRIAL_DAILY_CAP` (500 ≈ $6/day worst case) |
+| Text only, ≤500 chars, private chats only | Checked before any model call |
+| Annotation on the **first** message only | It is ~83% of per-message cost |
+
+Both counters move inside one locked SQL statement, so two simultaneous messages cannot
+both spend the last one. Unlike the paid gate it fails **closed**: a database error denies
+a stranger rather than granting free inference.
+
+**Nothing a trial user sends is stored.** Text is translated and discarded — there is no
+tenant to own it, and a row in `messages` with a null `tenant_id` would break the orphan
+check in step 7. `trial_users` holds a Telegram id, a language pair and a counter.
+
+That row is permanent by design: the allowance is lifetime, so deleting old rows would hand
+every past visitor a fresh five messages. There is deliberately no retention job for it.
+
+To watch the cost:
+
+```sql
+select day, messages_used from public.trial_daily_usage order by day desc limit 14;
+select count(*) filter (where messages_used >= 5) as exhausted,
+       count(*)                                   as visitors
+  from public.trial_users;
+```
+
+Comping someone extra trial messages is `update public.trial_users set messages_used = 0
+where telegram_id = ...`.
 
 ## Retention
 

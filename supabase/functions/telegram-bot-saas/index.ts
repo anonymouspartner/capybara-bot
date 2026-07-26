@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v12";
+const BUILD_VERSION = "saas-v13";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -29,9 +29,50 @@ const BOT_USERNAME = (() => {
   }
   return name;
 })();
-// Only used to mint Stripe customer-portal links for /billing. Unset degrades /billing
-// to a read-only summary rather than breaking it.
+// Used to mint Stripe customer-portal links for /billing, and to read the live price of
+// each plan for the intro message. Unset degrades /billing to a read-only summary and the
+// intro to its fallback prices, rather than breaking either.
 const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY") ?? "";
+
+// --- The front door -----------------------------------------------------------------
+// Where a stranger who finds this bot on Telegram goes to subscribe. Until these were
+// added the bot could describe the product but not sell it: the only route in was a
+// Payment Link pasted by hand, so anyone who arrived on their own hit a dead end.
+//
+// Unset is a supported state, not a broken one -- the intro drops the buttons and says to
+// get in touch instead. A missing link must never render as a button that goes nowhere.
+const PAYMENT_LINK_STANDARD = (Deno.env.get("STRIPE_PAYMENT_LINK_STANDARD") ?? "").trim();
+const PAYMENT_LINK_ULTIMATE = (Deno.env.get("STRIPE_PAYMENT_LINK_ULTIMATE") ?? "").trim();
+// The same price ids stripe-billing maps to plans. Here they are read-only: the bot never
+// provisions anything, it just asks Stripe what each plan costs so the number a customer
+// reads is by construction the number their card is charged. A displayed price that
+// disagrees with the charged one is the one bug in this feature that costs trust rather
+// than money, and hardcoding the copy is how that happens.
+const PRICE_ID_STANDARD = Deno.env.get("STRIPE_PRICE_STANDARD") ?? "";
+const PRICE_ID_ULTIMATE = Deno.env.get("STRIPE_PRICE_ULTIMATE") ?? "";
+
+// Shown only when Stripe cannot be reached. Deliberately vague rather than a precise
+// wrong number: "from $15" that turns out to be $19 reads as a bait and switch, where an
+// approximate figure reads as an approximation.
+const PLAN_FALLBACK: Record<PlanKey, string> = {
+  standard: "see link for price",
+  ultimate: "see link for price",
+};
+
+// Quotas quoted in the intro. stripe-billing owns the real values (it is what writes
+// tenants.message_quota at provisioning); these are display copy and must be kept in step
+// with it -- LAUNCH_SAAS.md says so in the one place someone changing a plan will look.
+const PLAN_QUOTA: Record<PlanKey, number> = { standard: 750, ultimate: 2500 };
+
+type PlanKey = "standard" | "ultimate";
+
+// How much a stranger gets before the wall, and the ceiling across every stranger per day.
+// Passed into consume_trial_message so these constants stay the single source of truth
+// rather than being duplicated in SQL.
+const TRIAL_MESSAGE_LIMIT = 5;
+const TRIAL_DAILY_CAP = 500;
+// One trial message must not be able to be a novel. Applied before any model call.
+const TRIAL_MAX_CHARS = 500;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
@@ -279,6 +320,13 @@ Deno.serve(async (req) => {
       status: "ok",
       version: BUILD_VERSION,
       adminConfigured: !Number.isNaN(SUPERADMIN_TELEGRAM_ID),
+      // The front door. Reported, NOT asserted by the deploy smoke test -- these are
+      // launch configuration rather than things the bot needs to serve existing
+      // customers, and a hard assertion would fail every deploy until Stripe is wired
+      // up. Both false means a stranger gets the intro with no way to buy.
+      paymentLinksConfigured: Boolean(PAYMENT_LINK_STANDARD) && Boolean(PAYMENT_LINK_ULTIMATE),
+      // False means the intro falls back to vague price copy rather than live amounts.
+      pricesConfigured: Boolean(STRIPE_SECRET_KEY) && Boolean(PRICE_ID_STANDARD) && Boolean(PRICE_ID_ULTIMATE),
     };
     // Opt-in seed check (?seed): a read-only count so a post-deploy smoke test can
     // catch an instance that cannot serve anyone. Kept off the default probe so plain
@@ -352,15 +400,24 @@ async function handleUpdate(update: any) {
     // they are arriving with one.
     const startPayload = parseStartPayload(msg.text ?? "");
     if (startPayload) { await beginOnboarding(msg, startPayload); return; }
-    await sendMessage(msg.chat.id,
-      "Hi! Capybara is a private translation bot for couples — it translates between " +
-      "your two languages, builds a study deck from your own conversations, and remembers " +
-      "what you talked about.\n\n" +
-      "It's a paid subscription. Once you've subscribed you'll get a one-tap link that " +
-      "sets this up automatically.\n\n" +
-      "If you've already subscribed and have a setup link, open it again — or send " +
-      "/start followed by your setup code.",
-    );
+
+    // A bare /start, or /plans, is someone arriving cold: pitch, then let them try it or
+    // buy it. Previously this branch described the product and then dead-ended, telling
+    // them they'd get a link "once you've subscribed" without ever saying how to.
+    // isCmd rather than an equality test: it also matches "/start@thebot", which Telegram
+    // sends in groups and a person can type anywhere. A bare compare misses it, and the
+    // miss is not harmless -- the text falls through to the trial path and "/start@thebot"
+    // gets translated. Any /start still here has already failed parseStartPayload above,
+    // so a malformed setup code lands on the intro rather than being translated too.
+    const t = (msg.text ?? "").trim();
+    if (isCmd(t, "start", "plans", "subscribe", "pricing")) {
+      const intro = isCmd(t, "start") ? await introMessage() : await plansMessage();
+      await sendMessage(msg.chat.id, intro.text, "Markdown", intro.keyboard);
+      return;
+    }
+    // Anything else from a stranger is a trial attempt. handleTrialMessage does its own
+    // gating and answers with the intro if they haven't picked a language pair yet.
+    await handleTrialMessage(msg);
     return;
   }
   // Everything past this point is scoped to the sender's tenant. lookupUser is the only
@@ -383,7 +440,11 @@ async function handleUpdate(update: any) {
   // paths (translate, annotate, /recap synthesis, Whisper) are spread across a dozen
   // handlers, and a gate that has to be remembered in each of them is a gate that will
   // eventually be forgotten in one.
-  if (!isSuperadmin(msg.from?.id) && !isCmd(msg.text ?? "", "billing", "delete_account", "export")) {
+  // The exempt list is every command a customer might need precisely BECAUSE they are
+  // blocked -- billing and its aliases must stay reachable when the subscription has
+  // lapsed or the allowance is spent, or the way out is behind the wall it opens.
+  if (!isSuperadmin(msg.from?.id) &&
+      !isCmd(msg.text ?? "", "billing", "plans", "subscribe", "pricing", "delete_account", "export")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
       await sendMessage(msg.chat.id, quotaRefusalText(verdict), "Markdown");
@@ -411,7 +472,11 @@ async function handleUpdate(update: any) {
         await sendMessage(m.chat.id,
           `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
           media + tail); } },
-    { match: t => isCmd(t, "billing"),                                                  handle: handleBilling },
+    // /plans is in the public menu for strangers, so it is visible to customers too.
+    // Without an entry here it would fall through to the media handlers below and get
+    // TRANSLATED and forwarded to their partner, costing them a quota message. For
+    // someone who already subscribes, "plans and pricing" is what /billing answers.
+    { match: t => isCmd(t, "billing", "plans", "subscribe", "pricing"),                 handle: handleBilling },
     { match: t => isCmd(t, "delete_account"),                                           handle: handleDeleteAccount },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
@@ -540,6 +605,269 @@ const ONBOARD_GENDERS: { code: string; label: string }[] = [
   { code: "female", label: "She/her" },
   { code: "male", label: "He/him" },
 ];
+
+// --- The front door: intro, live prices, free trial ---------------------------------
+//
+// Everything below runs for senders with NO tenant -- people who have not paid and may
+// never. It is the only place in this build where an unauthenticated stranger can cause
+// API spend, so the trial path is gated by consume_trial_message before any model call
+// and by the cheap local checks (private chat, text only, length) before even that.
+//
+// Trial text is translated and DISCARDED. Nothing a stranger sends is written to
+// public.messages: there is no tenant to own it, a null tenant_id would break the orphan
+// check in LAUNCH_SAAS.md step 7, and storing strangers' private messages is a liability
+// with no upside. Only counters and the chosen language pair persist.
+
+// Live prices, read from Stripe so the number a customer reads is by construction the
+// number their card is charged. Cached at module scope: Supabase keeps an isolate warm
+// between invocations, so this is roughly one Stripe call per cold start rather than one
+// per curious stranger. A failure is not an error path worth surfacing -- the intro still
+// renders, with vaguer copy.
+type PriceCache = { text: Record<PlanKey, string>; fetchedAt: number };
+const PRICE_TTL_MS = 10 * 60 * 1000;
+let priceCache: PriceCache | null = null;
+
+function formatStripeAmount(unitAmount: number, currency: string): string {
+  const symbol = { usd: "$", eur: "€", gbp: "£" }[currency?.toLowerCase()] ?? "";
+  const major = unitAmount / 100;
+  // Stripe amounts are integer minor units; show cents only when they are non-zero, so
+  // $15 reads as "$15/mo" rather than "$15.00/mo".
+  const shown = Number.isInteger(major) ? String(major) : major.toFixed(2);
+  return symbol ? `${symbol}${shown}/mo` : `${shown} ${currency?.toUpperCase()}/mo`;
+}
+
+async function stripePriceText(): Promise<Record<PlanKey, string>> {
+  if (priceCache && Date.now() - priceCache.fetchedAt < PRICE_TTL_MS) return priceCache.text;
+  const text: Record<PlanKey, string> = { ...PLAN_FALLBACK };
+  const wanted: [PlanKey, string][] = [["standard", PRICE_ID_STANDARD], ["ultimate", PRICE_ID_ULTIMATE]];
+  for (const [plan, id] of wanted) {
+    if (!STRIPE_SECRET_KEY || !id) continue;
+    try {
+      const resp = await fetch(`https://api.stripe.com/v1/prices/${encodeURIComponent(id)}`, {
+        headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}`, "Stripe-Version": "2024-06-20" },
+      });
+      if (!resp.ok) { console.error(`stripe price ${plan} lookup failed: ${resp.status}`); continue; }
+      const body = await resp.json();
+      if (typeof body?.unit_amount === "number") text[plan] = formatStripeAmount(body.unit_amount, body.currency);
+    } catch (e) {
+      console.error(`stripe price ${plan} lookup threw:`, e);
+    }
+  }
+  // Cached even on a partial failure, so a Stripe outage doesn't mean a fresh round of
+  // failing calls for every message that arrives during it.
+  priceCache = { text, fetchedAt: Date.now() };
+  return text;
+}
+
+// [Try it free] + one URL button per plan. A plan whose Payment Link is unset is omitted
+// rather than rendered as a dead button; if BOTH are unset the caller falls back to copy
+// that tells the reader to get in touch, so the bot never advertises a way to pay that
+// does not work.
+function planKeyboard(prices: Record<PlanKey, string>, includeTrial: boolean) {
+  const rows: any[] = [];
+  if (includeTrial) rows.push([{ text: "✨ Try it free", callback_data: "tr|begin" }]);
+  if (PAYMENT_LINK_STANDARD) rows.push([{ text: `Standard — ${prices.standard}`, url: PAYMENT_LINK_STANDARD }]);
+  if (PAYMENT_LINK_ULTIMATE) rows.push([{ text: `Ultimate — ${prices.ultimate}`, url: PAYMENT_LINK_ULTIMATE }]);
+  return rows.length ? { inline_keyboard: rows } : undefined;
+}
+
+function plansConfigured(): boolean {
+  return Boolean(PAYMENT_LINK_STANDARD || PAYMENT_LINK_ULTIMATE);
+}
+
+// The message a stranger gets for saying anything at all. One screen: what it is, what
+// makes it different from a translation app, both plans, and a way in.
+async function introMessage(): Promise<{ text: string; keyboard: any }> {
+  const prices = await stripePriceText();
+  const plans = plansConfigured()
+    ? `*Standard* — ${prices.standard}, ${PLAN_QUOTA.standard.toLocaleString()} messages/month\n` +
+      `*Ultimate* — ${prices.ultimate}, ${PLAN_QUOTA.ultimate.toLocaleString()} messages/month\n\n` +
+      `One subscription covers both of you.`
+    : `Subscriptions aren't open through the bot just yet — message the person who sent you here and they'll get you set up.`;
+  return {
+    text:
+      `*Capybara* is a private translation bot for couples who don't share a first language.\n\n` +
+      `Write in yours, your partner reads theirs. Nobody switches to English out of politeness, ` +
+      `and nobody spends the evening in a translation app.\n\n` +
+      `It also quietly does two things a translator can't:\n\n` +
+      `• *Builds a study deck from your own conversations* — the real words your partner ` +
+      `actually uses, with the sense they meant, exportable to Anki.\n` +
+      `• *Remembers* — ask "when did we book the flights?" and it finds it.\n\n` +
+      `${plans}\n\n` +
+      `_Try it free below — five messages, no card. Trial messages are translated and not stored._`,
+    keyboard: planKeyboard(prices, true),
+  };
+}
+
+// Shown when the allowance runs out, and by /plans.
+async function plansMessage(prefix?: string): Promise<{ text: string; keyboard: any }> {
+  const prices = await stripePriceText();
+  const body = plansConfigured()
+    ? `*Standard* — ${prices.standard}, ${PLAN_QUOTA.standard.toLocaleString()} messages/month\n` +
+      `*Ultimate* — ${prices.ultimate}, ${PLAN_QUOTA.ultimate.toLocaleString()} messages/month\n\n` +
+      `One subscription covers both of you. After paying you'll get a link that sets ` +
+      `everything up in a couple of taps, plus one to send your partner.`
+    : `Subscriptions aren't open through the bot just yet — message the person who sent you here.`;
+  return { text: `${prefix ? prefix + "\n\n" : ""}${body}`, keyboard: planKeyboard(prices, false) };
+}
+
+// Trial callbacks. Shape mirrors the ob|... wizard next door:
+//   tr|begin              -> ask which language they speak natively
+//   tr|n|<native>         -> native chosen, ask which they're learning
+//   tr|l|<native>|<learn> -> pair chosen, store it and invite a message
+//
+// Stateless in the same way and for the same reason: the pair is written to the trial row
+// and every later step reads it back, rather than being carried around in callback_data
+// where the client could edit it. Nothing here grants access to anything, so a forged tap
+// can at worst set the forger's own language pair.
+async function handleTrialCallback(cq: any): Promise<void> {
+  const parts = (cq.data ?? "").split("|");
+  const step = parts[1];
+  const chatId = cq.message?.chat?.id;
+  const telegramId = cq.from?.id;
+  if (!chatId || !telegramId) { await answerCallbackQuery(cq.id); return; }
+
+  if (step === "begin") {
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId, "Which language do you speak natively?", undefined, langPickerKeyboard("tr|n"));
+    return;
+  }
+  if (step === "n") {
+    const native = parts[2];
+    if (!LANGUAGES[native]) { await answerCallbackQuery(cq.id); return; }
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId, `And which are you learning?`, undefined, langPickerKeyboard(`tr|l|${native}`, native));
+    return;
+  }
+  if (step === "l") {
+    const native = parts[2], learning = parts[3];
+    if (!LANGUAGES[native] || !LANGUAGES[learning] || native === learning) { await answerCallbackQuery(cq.id); return; }
+    const { error } = await dbAdmin.from("trial_users").upsert(
+      { telegram_id: telegramId, native_language: native, learning_language: learning },
+      { onConflict: "telegram_id" });
+    if (error) {
+      console.error("trial pair save failed:", error);
+      await answerCallbackQuery(cq.id, "Something went wrong.");
+      return;
+    }
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId,
+      `Set: ${langLabel(native)} ↔ ${langLabel(learning)}.\n\n` +
+      `Send me a message in either language and I'll translate it. ` +
+      `You've got ${TRIAL_MESSAGE_LIMIT} free — the first one comes with the flashcards it would add to your deck.`,
+      "Markdown");
+    return;
+  }
+  await answerCallbackQuery(cq.id);
+}
+
+// One inbound message from someone with no tenant, after the intro. Returns having either
+// answered them or sold to them; never throws past the caller.
+async function handleTrialMessage(msg: any): Promise<void> {
+  const chatId = msg.chat.id;
+  const telegramId = msg.from?.id;
+  if (!telegramId) return;
+
+  // Cheap local refusals first, so none of them can cost a model call or an allowance.
+  // A group chat is the expensive one: the bot sitting in a group would be a free
+  // translator for everyone in it, charged to a single stranger's five-message quota.
+  if (msg.chat?.type !== "private") return;
+  const text = (msg.text ?? "").trim();
+  if (!text) {
+    const { text: t, keyboard } = await plansMessage(
+      "Voice, photos and files are part of the subscription — the free trial is text only.");
+    await sendMessage(chatId, t, "Markdown", keyboard);
+    return;
+  }
+  if (text.length > TRIAL_MAX_CHARS) {
+    await sendMessage(chatId, `That's a bit long for the free trial — try something under ${TRIAL_MAX_CHARS} characters.`);
+    return;
+  }
+
+  const { data, error } = await dbAdmin.rpc("consume_trial_message", {
+    p_telegram_id: telegramId,
+    p_trial_limit: TRIAL_MESSAGE_LIMIT,
+    p_daily_cap: TRIAL_DAILY_CAP,
+  });
+  // Fails CLOSED, unlike the paid gate: the caller has paid nothing, so erring towards
+  // "no free inference" costs a stranger one message and costs us nothing. The paid gate
+  // errs the other way on purpose, because a blip must not look like a billing problem.
+  if (error) {
+    console.error("consume_trial_message failed; refusing:", error);
+    await sendMessage(chatId, "Something went wrong on my end. Try again in a moment.");
+    return;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  const reason: string = row?.reason ?? "unknown";
+
+  if (!row?.allowed) {
+    if (reason === "no_pair") {
+      const { text: t, keyboard } = await introMessage();
+      await sendMessage(chatId, t, "Markdown", keyboard);
+      return;
+    }
+    if (reason === "daily_cap") {
+      const { text: t, keyboard } = await plansMessage(
+        "The free trial has hit its limit for today — try again tomorrow, or skip the queue below.");
+      await sendMessage(chatId, t, "Markdown", keyboard);
+      return;
+    }
+    const { text: t, keyboard } = await plansMessage(
+      `That's your ${TRIAL_MESSAGE_LIMIT} free messages used. Hope it gave you a feel for it.`);
+    await sendMessage(chatId, t, "Markdown", keyboard);
+    return;
+  }
+
+  const { data: trial } = await dbAdmin.from("trial_users")
+    .select("native_language, learning_language").eq("telegram_id", telegramId).maybeSingle();
+  const native = trial?.native_language, learning = trial?.learning_language;
+  if (!native || !learning) {
+    const { text: t, keyboard } = await introMessage();
+    await sendMessage(chatId, t, "Markdown", keyboard);
+    return;
+  }
+
+  const from = await classifyLanguage(text, native, learning);
+  const to = from === native ? learning : native;
+  const translated = await translate(text, from, to);
+  if (!translated) {
+    await sendMessage(chatId, "I couldn't translate that one — try again in a moment.");
+    return;
+  }
+
+  const used: number = row.used ?? 0;
+  const left = Math.max(0, TRIAL_MESSAGE_LIMIT - used);
+  let body = `${langMeta(to).flag} ${translated}`;
+
+  // The deck is the thing a price list can't convey and a translation app doesn't do, so
+  // the first message shows it. Only the first: annotation is ~83% of per-message cost,
+  // and one worked example demonstrates it as well as five.
+  if (used === 1) {
+    const sample = await trialFlashcards(text, from, to, translated);
+    if (sample) body += `\n\n${sample}`;
+  }
+  body += `\n\n_${left} free ${left === 1 ? "message" : "messages"} left._`;
+  await sendMessage(chatId, body, "Markdown");
+}
+
+// A few flashcards from the trial message, formatted for chat. Returns null rather than
+// throwing or explaining itself: this is a flourish on top of a translation that already
+// succeeded, and a failed demo should cost the reader nothing.
+async function trialFlashcards(text: string, from: LangCode, to: LangCode, translated: string): Promise<string | null> {
+  if (!hasAnnotatableWord(text)) return null;
+  try {
+    const { parsed } = await runAnnotation(ANNOTATION_MODEL, text, from, to, translated, "trial");
+    const rows = (parsed?.vocabulary ?? [])
+      .filter((v: any) => v?.lemma && v?.lemma_translation)
+      .slice(0, 4);
+    if (rows.length === 0) return null;
+    const lines = rows.map((v: any) => `• *${v.lemma}* — ${v.lemma_translation}`).join("\n");
+    return `Flashcards this would add to your deck:\n${lines}`;
+  } catch (e) {
+    console.error("trial flashcards failed:", e);
+    return null;
+  }
+}
 
 // Telegram sends "/start <payload>" when a t.me/<bot>?start=<payload> link is opened.
 // Returns the payload, or null if this isn't a /start carrying one.
@@ -2262,6 +2590,11 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   // or an exhausted allowance both dead-end here, so it must not be a command you have to
   // already know about.
   { command: "billing", description: "Subscription, usage and payment details" },
+  // The default menu scope is what a stranger sees before they have ever spoken to the
+  // bot, so this is the one command in the list aimed at someone who is not a customer
+  // yet: it is how the "/" menu offers a way to subscribe rather than only tools that
+  // need a subscription to do anything.
+  { command: "plans", description: "Plans and pricing" },
 ];
 // Only the two commands an admin uses on a live instance appear in the menu. The
 // one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
@@ -3839,6 +4172,11 @@ async function handleCallbackQuery(cq: any) {
   // authorisation is the pairing code, which handleOnboardingCallback revalidates
   // against the database on every step rather than trusting the callback payload.
   if ((cq.data ?? "").startsWith("ob|")) { await handleOnboardingCallback(cq); return; }
+
+  // Trial taps come from strangers -- no tenant, no subscription, nothing to authorise
+  // against. There is nothing to protect here: the worst a forged tap can do is set the
+  // forger's own language pair. The spending is gated later, by consume_trial_message.
+  if ((cq.data ?? "").startsWith("tr|")) { await handleTrialCallback(cq); return; }
 
   // Account deletion is confirmed by the tenant OWNER, who is not the operator either.
   // handleDeleteAccountConfirm re-resolves the sender and re-checks ownership rather than
