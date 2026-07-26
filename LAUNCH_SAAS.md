@@ -18,7 +18,7 @@ Payment Link  →  Stripe Checkout  →  success_url hits stripe-billing
                                      302 → t.me/<bot>?start=<code>
                                           │  Telegram sends "/start <code>"
                                           ▼
-                                   2 taps: languages, then he/she
+                        3 taps: native lang, learning lang, he/she
                                           │
                                           ▼
                                    invite link for their partner

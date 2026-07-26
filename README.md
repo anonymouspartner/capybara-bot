@@ -33,6 +33,7 @@ the other person, translating any caption along the way.
 - [The `/recap` memory pipeline](#the-recap-memory-pipeline)
 - [The model: one instance per pair](#the-model-one-instance-per-pair)
 - [Two products](#two-products)
+- [Customer onboarding (paid service)](#customer-onboarding-paid-service)
 - [Data model](#data-model)
 - [Repository map](#repository-map)
 - [Prerequisites](#prerequisites)
@@ -197,9 +198,10 @@ products, not different instances, and each has its own file and its own Supabas
 |---|---|---|
 | Tenancy | One couple per project | Many couples, one project |
 | Isolation | The project boundary | `tenant_id` on every table, plus a scoped DB client |
-| Onboarding | Edit `seed_couple.sql`, run it by hand | Stripe Checkout → one-tap Telegram deep link → two button taps |
+| Onboarding | Edit `seed_couple.sql`, run it by hand | Stripe Checkout → Telegram deep link → three taps, one for the partner |
 | Billing | None | Stripe subscription, two tiers, per-period message quota |
 | Admin | The couple's own `ADMIN_TELEGRAM_ID` | `SUPERADMIN_TELEGRAM_ID` — the operator, never a customer |
+| Deploys | `/update` self-deploy from Telegram, or Actions | Actions only — **no `/update`** (one tap would redeploy every tenant) |
 | Retention | 30-day PII cron | Kept while the account exists; `/delete_account` removes everything |
 
 The fork was deliberate. Roughly 90% is shared core — translation, annotation, `/recap`,
@@ -215,6 +217,68 @@ take a tenant argument too — scoping the TypeScript alone would not have reach
 
 Wiring up the paid service (BotFather, Stripe products, Payment Links, secrets, deploy
 order, an end-to-end test) is documented in **`LAUNCH_SAAS.md`**.
+
+## Customer onboarding (paid service)
+
+Self-serve end to end. The only thing the operator hands out is a Payment Link — no
+website, no email, no manual provisioning step.
+
+```
+Payment Link → Stripe Checkout → success_url hits stripe-billing
+                                      │  verifies the session, creates the tenant
+                                      ▼
+                                 302 → t.me/<bot>?start=<code>
+                                      │  Telegram sends "/start <code>"
+                                      ▼
+                         3 taps: native language, learning language, he/she
+                                      │
+                                      ▼
+                             invite link for their partner
+                                      │  partner taps, picks he/she
+                                      ▼
+                                both set up, code retired
+```
+
+**Payment → tenant** (`stripe-billing`, the `GET ?session_id=` route):
+
+1. The Checkout session is retrieved from Stripe and must be `mode: "subscription"` **and**
+   carry a price matching `STRIPE_PRICE_STANDARD` or `STRIPE_PRICE_ULTIMATE`. There is
+   deliberately **no fallback plan** — an unrelated paid session provisions nothing.
+2. Provisioning is **idempotent**, keyed on `stripe_checkout_session_id`: refreshing the
+   success page returns the same code rather than minting a second tenant, and a unique
+   violation re-reads instead of failing.
+3. The tenant row is written with its plan, quota, Stripe ids, a random `pairing_code` and
+   a **14-day** `pairing_code_expires_at`, then the customer is 302'd into Telegram.
+
+This runs on the **redirect, not the webhook**. Stripe fires both simultaneously with no
+ordering guarantee, so provisioning on the webhook would sometimes redirect a paying
+customer to a code that does not exist yet.
+
+**The in-chat wizard** (`telegram-bot-saas`): the payer picks their native language, then
+the language they're learning (their own is excluded from the second picker), then how the
+bot should refer to them. That last question explains itself in the copy — gendered verb
+and adjective agreement is not cosmetic, and a question that looks decorative gets skipped.
+The partner opens the invite link and answers **one** question: the pair is read off the
+payer's row and inverted, so it cannot contradict what was already chosen.
+
+Three things hold it together:
+
+- **Every step re-validates** `claim_tenant_seat(<code>)` against the database — on the
+  `/start` and again on each button tap. Nothing is trusted from the callback payload;
+  Telegram's own clients only send `callback_data` the bot issued, but MTProto's
+  `getBotCallbackAnswer` accepts an arbitrary one.
+- **Seats gate the flow.** Owner steps require zero seats taken, the partner step exactly
+  one, and `owner_user_id` is write-once at the database. Ownership is the authority behind
+  cancelling the card and deleting the couple's corpus, so it must not be reachable by any
+  route that isn't deliberate — including the honest race where the code reaches the
+  partner before the payer has finished.
+- **Refusals are specific** — expired, seats full, subscription inactive, unrecognised
+  code, or "this Telegram account is already linked to a subscription" — because each is a
+  different real situation with a different fix.
+
+The payer can use the bot **solo** in the gap before their partner joins. Once the second
+seat is filled the `pairing_code` is cleared, so a forwarded link is inert from then on,
+and the payer is told their partner arrived.
 
 ## Data model
 
@@ -391,6 +455,11 @@ git tag vNN
 
 ### Self-deploy from Telegram (`/update`)
 
+> **Single-tenant build only.** `/update` is deliberately absent from `telegram-bot-saas`,
+> where one tap would redeploy the function serving every subscribing couple at once. The
+> paid service deploys through the Actions workflow and nothing else, and sets no `GITHUB_*`
+> secrets.
+
 The admin can check for and ship new builds **from inside Telegram** with **`/update`**:
 it reads the latest `BUILD_VERSION` from this repo on GitHub, compares it to the running
 build, and — if the live bot is behind — offers a one-tap **Deploy** button that dispatches
@@ -519,6 +588,26 @@ an existing corpus** — new instances can ignore them.
 Each backfill command is **idempotent and batched** — run it repeatedly until it reports
 zero remaining.
 
+### On the paid service
+
+The same commands exist in `telegram-bot-saas`, gated to `SUPERADMIN_TELEGRAM_ID` — the
+operator of the service, never a customer — with two differences worth knowing:
+
+- **The grinds run against the operator's own tenant.** They go through the tenant-scoped
+  client like everything else, so there is no in-chat lever to backfill a *customer's*
+  corpus; that is a SQL job against the commercial project.
+- **`/tenants` is the one command that crosses tenants.** It reads the `tenants` table and
+  seat counts only — never message content — and reports signups needing attention first
+  (paid but never set up, waiting on a partner, over quota, failed payment), then
+  subscription and plan counts, then usage and estimated API spend. Revenue is deliberately
+  absent: it lives in Stripe, and a copy here would only go stale.
+
+The operator's own messages **bypass the subscription and quota gate**, which is why their
+`messages_used` stays at zero.
+
+Denials are uniform — a flat *"Not authorized."* that says nothing about whether the
+command exists, so a customer probing operator commands learns nothing.
+
 ## Design philosophy
 
 - **One file, never forked.** Every instance ships the exact same committed `index.ts`.
@@ -538,7 +627,10 @@ deploy-safety and reproducibility handoffs that shaped them.
 
 - **Health route shows `adminConfigured: false`** — `ADMIN_TELEGRAM_ID` isn't set on
   that project. Set it and **redeploy** (it's read once at boot); admin commands stay
-  gated shut until you do.
+  gated shut until you do. On the paid build the same flag reads `SUPERADMIN_TELEGRAM_ID`,
+  falling back to `ADMIN_TELEGRAM_ID` — so renaming the secret is safe, but a typo in the
+  numeric id turns every operator command into *"Not authorized."* while the health route
+  still reports `true`. `/tenants` is the real test.
 - **Bot doesn't recognize a user** — an unregistered Telegram user gets a reply with
   their own numeric ID. Put both IDs in `seed_couple.sql` and run it.
 - **A freshly-sent message doesn't appear in `/recap`** — expected: messages have a
