@@ -87,7 +87,9 @@ Runs the same gate → CLI-from-disk deploy → health smoke, no local machine n
 **Fallback (offline / first deploy during setup): local scripts.** Windows: `.\deploy.ps1 -ProjectRef <ref>`.
 macOS/Linux: `./deploy.sh <ref>`.
 
-The admin `/update` command is an alternate trigger for the **same** `deploy.yml` workflow —
+The admin `/update` command (**single-tenant build only** — deliberately absent from
+`telegram-bot-saas`, where one tap would redeploy every tenant at once) is an alternate
+trigger for the **same** `deploy.yml` workflow —
 it just dispatches it from inside Telegram. The human stays in the loop (the admin taps the
 deploy button), and the workflow's predeploy gate + health smoke test still run. It does not
 bypass any of the discipline above. The feature is inert unless the optional `GITHUB_*` secrets

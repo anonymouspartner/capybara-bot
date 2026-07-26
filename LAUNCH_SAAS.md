@@ -100,8 +100,9 @@ their own.
 | `QUOTA_STANDARD` | billing | Messages/period. Defaults to 1500 |
 | `QUOTA_ULTIMATE` | billing | Messages/period. Defaults to 4000 |
 
-Optional (`/update` self-deploy, inert if unset): `GITHUB_DEPLOY_TOKEN`, `GITHUB_REPO`,
-`GITHUB_DEPLOY_BRANCH`.
+There is no `/update` self-deploy command in this build and no `GITHUB_*` secrets to set.
+The single-tenant bot has one; here a single tap would redeploy the function serving every
+tenant at once, so deploys go through the Actions workflow only.
 
 ## Step 4 — Register the Stripe webhook *(Stripe dashboard, test mode)*
 
