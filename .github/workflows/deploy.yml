@@ -118,7 +118,12 @@ jobs:
           if [ -z "$file_ver" ]; then echo "FAIL: could not find BUILD_VERSION in index.ts"; exit 1; fi
           # Fetch live version from health endpoint (gracefully skipped on first deploy)
           live_json=$(curl -fsS "https://${TARGET_REF}.supabase.co/functions/v1/${FUNCTION_NAME}?health" 2>/dev/null || echo '{}')
-          live_ver=$(echo "$live_json" | grep -o '"version":"[^"]*"' | head -1 | sed 's/"version":"//;s/"//')
+          # `|| true` inside the substitution: on a FIRST deploy the health route does not
+          # exist, live_json is '{}', and grep exits 1 for finding nothing. Under pipefail
+          # that fails the assignment, and set -e then kills the step before reaching the
+          # "first deploy?" branch immediately below -- which exists to handle exactly this
+          # case. An empty live_ver is the signal, not an error.
+          live_ver=$(echo "$live_json" | grep -o '"version":"[^"]*"' | head -1 | sed 's/"version":"//;s/"//' || true)
           if [ -z "$live_ver" ]; then
             echo "Health endpoint unreachable (first deploy?). Skipping version bump check."
           elif [ "$file_ver" = "$live_ver" ]; then
