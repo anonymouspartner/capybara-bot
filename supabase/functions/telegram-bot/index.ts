@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v82";
+const BUILD_VERSION = "v83";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -964,13 +964,19 @@ async function transcribeWithWhisper(audioBlob: Blob, user: any): Promise<Whispe
 }
 
 // The schema deliberately no longer asks for "grammar" (a list of grammatical features
-// like "instrumental case", "imperfective aspect"). Those rows were written on every
-// annotation and read by nothing: the only consumer of message_annotations anywhere is
-// annotation_type = 'vocabulary' (the vocabulary view). Output tokens are ~70% of the
-// cost of an annotation pass, and that array was the largest field nobody looked at.
-// Existing 'grammar' rows are left in place and the CHECK constraint still permits the
-// type, so restoring it is a prompt change with no migration. langMeta.grammarExamples is
-// kept for the same reason.
+// like "instrumental case", "imperfective aspect"), nor for "idioms" and "register".
+// Those rows were written on every annotation and read by nothing: the only consumer of
+// message_annotations anywhere is annotation_type = 'vocabulary' (the vocabulary view).
+// Output tokens are ~70% of the cost of an annotation pass, and those were the fields
+// nobody looked at. Existing rows are left in place and the CHECK constraint still
+// permits all three types, so restoring any of them is a prompt change with no
+// migration. langMeta.grammarExamples is kept for the same reason.
+//
+// Dropping "register" removed something load-bearing that it had been providing by
+// accident: the wrong-script early return used to answer {"vocabulary":[],...,
+// "register":"neutral"}, and that register row was what left a language-keyed marker
+// behind so backfill_pending_sides' anti-join could retire the side. annotateMessage now
+// writes the fallback row explicitly whenever a pass yields no vocabulary.
 function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, parallelText?: string): string {
   const langName = langMeta(language).englishName;
   const otherLangName = langMeta(otherLanguage).englishName;
@@ -986,8 +992,8 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
       `(e.g. if "afraid" is rendered as a form of "боятися", lemma_translation is "боятися", never "наляканий").`
     : "";
   const oppositeScript = langMeta(language).script === "cyrillic"
-    ? `If the MAJORITY of letter characters in the input are Latin-script, return {"vocabulary":[],"idioms":[],"register":"neutral"}.`
-    : `If the MAJORITY of letter characters in the input are Cyrillic-script, return {"vocabulary":[],"idioms":[],"register":"neutral"}.`;
+    ? `If the MAJORITY of letter characters in the input are Latin-script, return {"vocabulary":[]}.`
+    : `If the MAJORITY of letter characters in the input are Cyrillic-script, return {"vocabulary":[]}.`;
   return (
     `Analyze the ${langName} text and return a JSON object with these keys:\n` +
     `- "vocabulary": array of {lemma, part_of_speech, gloss, lemma_translation} for content words only.\n` +
@@ -999,9 +1005,7 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
     `    - One word only when possible; a short phrase if the language has no single-word equivalent.\n` +
     `    - The gloss and lemma_translation may be identical; that's fine \u2014 return both.\n` +
     `  * SKIP: prepositions, conjunctions, particles, interjections, pronouns, numerals, proper nouns (names of people/places).\n` +
-    `  * For homographs (same lemma, different part of speech), return separate entries.\n` +
-    `- "idioms": array of any idiomatic expressions\n` +
-    `- "register": one of "formal", "informal", "neutral"\n\n` +
+    `  * For homographs (same lemma, different part of speech), return separate entries.\n\n` +
     `${oppositeScript}${senseAnchor}\n` +
     `Output ONLY raw JSON. Do NOT wrap in markdown code fences. Do NOT include any preamble or commentary.`
   );
@@ -1166,15 +1170,14 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
     if (!v.lemma) continue;
     annotations.push({ message_id: messageId, annotation_type: "vocabulary", annotation_value: v.lemma, details: { ...v, language } });
   }
-  for (const i of parsed.idioms ?? []) {
-    annotations.push({ message_id: messageId, annotation_type: "idiom", annotation_value: i, details: { language } });
-  }
-  if (parsed.register) {
-    annotations.push({ message_id: messageId, annotation_type: "register", annotation_value: parsed.register, details: { language } });
-  }
-  if (annotations.length > 0) {
-    await supabase.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
-  }
+  // A pass that yields no vocabulary -- the wrong-script early return, or a side whose
+  // words are all skipped as function words -- must still leave a language-keyed row
+  // behind. Without one, backfill_pending_sides' anti-join never recognizes the side as
+  // done and /backfill loops on it forever (the failure 20260621010000 was written to
+  // fix). "register": "neutral" used to supply that marker as a side effect; now that the
+  // prompt no longer asks for it, the fallback row is written explicitly.
+  if (annotations.length === 0) { await writeFallbackRow(); return; }
+  await supabase.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
 }
 
 async function sendMessage(chatId: number, text: string, parseMode?: string, replyMarkup?: any) {
