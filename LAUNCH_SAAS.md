@@ -7,28 +7,51 @@ webhook secrets are created by hand.
 Target project: the **commercial** Supabase project (not the personal one). Its schema is
 already applied — `supabase/migrations/` followed by `supabase/migrations-saas/`.
 
+> **The first instance is already launched.** It is on live Stripe with two plans
+> (Standard $10/mo, 750 messages; Pro $39/mo, 2,500) and the health route reports
+> `stripeMode: live`. Steps 1–8 below are written for someone doing this from zero, and
+> that is still how to read them — but if you are operating the existing instance, the
+> section you want is [Step 8](#step-8--go-live) for the test→live cutover and
+> [Operating notes](#operating-notes) for everything after.
+>
+> Two things learned doing it for real, both now written into the steps: the redirect URL
+> belongs in the Payment Link's *redirect* field and nowhere else, and **every check in
+> this runbook passes identically with test secrets**, so `stripeMode` is the only one
+> that tells you the cutover actually happened.
+
 ---
 
 ## What the customer experiences
 
 ```
-Payment Link  →  Stripe Checkout  →  success_url hits stripe-billing
-                                          │  verifies the session, creates the tenant
-                                          ▼
-                                     302 → t.me/<bot>?start=<code>
-                                          │  Telegram sends "/start <code>"
-                                          ▼
-                        3 taps: native lang, learning lang, he/she
+stranger messages the bot  →  intro + plan buttons, in THEIR language
                                           │
-                                          ▼
-                                   invite link for their partner
-                                          │  partner taps, picks he/she
-                                          ▼
-                                     both set up, code retired
+                     ┌────────────────────┴────────────────────┐
+                     ▼                                         ▼
+              "Try it free"                              Standard / Pro
+        5 messages, real translation                    Stripe Checkout
+        + a real flashcard on the 1st                          │
+                     │                                         ▼
+                     └───── paywall ─────►  success_url hits stripe-billing
+                                                   │  verifies session, creates tenant
+                                                   ▼
+                                              302 → t.me/<bot>?start=<code>
+                                                   │  Telegram sends "/start <code>"
+                                                   ▼
+                                 3 taps: native lang, learning lang, he/she
+                                                   │
+                                                   ▼
+                                        invite link for their partner
+                                                   │  partner taps, picks he/she
+                                                   ▼
+                                          both set up, code retired
 ```
 
-No website, no email, no manual step from you. The only thing you hand out is the Payment
-Link.
+No website, no email, no manual step from you. **You do not hand out a payment link** —
+people find the bot, and the bot sells. The link exists as a button inside the intro, so
+the pitch and the trial come first. Everything the customer reads on this path is in their
+own language, resolved from Telegram's `language_code` before they have told the bot
+anything.
 
 ---
 
@@ -62,8 +85,14 @@ their own.
 > Build everything with the toggle ON. Creating it in the wrong mode is harmless but
 > leaves half the configuration in the world you are not using.
 
-1. Create one product, **two recurring monthly prices** — Capybara Standard and Capybara Pro.
-   Copy both price ids (`price_…`).
+1. Create **two products, one recurring monthly price each** — Capybara Standard and
+   Capybara Pro. Copy both price ids (`price_…`).
+
+   Two products rather than one with two prices, because the customer sees the product
+   name on the Checkout page and the receipt, and "Capybara Standard" is more use to them
+   than "Capybara — $10 plan". **Prices are immutable**: to change an amount you create a
+   new price and archive the old one, which is why the amount is worth settling before
+   this step rather than after.
 2. Decide the quotas. Defaults are **750** (Standard) and **2500** (Pro); the
    `QUOTA_*` secrets below override them.
 
@@ -412,7 +441,35 @@ route out: owner-only, two-step, and it cancels the subscription, removes the St
 audio, then deletes the tenant row (which cascades to every table). That order is
 deliberate — if anything fails partway, the customer has stopped being charged.
 
+## Language coverage
+
+Everything a customer reads — the intro, the trial, onboarding, `/help`, `/billing`, quota
+messages, the study commands, errors — is translated into all eight registry languages
+(`supabase/functions/telegram-bot-saas/strings.ts`). The reader's language is resolved from
+their registered pair, else their trial row, else Telegram's own `language_code`, so a
+stranger's first screen is already right.
+
+**English and Ukrainian are reviewed. Spanish, French, German, Italian, Portuguese and
+Polish are machine-written and unreviewed** — nobody who speaks them has read the copy.
+They are almost certainly serviceable and may contain phrasing a native speaker would not
+use. That matters more here than on most products, because this one sells language
+quality. If you acquire customers in one of those six, getting a speaker to read the file
+is cheap and worth doing; the fix is one file and no migration.
+
+A *missing* translation degrades safely — `t()` falls back to English and warns. A *wrong*
+one does not announce itself, which is why the provenance is recorded rather than assumed.
+
 ## Known gaps
+
+- **Quota enforcement has never been exercised.** The operator bypasses the gate, so
+  nobody has actually hit a cap. Testing it means a throwaway tenant with `message_quota`
+  lowered to a couple of messages — worth doing before a customer finds the edge first.
+
+- **Deleting a tenant by SQL orphans its voice files.** `storage.protect_delete()` refuses
+  direct deletes from `storage.objects`, and only `/delete_account` sweeps the bucket.
+  Removing a tenant by hand therefore leaves its audio behind, and for a real customer
+  that is a retention problem rather than housekeeping. Use `/delete_account` for anyone
+  real; if you must use SQL, clear `voice-messages/<tenant_id>/` in the dashboard after.
 
 - **No card-expiry warning.** A failed payment now messages the couple in Telegram, but
   nothing warns them *before* a card expires. Stripe can email that on its own.
