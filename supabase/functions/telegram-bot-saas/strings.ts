@@ -1801,6 +1801,53 @@ export const STRINGS: Record<string, Row> = {
     pl: "Nie udało się tego dokończyć — nic nie zostało zmienione. Spróbuj za chwilę.",
   },
 
+
+  // ---- Promotion codes -------------------------------------------------------
+
+  promo_usage: {
+    en: "Send the code with the command, like this:\n\n<code>/promo FIRSTMONTH</code>",
+    uk: "Надішли код разом із командою, ось так:\n\n<code>/promo FIRSTMONTH</code>",
+    es: "Envía el código junto al comando, así:\n\n<code>/promo FIRSTMONTH</code>",
+    fr: "Envoie le code avec la commande, comme ceci :\n\n<code>/promo FIRSTMONTH</code>",
+    de: "Schick den Code mit dem Befehl, so:\n\n<code>/promo FIRSTMONTH</code>",
+    it: "Manda il codice insieme al comando, così:\n\n<code>/promo FIRSTMONTH</code>",
+    pt: "Envia o código com o comando, assim:\n\n<code>/promo FIRSTMONTH</code>",
+    pl: "Wyślij kod razem z komendą, o tak:\n\n<code>/promo FIRSTMONTH</code>",
+  },
+
+  promo_bad_shape: {
+    en: "That doesn't look like a code. They're letters and numbers, no spaces — check it and try again.",
+    uk: "Це не схоже на код. Вони складаються з літер і цифр, без пробілів — перевір і спробуй ще раз.",
+    es: "Eso no parece un código. Son letras y números, sin espacios — compruébalo e inténtalo otra vez.",
+    fr: "Ça ne ressemble pas à un code. Ce sont des lettres et des chiffres, sans espaces — vérifie et réessaie.",
+    de: "Das sieht nicht nach einem Code aus. Buchstaben und Zahlen, keine Leerzeichen — prüf ihn und versuch es nochmal.",
+    it: "Non sembra un codice. Sono lettere e numeri, senza spazi — controlla e riprova.",
+    pt: "Isso não parece um código. São letras e números, sem espaços — verifica e tenta outra vez.",
+    pl: "To nie wygląda na kod. Kody to litery i cyfry, bez spacji — sprawdź i spróbuj ponownie.",
+  },
+
+  promo_applied: {
+    en: (v: any) => `Code <b>${v.code}</b> is on the buttons below — you'll see the discount on the payment page before you pay anything. If it isn't valid, the payment page will say so.`,
+    uk: (v: any) => `Код <b>${v.code}</b> уже в кнопках нижче — знижку буде видно на сторінці оплати ще до того, як ти щось заплатиш. Якщо код недійсний, сторінка оплати про це скаже.`,
+    es: (v: any) => `El código <b>${v.code}</b> está en los botones de abajo — verás el descuento en la página de pago antes de pagar nada. Si no es válido, la página te lo dirá.`,
+    fr: (v: any) => `Le code <b>${v.code}</b> est dans les boutons ci-dessous — tu verras la réduction sur la page de paiement avant de payer quoi que ce soit. S'il n'est pas valable, la page te le dira.`,
+    de: (v: any) => `Der Code <b>${v.code}</b> steckt in den Buttons unten — den Rabatt siehst du auf der Bezahlseite, bevor du irgendetwas zahlst. Ist er ungültig, sagt die Seite das.`,
+    it: (v: any) => `Il codice <b>${v.code}</b> è nei pulsanti qui sotto — vedrai lo sconto sulla pagina di pagamento prima di pagare qualsiasi cosa. Se non è valido, la pagina te lo dirà.`,
+    pt: (v: any) => `O código <b>${v.code}</b> está nos botões abaixo — vais ver o desconto na página de pagamento antes de pagares seja o que for. Se não for válido, a página diz.`,
+    pl: (v: any) => `Kod <b>${v.code}</b> jest w przyciskach poniżej — zniżkę zobaczysz na stronie płatności, zanim cokolwiek zapłacisz. Jeśli kod jest nieważny, strona to pokaże.`,
+  },
+
+  promo_existing_account: {
+    en: "You already have a subscription, so a code goes in through the billing portal rather than a new checkout — otherwise you'd end up paying for two. Open /management and tap Manage subscription.",
+    uk: "У тебе вже є підписка, тож код вводиться через портал оплати, а не через нову оплату — інакше ти платив(ла) би двічі. Відкрий /management і натисни «Керувати підпискою».",
+    es: "Ya tienes una suscripción, así que el código se aplica desde el portal de facturación y no en un pago nuevo — si no, acabarías pagando dos. Abre /management y pulsa Gestionar suscripción.",
+    fr: "Tu as déjà un abonnement : le code passe par le portail de facturation, pas par un nouveau paiement — sinon tu en paierais deux. Ouvre /management et appuie sur Gérer l'abonnement.",
+    de: "Du hast schon ein Abo, also läuft ein Code über das Abrechnungsportal statt über einen neuen Checkout — sonst zahlst du doppelt. Öffne /management und tipp auf Abo verwalten.",
+    it: "Hai già un abbonamento, quindi il codice si inserisce dal portale di fatturazione e non con un nuovo pagamento — altrimenti ne pagheresti due. Apri /management e tocca Gestisci abbonamento.",
+    pt: "Já tens uma subscrição, por isso o código entra pelo portal de faturação e não num pagamento novo — senão acabavas a pagar duas. Abre /management e toca em Gerir subscrição.",
+    pl: "Masz już subskrypcję, więc kod wpisuje się w portalu płatności, a nie przy nowej płatności — inaczej płaciłbyś za dwie. Otwórz /management i dotknij Zarządzaj subskrypcją.",
+  },
+
 };
 
 // Looks up a string. Falls back to English on a missing translation and warns, so a gap

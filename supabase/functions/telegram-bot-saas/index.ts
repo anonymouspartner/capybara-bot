@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v25";
+const BUILD_VERSION = "saas-v26";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -462,6 +462,27 @@ async function handleUpdate(update: any) {
     // gets translated. Any /start still here has already failed parseStartPayload above,
     // so a malformed setup code lands on the intro rather than being translated too.
     const cmd = (msg.text ?? "").trim();
+
+    // /promo <code>. Deliberately NOT advertised in the intro or the "/" menu: a visible
+    // promo box invites code-hunting and teaches everyone that the list price is optional.
+    // It is here for people who were handed a code, and it turns "find the promotion field
+    // at checkout" into a link that already has the discount on it.
+    if (isCmd(cmd, "promo", "code")) {
+      const lang = viewerLang(msg.from);
+      const arg = cmd.replace(/^\/(promo|code)(@\S+)?\s*/, "").trim();
+      if (!arg) {
+        await sendMessage(msg.chat.id, t(lang, "promo_usage"), "HTML");
+        return;
+      }
+      if (!looksLikePromoCode(arg)) {
+        await sendMessage(msg.chat.id, t(lang, "promo_bad_shape"), "HTML");
+        return;
+      }
+      const withCode = await plansMessage(lang, t(lang, "promo_applied", { code: escapeHtml(arg) }), arg);
+      await sendMessage(msg.chat.id, withCode.text, "HTML", withCode.keyboard);
+      return;
+    }
+
     if (isCmd(cmd, "start", "plans", "subscribe", "pricing")) {
       // Nothing is known about this person yet, so the language comes from Telegram's own
       // UI setting. That is the whole point: a Ukrainian speaker's very first screen is in
@@ -508,7 +529,7 @@ async function handleUpdate(update: any) {
   // ones. /recap and /note are NOT here: /recap synthesises and /note classifies then
   // embeds, so both genuinely spend.
   if (!isSuperadmin(msg.from?.id) &&
-      !isCmd(msg.text ?? "", "management", "billing", "plans", "subscribe", "pricing", "delete_account", "export",
+      !isCmd(msg.text ?? "", "management", "billing", "plans", "subscribe", "pricing", "promo", "code", "delete_account", "export",
              "leave", "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
@@ -558,6 +579,7 @@ async function handleUpdate(update: any) {
     // TRANSLATED and forwarded to their partner, costing them a quota message. For
     // someone who already subscribes, "plans and pricing" is what /billing answers.
     { match: t => isCmd(t, "management", "billing", "plans", "subscribe", "pricing"),   handle: handleManagement },
+    { match: t => isCmd(t, "promo", "code"),                                            handle: handlePromo },
     { match: t => isCmd(t, "delete_account"),                                           handle: handleDeleteAccount },
     { match: t => isCmd(t, "leave"),                                                    handle: handleLeave },
     { match: t => t === "/help",                                                        handle: handleHelp },
@@ -786,12 +808,36 @@ function deckCodes(user: any): string {
   return `${user.native_language}|${user.learning_language}`;
 }
 
-function planKeyboard(lang: Lang, prices: Record<PlanKey, string>, includeTrial: boolean) {
+// Stripe substitutes a promotion code into Checkout from the link itself, via
+// prefilled_promo_code. That is strictly better than telling someone to find the "add
+// promotion code" box: the discount is visible on the first screen they see, so they never
+// have to trust that it applied, and there is no step to forget.
+//
+// This only works if allow_promotion_codes is enabled on the Payment Link -- otherwise
+// Stripe renders no promotion field at all and the parameter is silently dropped. That is
+// a dashboard setting, not something this build can set, and it is the reason a correctly
+// created coupon can still be impossible to redeem.
+function withPromo(url: string, promo?: string | null): string {
+  if (!promo) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}prefilled_promo_code=${encodeURIComponent(promo)}`;
+}
+
+function planKeyboard(lang: Lang, prices: Record<PlanKey, string>, includeTrial: boolean, promo?: string | null) {
   const rows: any[] = [];
   if (includeTrial) rows.push([{ text: t(lang, "btn_try_free"), callback_data: "tr|begin" }]);
-  if (PAYMENT_LINK_STANDARD) rows.push([{ text: `Standard — ${prices.standard}`, url: PAYMENT_LINK_STANDARD }]);
-  if (PAYMENT_LINK_ULTIMATE) rows.push([{ text: `Pro — ${prices.ultimate}`, url: PAYMENT_LINK_ULTIMATE }]);
+  if (PAYMENT_LINK_STANDARD) rows.push([{ text: `Standard — ${prices.standard}`, url: withPromo(PAYMENT_LINK_STANDARD, promo) }]);
+  if (PAYMENT_LINK_ULTIMATE) rows.push([{ text: `Pro — ${prices.ultimate}`, url: withPromo(PAYMENT_LINK_ULTIMATE, promo) }]);
   return rows.length ? { inline_keyboard: rows } : undefined;
+}
+
+// Deliberately permissive: this checks the SHAPE, not the validity. Stripe is the only
+// authority on whether a code exists, is still within its redemption limit, and applies to
+// the plan being bought -- and it answers all of that at Checkout, on the screen the
+// customer is already looking at. Calling the API here to pre-validate would add a network
+// round trip, a second failure mode, and a way for the bot to say "invalid" about a code
+// that is actually fine. The only job here is to keep junk out of a URL.
+function looksLikePromoCode(raw: string): boolean {
+  return /^[A-Za-z0-9_-]{3,64}$/.test(raw);
 }
 
 // The message a stranger gets for saying anything at all. One screen: what it is, what
@@ -806,14 +852,14 @@ async function introMessage(lang: Lang): Promise<{ text: string; keyboard: any }
 }
 
 // Shown when the allowance runs out, and by /plans.
-async function plansMessage(lang: Lang, prefix?: string): Promise<{ text: string; keyboard: any }> {
+async function plansMessage(lang: Lang, prefix?: string, promo?: string | null): Promise<{ text: string; keyboard: any }> {
   const prices = await stripePriceText();
   const body = plansConfigured()
     ? `${planComparison(lang, prices)}\n\n${t(lang, "plans_after_paying")}`
     : t(lang, "plans_not_open");
   return {
     text: `${prefix ? prefix + "\n\n" : ""}${body}`,
-    keyboard: planKeyboard(lang, prices, false),
+    keyboard: planKeyboard(lang, prices, false, promo),
   };
 }
 
@@ -1312,6 +1358,15 @@ function planLabel(plan: string | null | undefined): string {
 // ever sent to the OWNER: the partner is a member of the couple, not the account holder,
 // and giving them a cancel button for someone else's card would be a support incident
 // waiting to happen.
+// A code from someone who already has an account -- most often a lapsed subscriber coming
+// back. Their route is the Stripe portal rather than a Payment Link, and the portal takes
+// promotion codes on its own screens, so this points them there instead of handing them a
+// link that would start a SECOND subscription alongside the one they already have.
+async function handlePromo(msg: any, user: any): Promise<void> {
+  const lang = viewerLang(msg.from, user);
+  await sendMessage(msg.chat.id, t(lang, "promo_existing_account"), "HTML");
+}
+
 // ---------------------------------------------------------------------------- /management
 //
 // Renamed from /billing, because it stopped being only about billing: it is where you see
