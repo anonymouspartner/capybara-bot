@@ -113,14 +113,12 @@ their own.
 | `SUPERADMIN_TELEGRAM_ID` | bot | **You.** Gates deploys, the grinds, and diagnostics. Not a customer |
 | `STRIPE_SECRET_KEY` | billing + bot | `sk_test_…` first. Also used by `/delete_account` to cancel the subscription |
 | `STRIPE_WEBHOOK_SECRET` | billing | `whsec_…`, from step 5 |
-| `STRIPE_PRICE_STANDARD` | billing | `price_…` |
-| `STRIPE_PRICE_ULTIMATE` | billing | `price_…` |
-| `QUOTA_STANDARD` | **bot + billing** | Messages/period. Defaults to 750. Billing provisions it, the bot advertises it |
-| `QUOTA_ULTIMATE` | **bot + billing** | Messages/period. Defaults to 2500. Same |
+| `STRIPE_PRICE_STANDARD` | **bot + billing** | `price_…`. Billing maps it to a plan; the bot reads the live amount so the displayed price always matches what is charged |
+| `STRIPE_PRICE_ULTIMATE` | **bot + billing** | Same |
 | `STRIPE_PAYMENT_LINK_STANDARD` | bot | The Payment Link from step 2. Without it the intro shows no Standard button |
 | `STRIPE_PAYMENT_LINK_ULTIMATE` | bot | Same, for Ultimate |
-| `STRIPE_PRICE_STANDARD` | **bot** + billing | The bot reads the live amount so displayed price always matches what is charged |
-| `STRIPE_PRICE_ULTIMATE` | **bot** + billing | Same |
+| `QUOTA_STANDARD` | **bot + billing** | Messages/period. Defaults to 750. Billing provisions it, the bot advertises it |
+| `QUOTA_ULTIMATE` | **bot + billing** | Messages/period. Defaults to 2500. Same |
 
 > **Changing a quota means redeploying BOTH functions.** `stripe-billing` provisions the
 > number; `telegram-bot-saas` advertises it in the intro. They read the same two secrets,
