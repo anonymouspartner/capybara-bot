@@ -28,7 +28,12 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-const BUILD_VERSION = "billing-v9";
+// v10 carries no code change. It exists to force a cold start for the live-mode Stripe
+// cutover: every secret below is read once at module scope, so a warm isolate keeps the
+// key it booted with. Setting a secret does not reliably evict those isolates, and a
+// stale test key here would fail signature verification on real webhooks -- a paying
+// customer's tenant would silently never be provisioned. A deploy replaces them all.
+const BUILD_VERSION = "billing-v10";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
