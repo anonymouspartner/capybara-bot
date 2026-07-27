@@ -165,6 +165,19 @@ jobs:
                 || { echo "FAIL: botUsernameConfigured not true (TELEGRAM_BOT_USERNAME)"; exit 1; }
               echo "$body" | grep -q '"pricesConfigured":true' \
                 || { echo "FAIL: pricesConfigured not true (STRIPE_PRICE_STANDARD / STRIPE_PRICE_ULTIMATE)"; exit 1; }
+              # Mode is REPORTED, not asserted. A test-mode instance is legitimate -- it is
+              # how the flow gets rehearsed before launch -- so failing on it would block
+              # the normal path. What is not legitimate is believing you went live when you
+              # did not: the three checks above pass identically with test secrets, which is
+              # how a go-live once completed fully green while still taking 4242 4242 4242
+              # 4242 and provisioning tenants against test objects. Printed loudly so the
+              # mismatch is visible in the run that caused it.
+              mode=$(echo "$body" | grep -o '"stripeMode":"[^"]*"' | sed 's/.*://;s/"//g')
+              tails=$(echo "$body" | grep -o '"priceTails":{[^}]*}')
               echo "Smoke test passed: version ${ver}, Stripe fully configured."
+              echo "  >> Stripe mode: ${mode:-unreported}   ${tails:-}"
+              [ "$mode" = "live" ] && echo "  >> LIVE MODE: real cards, real money." || true
+              [ "$mode" = "test" ] && echo "  >> TEST MODE: test cards only. Not selling to anyone yet." || true
+              [ "$mode" = "unknown" ] && echo "  >> WARNING: STRIPE_SECRET_KEY has neither sk_live_ nor sk_test_ prefix." || true
               ;;
           esac

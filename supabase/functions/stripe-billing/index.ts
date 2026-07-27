@@ -28,12 +28,18 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-// v10 carries no code change. It exists to force a cold start for the live-mode Stripe
-// cutover: every secret below is read once at module scope, so a warm isolate keeps the
-// key it booted with. Setting a secret does not reliably evict those isolates, and a
-// stale test key here would fail signature verification on real webhooks -- a paying
-// customer's tenant would silently never be provisioned. A deploy replaces them all.
-const BUILD_VERSION = "billing-v10";
+// Every secret below is read once at module scope, so a warm isolate keeps the key it
+// booted with; setting a secret does not reliably evict those isolates. That is why a
+// secrets change is always followed by a deploy, and why BUILD_VERSION moves even when
+// the code does not.
+//
+// v11 adds stripeMode and priceTails to the health route. Prompted by a go-live that
+// reported fully green -- stripeConfigured, pricesConfigured, botUsernameConfigured all
+// true -- while every Stripe secret was still the test one, because those flags test
+// PRESENCE and a test key is just as present as a live key. A test card then bought a
+// real-looking subscription and provisioned a tenant. The health route now says which
+// world it is in, so "did the secrets actually change" is answerable without a card.
+const BUILD_VERSION = "billing-v11";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -426,6 +432,29 @@ Deno.serve(async (req) => {
       stripeConfigured: Boolean(STRIPE_SECRET_KEY) && Boolean(STRIPE_WEBHOOK_SECRET),
       botUsernameConfigured: Boolean(TELEGRAM_BOT_USERNAME),
       pricesConfigured: Boolean(PRICE_STANDARD) && Boolean(PRICE_ULTIMATE),
+      // Which Stripe WORLD this build is wired to. stripeConfigured above answers only
+      // "is a key present", and a test key satisfies it exactly as well as a live one --
+      // so a go-live where the secrets never actually changed reports fully green while
+      // still taking 4242 4242 4242 4242 and provisioning real tenants against test
+      // objects. That happened. This is the field that contradicts it.
+      //
+      // Derived from the key's public prefix, never its body: `sk_live_` / `sk_test_` is
+      // how Stripe itself labels the mode, and it is not the secret. "unknown" means a
+      // key is set but has neither prefix -- worth surfacing rather than guessing.
+      stripeMode: !STRIPE_SECRET_KEY
+        ? "unset"
+        : STRIPE_SECRET_KEY.startsWith("sk_live_")
+          ? "live"
+          : STRIPE_SECRET_KEY.startsWith("sk_test_")
+            ? "test"
+            : "unknown",
+      // A price id is not a credential -- it appears in every Checkout URL. Showing the
+      // last six makes a stale secret identifiable at a glance without publishing the
+      // whole mapping, which is the specific failure that let a test price through.
+      priceTails: {
+        standard: PRICE_STANDARD ? PRICE_STANDARD.slice(-6) : null,
+        ultimate: PRICE_ULTIMATE ? PRICE_ULTIMATE.slice(-6) : null,
+      },
       // The EFFECTIVE quotas -- code defaults unless a QUOTA_* secret overrides them.
       // Reported because the override is otherwise invisible: a stale secret silently
       // keeps provisioning new tenants at an old cap, a deploy that changes the defaults
