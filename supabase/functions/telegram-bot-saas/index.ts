@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v14";
+const BUILD_VERSION = "saas-v15";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -727,7 +727,7 @@ function planKeyboard(prices: Record<PlanKey, string>, includeTrial: boolean) {
   const rows: any[] = [];
   if (includeTrial) rows.push([{ text: "✨ Try it free", callback_data: "tr|begin" }]);
   if (PAYMENT_LINK_STANDARD) rows.push([{ text: `Standard — ${prices.standard}`, url: PAYMENT_LINK_STANDARD }]);
-  if (PAYMENT_LINK_ULTIMATE) rows.push([{ text: `Ultimate — ${prices.ultimate}`, url: PAYMENT_LINK_ULTIMATE }]);
+  if (PAYMENT_LINK_ULTIMATE) rows.push([{ text: `Pro — ${prices.ultimate}`, url: PAYMENT_LINK_ULTIMATE }]);
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
@@ -739,7 +739,7 @@ function planComparison(prices: Record<PlanKey, string>): string {
   return (
     `*Standard* — ${prices.standard}\n` +
     `${PLAN_QUOTA.standard.toLocaleString()} messages/month. Flashcards from what *you* write.\n\n` +
-    `*Ultimate* — ${prices.ultimate}\n` +
+    `*Pro* — ${prices.ultimate}\n` +
     `${PLAN_QUOTA.ultimate.toLocaleString()} messages/month. Flashcards from *both* sides — ` +
     `what you write and what you read. Roughly double the deck.\n\n` +
     `One subscription covers you and a language partner.`
@@ -1223,9 +1223,15 @@ async function finishOnboarding(
 //
 // Unknown slugs fall through capitalized rather than being hidden, so a plan added later
 // still reads sensibly before anyone remembers to update this.
+//
+// The KEY is the internal plan slug and matches tenants.plan, the QUOTA_* / STRIPE_PRICE_*
+// secret names, and planForPrice in stripe-billing. "ultimate" is kept as that slug even
+// though the tier is sold as Pro: renaming it would mean a data migration over
+// tenants.plan plus re-entering three secrets, to change something no customer ever sees.
+// The VALUE is what customers see, and must match the Stripe product name exactly.
 const PLAN_LABELS: Record<string, string> = {
-  standard: "Capybara",
-  ultimate: "Capybara Ultimate",
+  standard: "Capybara Standard",
+  ultimate: "Capybara Pro",
   comped: "Complimentary",
 };
 function planLabel(plan: string | null | undefined): string {

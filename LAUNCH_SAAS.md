@@ -62,25 +62,25 @@ their own.
 > Build everything with the toggle ON. Creating it in the wrong mode is harmless but
 > leaves half the configuration in the world you are not using.
 
-1. Create one product, **two recurring monthly prices** — Capybara and Capybara Ultimate.
+1. Create one product, **two recurring monthly prices** — Capybara Standard and Capybara Pro.
    Copy both price ids (`price_…`).
-2. Decide the quotas. Defaults are **750** (Standard) and **2500** (Ultimate); the
+2. Decide the quotas. Defaults are **750** (Standard) and **2500** (Pro); the
    `QUOTA_*` secrets below override them.
 
    Calibration: your own traffic is ~1,650 messages/month, which cost about **$25/month**
    before any of the annotation work. The rate now is **~$0.007/message on Standard** and
-   **~$0.012 on Ultimate** (which annotates both sides) — calibrated against real spend,
+   **~$0.012 on Pro** (which annotates both sides) — calibrated against real spend,
    since the cost model came in 20% under the actual bill. A tenant sitting at the cap
-   therefore costs roughly **$5.25** (Standard) or **$30.00** (Ultimate) in inference.
+   therefore costs roughly **$5.25** (Standard) or **$30.00** (Pro) in inference.
 
    Add Stripe (2.9% + $0.30 per charge) and price above the *cap* cost rather than the
    average — a quota exists so customers may reach it. That puts the break-even floor at
-   about **$5.72** (Standard, one annotation pass) and **$31.20** (Ultimate, two);
+   about **$5.72** (Standard, one annotation pass) and **$31.20** (Pro, two);
    $10–12 and $39 clear them. Supabase adds nothing while the project is on the free tier
    (see "Storage and the free tier" below).
 
-   Note the asymmetry: Ultimate's floor is high because it buys twice the annotation, not
-   just more messages. Do not discount Ultimate below ~$32 without also revisiting what it
+   Note the asymmetry: Pro's floor is high because it buys twice the annotation, not
+   just more messages. Do not discount Pro below ~$32 without also revisiting what it
    includes.
 
    Re-derive `$/message` from the Anthropic console after a month of real traffic rather
@@ -114,11 +114,11 @@ their own.
 | `STRIPE_SECRET_KEY` | billing + bot | `sk_test_…` first. Also used by `/delete_account` to cancel the subscription |
 | `STRIPE_WEBHOOK_SECRET` | billing | `whsec_…`, from step 5 |
 | `STRIPE_PRICE_STANDARD` | **bot + billing** | `price_…`. Billing maps it to a plan; the bot reads the live amount so the displayed price always matches what is charged |
-| `STRIPE_PRICE_ULTIMATE` | **bot + billing** | Same |
+| `STRIPE_PRICE_ULTIMATE` | **bot + billing** | Same, for the Pro tier |
 | `STRIPE_PAYMENT_LINK_STANDARD` | bot | The Payment Link from step 2. Without it the intro shows no Standard button |
-| `STRIPE_PAYMENT_LINK_ULTIMATE` | bot | Same, for Ultimate |
+| `STRIPE_PAYMENT_LINK_ULTIMATE` | bot | Same, for the Pro tier |
 | `QUOTA_STANDARD` | **bot + billing** | Messages/period. Defaults to 750. Billing provisions it, the bot advertises it |
-| `QUOTA_ULTIMATE` | **bot + billing** | Messages/period. Defaults to 2500. Same |
+| `QUOTA_ULTIMATE` | **bot + billing** | Messages/period. Defaults to 2500. Slug stays `ULTIMATE`; the tier is sold as **Pro** |
 
 > **Changing a quota means redeploying BOTH functions.** `stripe-billing` provisions the
 > number; `telegram-bot-saas` advertises it in the intro. They read the same two secrets,
@@ -236,9 +236,9 @@ cost you roughly `quota × $0.007`.
 | | quota | annotates | ~$/message |
 |---|---|---|---|
 | Standard | 750 | what you write | **$0.007** |
-| Ultimate | 2,500 | both sides | **$0.012** |
+| Pro | 2,500 | both sides | **$0.012** |
 
-So a tenant at cap costs about **$5.25** (Standard) or **$30.00** (Ultimate).
+So a tenant at cap costs about **$5.25** (Standard) or **$30.00** (Pro).
 
 Two places enforce it and they must agree, or the distinction is fiction: `annotatesBothSides`
 in the bot, and the plan gate on the translation arm of `backfill_pending_sides`
