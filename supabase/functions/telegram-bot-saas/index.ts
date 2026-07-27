@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v26";
+const BUILD_VERSION = "saas-v27";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -529,7 +529,7 @@ async function handleUpdate(update: any) {
   // ones. /recap and /note are NOT here: /recap synthesises and /note classifies then
   // embeds, so both genuinely spend.
   if (!isSuperadmin(msg.from?.id) &&
-      !isCmd(msg.text ?? "", "management", "billing", "plans", "subscribe", "pricing", "promo", "code", "delete_account", "export",
+      !isCmd(msg.text ?? "", "management", "billing", "plans", "subscribe", "pricing", "promo", "code", "delete_account", "export", "mistakes",
              "leave", "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
@@ -586,7 +586,8 @@ async function handleUpdate(update: any) {
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
-    { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
+    { match: t => isCmd(t, "export"),                                                   handle: handleExport },
+    { match: t => isCmd(t, "mistakes"),                                                 handle: handleMistakes },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
     { match: t => isCmd(t, "backfill_grammar"),                                          handle: handleBackfillGrammar },
     { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
@@ -3073,7 +3074,8 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "vocab", description: "Top unlearned words in each deck" },
   { command: "learn", description: "Add a word to study (or: top N)" },
   { command: "forget", description: "Remove a word from a deck" },
-  { command: "export", description: "Download both decks as CSV for Anki" },
+  { command: "export", description: "Download both decks as CSV for Anki (or: new)" },
+  { command: "mistakes", description: "Review your recent grammar mistakes" },
   { command: "capybara", description: "Toggle grammar help for your learning language" },
   { command: "ask", description: "Ask your shared conversation memory" },
   { command: "note", description: "Save a private note to memory" },
@@ -3488,16 +3490,57 @@ function csvEscape(value: string | null | undefined): string {
 // before retrying an update: a retry would re-run the whole build and deliver the file
 // twice. The user gets an immediate acknowledgement instead of a silent pause.
 async function handleExport(msg: any, user: any) {
+  // "/export new" limits the file to cards added since the last completed export. Anki
+  // matches on the first field and UPDATES rather than duplicating, so a full re-import is
+  // harmless -- this is about being able to see what is new, not about avoiding damage.
+  const onlyNew = /^\/export(@\S+)?\s+new\b/i.test((msg.text ?? "").trim());
   await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "export_building"));
-  scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user));
+  scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user, onlyNew));
 }
 
-async function exportRun(chatId: number, user: any) {
+// Replaces `word` in `sentence` with a blank, matching it as a WHOLE word. JavaScript's
+// \b is ASCII-only, so it cannot be used here: a Cyrillic "довго" would otherwise match
+// inside "довгого" and blank only the stem, leaking "го" onto the card front. The
+// lookarounds below use \p{L} (any letter) instead. Returns null when the word is not
+// present as a standalone token, so the caller can fall back rather than emit a
+// half-blanked sentence.
+//
+// At module scope because /export and /mistakes both build the same fill-in-the-blank
+// card from a grammar correction. Two copies of this would drift, and the drift would be
+// invisible: a card that blanks the stem still looks like a card.
+function blankWord(sentence: string, word: string): string | null {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let re: RegExp;
+  try {
+    re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "u");
+  } catch {
+    return null; // Malformed pattern from unexpected model output -- fall back.
+  }
+  return re.test(sentence) ? sentence.replace(re, "_____") : null;
+}
+
+// The parenthetical that makes a blanked sentence answerable. "Я дуже _____ тобою." could
+// take any of several verbs, so the front names the word by dictionary form and meaning,
+// leaving only the inflection to produce -- which is the skill being tested. The category
+// rides along only when the word does: on its own it names the KIND of mistake rather than
+// the missing word, which reads as a hint and leads nowhere.
+function clozeClue(g: any): string {
+  const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
+  return word ? `  (${[word, g.category].filter(Boolean).join(" · ")})` : "";
+}
+
+async function exportRun(chatId: number, user: any, onlyNew = false) {
   const db = tenantDb(user.tenant_id);
-  const { data: cards, error } = await db
+  // Only meaningful once something has been exported before; on a first run "new" is
+  // everything, which is also what the user would want.
+  const since: string | null = onlyNew ? (user.last_exported_at ?? null) : null;
+
+  let cardQuery = db
     .from("flashcards")
     .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
     .order("created_at", { ascending: true });
+  if (since) cardQuery = cardQuery.gt("created_at", since);
+  const { data: cards, error } = await cardQuery;
 
   if (error) {
     console.error("export query failed:", error);
@@ -3508,16 +3551,19 @@ async function exportRun(chatId: number, user: any) {
   // Grammar corrections ride in the same file as a third deck. They are personal, so
   // only the requester's own rows are exported. A read failure here degrades to a
   // vocabulary-only export rather than losing the whole thing.
-  const { data: corrections, error: corrError } = await db
+  let corrQuery = db
     .from("grammar_corrections")
     .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
     .eq("user_id", user.id)
     .order("created_at", { ascending: true });
+  if (since) corrQuery = corrQuery.gt("created_at", since);
+  const { data: corrections, error: corrError } = await corrQuery;
   if (corrError) console.error("export: grammar_corrections read failed:", corrError);
   const grammarRows = corrections ?? [];
 
   if ((!cards || cards.length === 0) && grammarRows.length === 0) {
-    await sendMessage(chatId, t(viewerLang(undefined, user), "export_empty"));
+    await sendMessage(chatId, t(viewerLang(undefined, user),
+      since ? "export_no_new" : "export_empty"));
     return;
   }
 
@@ -3561,23 +3607,6 @@ async function exportRun(chatId: number, user: any) {
     ].join(","));
   }
 
-  // Replaces `word` in `sentence` with a blank, matching it as a WHOLE word. JavaScript's
-  // \b is ASCII-only, so it cannot be used here: a Cyrillic "довго" would otherwise match
-  // inside "довгого" and blank only the stem, leaking "го" onto the card front. The
-  // lookarounds below use \p{L} (any letter) instead. Returns null when the word is not
-  // present as a standalone token, so the caller can fall back rather than emit a
-  // half-blanked sentence.
-  const blankWord = (sentence: string, word: string): string | null => {
-    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    let re: RegExp;
-    try {
-      re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "u");
-    } catch {
-      return null; // Malformed pattern from unexpected model output -- fall back.
-    }
-    return re.test(sentence) ? sentence.replace(re, "_____") : null;
-  };
-
   // Grammar cards reuse the Capybara notetype so the whole export stays one file with
   // one import: the sentence the learner actually wrote goes in the first field (the
   // card front, and Anki's match key, so repeating a mistake updates its card instead
@@ -3601,11 +3630,7 @@ async function exportRun(chatId: number, user: any) {
       // because that field IS the card front; the notetype's template is not ours to
       // change. Each part is optional and the clue is omitted entirely when none is
       // present, so an older row still yields a usable card.
-      const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
-      // The category is only shown alongside the word. On its own it names the KIND of
-      // mistake, not the missing word -- "(agreement)" reads as a hint but leads nowhere,
-      // which is worse than no parenthetical at all.
-      const front = word ? `${cloze}  (${[word, g.category].filter(Boolean).join(" · ")})` : cloze;
+      const front = `${cloze}${clozeClue(g)}`;
       rows.push([
         csvEscape(front),
         csvEscape(g.category ?? ""),
@@ -3681,6 +3706,70 @@ async function exportRun(chatId: number, user: any) {
       : "") +
     blankedNote;
   await sendDocument(chatId, filename, csv, "text/csv", caption);
+
+  // Recorded only after the file is actually sent. Marking the export before delivery
+  // would advance the "new" cutoff past cards the user never received, so a failed send
+  // would silently drop them from the next incremental export too.
+  //
+  // Fire-and-forget on failure: the customer has their file, and losing a counter is not
+  // worth an error message about something that, from their side, worked.
+  const { error: markErr } = await dbAdmin.from("users")
+    .update({ last_exported_at: new Date().toISOString(), export_count: (user.export_count ?? 0) + 1 })
+    .eq("id", user.id);
+  if (markErr) console.error("export: failed to record run:", markErr);
+}
+
+// Your own recent mistakes, as fill-in-the-blank, in the chat.
+//
+// The data has been collected since the grammar assistant shipped and, until now, only
+// ever left through /export -- which means the corrections were useful to the small number
+// of people who set up Anki and invisible to everyone else. This costs nothing to serve
+// (one indexed read, no model call) and makes /capybara feel like it is FOR something
+// rather than a thing that comments on a message and moves on.
+//
+// Answers are hidden behind Telegram's spoiler formatting rather than a button, so the
+// whole set arrives in one message with no callback round-trip, no state to keep, and no
+// way to end up half-way through a review that the bot has forgotten about.
+async function handleMistakes(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
+  const lang = viewerLang(msg.from, user);
+  const { data, error } = await db
+    .from("grammar_corrections")
+    .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: false })
+    .limit(5);
+  if (error) {
+    console.error("mistakes read failed:", error);
+    await sendMessage(msg.chat.id, t(lang, "mistakes_failed"));
+    return;
+  }
+  const rows = data ?? [];
+  if (rows.length === 0) {
+    await sendMessage(msg.chat.id, t(lang, user.grammar_assist ? "mistakes_none" : "mistakes_off"), "HTML");
+    return;
+  }
+
+  const blocks = rows.map((g: any, i: number) => {
+    // Same preferred shape as the exported card: blank the corrected word out of the
+    // CORRECTED sentence, so the learner never re-reads their own error before recalling.
+    const cloze = g.correction_focus ? blankWord(g.corrected_text ?? "", g.correction_focus) : null;
+    const n = `${i + 1}.`;
+    if (cloze) {
+      const answer = escapeHtml(String(g.correction_focus));
+      const wrote = g.error_focus ? ` ${t(lang, "mistakes_you_wrote", { wrote: escapeHtml(String(g.error_focus)) })}` : "";
+      const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
+      return `${n} ${escapeHtml(cloze)}${escapeHtml(clozeClue(g))}\n   <tg-spoiler><b>${answer}</b>${why}${wrote}</tg-spoiler>`;
+    }
+    // No single word to blank (word order, a missing word). Show what they wrote, with the
+    // correction hidden -- still a recall step rather than a read.
+    const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
+    return `${n} ${escapeHtml(String(g.original_text ?? ""))}\n   <tg-spoiler><b>${escapeHtml(String(g.corrected_text ?? ""))}</b>${why}</tg-spoiler>`;
+  });
+
+  await sendMessage(msg.chat.id,
+    `${t(lang, "mistakes_header")}\n\n${blocks.join("\n\n")}\n\n${t(lang, "mistakes_footer")}`,
+    "HTML");
 }
 
 async function refreshVocabularyCounts(db: TenantDb) {

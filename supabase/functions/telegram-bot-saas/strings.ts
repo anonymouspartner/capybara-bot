@@ -1848,6 +1848,86 @@ export const STRINGS: Record<string, Row> = {
     pl: "Masz już subskrypcję, więc kod wpisuje się w portalu płatności, a nie przy nowej płatności — inaczej płaciłbyś za dwie. Otwórz /management i dotknij Zarządzaj subskrypcją.",
   },
 
+
+  // ---- /mistakes and incremental export --------------------------------------
+
+  mistakes_header: {
+    en: "📝 <b>Your recent mistakes</b>\nTap the blur to check yourself.",
+    uk: "📝 <b>Твої останні помилки</b>\nТоркнись розмиття, щоб перевірити себе.",
+    es: "📝 <b>Tus errores recientes</b>\nToca el difuminado para comprobarte.",
+    fr: "📝 <b>Tes erreurs récentes</b>\nTouche le flou pour vérifier.",
+    de: "📝 <b>Deine letzten Fehler</b>\nTipp auf die Unschärfe, um dich zu prüfen.",
+    it: "📝 <b>I tuoi errori recenti</b>\nTocca la sfocatura per controllarti.",
+    pt: "📝 <b>Os teus erros recentes</b>\nToca no borrão para te verificares.",
+    pl: "📝 <b>Twoje ostatnie błędy</b>\nDotknij rozmycia, żeby się sprawdzić.",
+  },
+
+  mistakes_footer: {
+    en: "<i>These are also in /export, tagged by mistake type.</i>",
+    uk: "<i>Вони також є в /export, позначені за типом помилки.</i>",
+    es: "<i>También están en /export, etiquetados por tipo de error.</i>",
+    fr: "<i>Elles sont aussi dans /export, étiquetées par type d'erreur.</i>",
+    de: "<i>Die stecken auch in /export, nach Fehlerart getaggt.</i>",
+    it: "<i>Ci sono anche in /export, taggati per tipo di errore.</i>",
+    pt: "<i>Também estão no /export, etiquetados por tipo de erro.</i>",
+    pl: "<i>Są też w /export, otagowane według rodzaju błędu.</i>",
+  },
+
+  mistakes_you_wrote: {
+    en: (v: any) => `(you wrote: ${v.wrote})`,
+    uk: (v: any) => `(ти написав(ла): ${v.wrote})`,
+    es: (v: any) => `(escribiste: ${v.wrote})`,
+    fr: (v: any) => `(tu as écrit : ${v.wrote})`,
+    de: (v: any) => `(du hast geschrieben: ${v.wrote})`,
+    it: (v: any) => `(hai scritto: ${v.wrote})`,
+    pt: (v: any) => `(escreveste: ${v.wrote})`,
+    pl: (v: any) => `(napisałeś(-aś): ${v.wrote})`,
+  },
+
+  mistakes_none: {
+    en: "Nothing to review — I haven't caught any mistakes yet. Keep writing in the language you're learning and they'll turn up here.",
+    uk: "Нема чого повторювати — я поки не помітив помилок. Продовжуй писати мовою, яку вивчаєш, і вони з'являться тут.",
+    es: "Nada que repasar — aún no he detectado errores. Sigue escribiendo en el idioma que aprendes y aparecerán aquí.",
+    fr: "Rien à revoir — je n'ai encore relevé aucune erreur. Continue à écrire dans la langue que tu apprends et elles apparaîtront ici.",
+    de: "Nichts zu wiederholen — mir sind noch keine Fehler aufgefallen. Schreib weiter in der Sprache, die du lernst, dann tauchen sie hier auf.",
+    it: "Niente da ripassare — non ho ancora trovato errori. Continua a scrivere nella lingua che stai imparando e appariranno qui.",
+    pt: "Nada para rever — ainda não apanhei erros. Continua a escrever na língua que estás a aprender e vão aparecer aqui.",
+    pl: "Nie ma czego powtarzać — nie wyłapałem jeszcze błędów. Pisz dalej w języku, którego się uczysz, a się pojawią.",
+  },
+
+  mistakes_off: {
+    en: "Grammar help is off, so I'm not noting your mistakes. Turn it on with /capybara and they'll collect here as you write.",
+    uk: "Допомога з граматикою вимкнена, тож я не занотовую помилки. Увімкни її через /capybara — і вони збиратимуться тут.",
+    es: "La ayuda de gramática está desactivada, así que no anoto tus errores. Actívala con /capybara y se irán recogiendo aquí.",
+    fr: "L'aide grammaticale est désactivée, je ne note donc pas tes erreurs. Active-la avec /capybara et elles s'accumuleront ici.",
+    de: "Die Grammatikhilfe ist aus, ich notiere deine Fehler also nicht. Schalt sie mit /capybara ein, dann sammeln sie sich hier.",
+    it: "L'aiuto di grammatica è spento, quindi non annoto i tuoi errori. Attivalo con /capybara e si raccoglieranno qui.",
+    pt: "A ajuda de gramática está desligada, por isso não anoto os teus erros. Liga-a com /capybara e vão juntar-se aqui.",
+    pl: "Pomoc gramatyczna jest wyłączona, więc nie zapisuję twoich błędów. Włącz ją przez /capybara, a zaczną się tu zbierać.",
+  },
+
+  mistakes_failed: {
+    en: "Couldn't fetch your corrections. Check function logs.",
+    uk: "Не вдалося отримати твої виправлення. Перевір логи функції.",
+    es: "No he podido cargar tus correcciones. Revisa los registros.",
+    fr: "Impossible de charger tes corrections. Vérifie les journaux.",
+    de: "Deine Korrekturen konnten nicht geladen werden. Prüf die Logs.",
+    it: "Non sono riuscito a caricare le tue correzioni. Controlla i log.",
+    pt: "Não consegui carregar as tuas correções. Verifica os registos.",
+    pl: "Nie udało się pobrać twoich poprawek. Sprawdź logi funkcji.",
+  },
+
+  export_no_new: {
+    en: "Nothing new since your last export. Send /export on its own for the full set.",
+    uk: "Нічого нового від часу останнього експорту. Надішли /export без слів, щоб отримати все.",
+    es: "Nada nuevo desde tu última exportación. Envía /export a secas para el conjunto completo.",
+    fr: "Rien de nouveau depuis ton dernier export. Envoie /export seul pour tout récupérer.",
+    de: "Nichts Neues seit deinem letzten Export. Schick /export allein für den ganzen Satz.",
+    it: "Niente di nuovo dall'ultima esportazione. Manda /export da solo per l'insieme completo.",
+    pt: "Nada de novo desde a última exportação. Envia /export sozinho para o conjunto completo.",
+    pl: "Nic nowego od ostatniego eksportu. Wyślij samo /export, żeby dostać całość.",
+  },
+
 };
 
 // Looks up a string. Falls back to English on a missing translation and warns, so a gap
