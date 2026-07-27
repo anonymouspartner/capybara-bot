@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v20";
+const BUILD_VERSION = "saas-v21";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -588,7 +588,7 @@ async function handleUpdate(update: any) {
   else if (msg.venue || msg.location) { await handleLocationMessage(msg, user); }
   else if (msg.contact) { await handleContactMessage(msg, user); }
   else if (msg.text) { await handleTextMessage(msg, user); }
-  else { await sendMessage(msg.chat.id, "I can handle text, voice, photos, videos, files, stickers, GIFs, audio, locations, and contacts. Other types aren't supported yet."); }
+  else { await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unsupported_media")); }
 }
 
 // ---------------------------------------------------------------------------- Billing gate
@@ -765,6 +765,12 @@ function plansConfigured(): boolean {
 //
 // The plan NAMES stay untranslated: "Standard" and "Pro" are product names and must match
 // the Stripe product the customer's receipt will show. Only the button verb is localized.
+// The two language codes a /learn or /forget usage line should offer. Was hardcoded
+// "uk|en", which is wrong for every pair but one -- the same assumption /help carried.
+function deckCodes(user: any): string {
+  return `${user.native_language}|${user.learning_language}`;
+}
+
 function planKeyboard(lang: Lang, prices: Record<PlanKey, string>, includeTrial: boolean) {
   const rows: any[] = [];
   if (includeTrial) rows.push([{ text: t(lang, "btn_try_free"), callback_data: "tr|begin" }]);
@@ -1553,7 +1559,7 @@ async function handleDeleteAccount(msg: any, user: any): Promise<void> {
     .eq("id", user.tenant_id).maybeSingle();
   if (error || !tenant) {
     console.error("delete_account: tenant read failed:", error);
-    await sendMessage(msg.chat.id, "I couldn't load your account just now. Try again shortly.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "account_load_failed"));
     return;
   }
   if (tenant.owner_user_id !== user.id) {
@@ -2135,34 +2141,9 @@ async function translate(
 // itself already comes back in their native language from checkGrammar. A language with
 // no entry falls back to English, the same English-fallback convention the rest of the
 // bot's UI text uses.
-type GrammarUi = {
-  correct: string;
-  noteHeader: string;
-  saveFailed: string;
-  on: (learnName: string) => string;
-  off: (learnName: string) => string;
-};
-const GRAMMAR_UI: Record<string, GrammarUi> = {
-  en: {
-    correct: "✅ Looks correct.",
-    noteHeader: "📝 Grammar note:",
-    saveFailed: "⚠️ Couldn't save that setting — please try again.",
-    on: (l) => `✅ Grammar assistant ON. When you write in ${l}, I'll check it and privately explain any mistakes (just to you — your partner never sees the note). Turn it off with /capybara off.`,
-    off: (l) => `Grammar assistant OFF. I'll stop checking your ${l}. Turn it back on with /capybara on.`,
-  },
-  uk: {
-    correct: "✅ Виглядає правильно.",
-    noteHeader: "📝 Граматична нотатка:",
-    saveFailed: "⚠️ Не вдалося зберегти налаштування — спробуй ще раз.",
-    // Language names in the registry are English and don't decline in Ukrainian, so
-    // these refer to the studied language indirectly rather than naming it inline.
-    on: () => "✅ Помічник з граматики УВІМКНЕНО. Коли ти пишеш мовою, яку вивчаєш, я перевірю текст і приватно поясню помилки (тільки тобі — партнер їх не бачить). Вимкнути: /capybara off.",
-    off: () => "Помічник з граматики ВИМКНЕНО. Більше не перевірятиму. Увімкнути: /capybara on.",
-  },
-};
-function grammarUi(nativeLang: LangCode): GrammarUi {
-  return GRAMMAR_UI[nativeLang] ?? GRAMMAR_UI.en;
-}
+// GRAMMAR_UI is gone: its five strings live in the catalog with the other 85, in eight
+// languages instead of two. Two localization systems for one job was one too many, and the
+// old one silently gave English to anyone who was not an en or uk native.
 
 // A grammar verdict. `correct: true` means nothing to fix (and nothing to store --
 // there is no card in a sentence that was already right). Otherwise the pieces are kept
@@ -2259,9 +2240,9 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
   const db = tenantDb(user.tenant_id);
   const verdict = await checkGrammar(text, user.learning_language, user.native_language);
   if (verdict === null) return; // API/parse failed -- stay silent rather than nag.
-  const ui = grammarUi(user.native_language);
+  const lang = viewerLang(undefined, user);
   if (verdict.correct) {
-    await sendMessage(chatId, ui.correct);
+    await sendMessage(chatId, t(lang, "grammar_correct"));
     return;
   }
   const { error } = await db.from("grammar_corrections").insert({
@@ -2280,7 +2261,7 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
   if (error) console.error("grammar correction insert failed:", error);
 
   const explanation = verdict.explanation ? `\n${verdict.explanation}` : "";
-  await sendMessage(chatId, `${ui.noteHeader}\n${verdict.corrected}${explanation}`);
+  await sendMessage(chatId, `${t(lang, "grammar_note_header")}\n${verdict.corrected}${explanation}`);
 }
 
 // /capybara [on|off] -- per-user toggle for the grammar assistant. Bare /capybara
@@ -2289,15 +2270,15 @@ async function handleCapybara(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const arg = msg.text.replace(/^\/capybara(@\S+)?/i, "").trim().toLowerCase();
   const enabled = arg === "on" ? true : arg === "off" ? false : !user.grammar_assist;
-  const ui = grammarUi(user.native_language);
+  const lang = viewerLang(msg.from, user);
   const { error } = await db.from("users").update({ grammar_assist: enabled }).eq("id", user.id);
   if (error) {
     console.error("grammar toggle failed:", error);
-    await sendMessage(msg.chat.id, ui.saveFailed);
+    await sendMessage(msg.chat.id, t(lang, "grammar_save_failed"));
     return;
   }
-  const learnName = langLabel(user.learning_language);
-  await sendMessage(msg.chat.id, enabled ? ui.on(learnName) : ui.off(learnName));
+  await sendMessage(msg.chat.id,
+    t(lang, enabled ? "grammar_on" : "grammar_off", { lang: langLabel(user.learning_language) }));
 }
 
 type WhisperResult =
@@ -3346,7 +3327,7 @@ async function exportRun(chatId: number, user: any) {
   const grammarCount = rows.length - Object.values(deckCounts).reduce((a, b) => a + b, 0);
 
   if (rows.length === 0) {
-    await sendMessage(chatId, "Nothing has exportable rows yet (vocabulary records may be missing).");
+    await sendMessage(chatId, t(viewerLang(undefined, user), "export_nothing"));
     return;
   }
 
@@ -3553,21 +3534,22 @@ async function lookupVocabByLemma(db: TenantDb, lemma: string, language: LangCod
 }
 
 async function handleLearnTop(msg: any, user: any, arg: string) {
+  const lang = viewerLang(msg.from, user);
   const db = tenantDb(user.tenant_id);
   const match = arg.match(/^top\s*(\d+)?(?:\s+(\S+))?$/i);
   if (!match) {
-    await sendMessage(msg.chat.id, "Usage: `/learn top <N> [uk|en]`", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_top_usage", { codes: deckCodes(user) }), "HTML");
     return;
   }
   const nRaw = match[1];
   const langTokenRaw = match[2];
   if (!nRaw) {
-    await sendMessage(msg.chat.id, "How many words?\n\nUsage: `/learn top <N> [uk|en]`", "Markdown");
+    await sendMessage(msg.chat.id, `${t(lang, "learn_how_many")}\n\n${t(lang, "learn_top_usage", { codes: deckCodes(user) })}`, "HTML");
     return;
   }
   const n = parseInt(nRaw, 10);
   if (!Number.isFinite(n) || n <= 0) {
-    await sendMessage(msg.chat.id, "N must be a positive number.", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_n_positive"));
     return;
   }
   const N = Math.min(n, 50);
@@ -3654,12 +3636,13 @@ async function resolveLearnTarget(user: any, word: string): Promise<
 }
 
 async function handleLearn(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
   const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const arg = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
   if (!arg) {
-    await sendMessage(msg.chat.id, "Usage: `/learn <word>` or `/learn top <N> [uk|en]`\n\nRun /vocab to see suggested words.", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_usage", { codes: deckCodes(user) }), "HTML");
     return;
   }
   if (arg.toLowerCase().startsWith("top")) {
@@ -3667,7 +3650,7 @@ async function handleLearn(msg: any, user: any) {
     return;
   }
   if (arg.includes(" ")) {
-    await sendMessage(msg.chat.id, "Please add one word at a time.\n\n(Or use `/learn top N [uk|en]` to bulk-add.)", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_one_at_a_time", { codes: deckCodes(user) }), "HTML");
     return;
   }
   const resolved = await resolveLearnTarget(user, arg);
@@ -3731,11 +3714,11 @@ async function handleForget(msg: any, user: any) {
   const firstSpace = text.indexOf(" ");
   const arg = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
   if (!arg) {
-    await sendMessage(msg.chat.id, "Usage: `/forget <word>`\n\nRemoves a word from the matching deck.", "Markdown");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "forget_usage"), "HTML");
     return;
   }
   if (arg.includes(" ")) {
-    await sendMessage(msg.chat.id, "Please remove one word at a time.", "Markdown");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "forget_one_at_a_time"));
     return;
   }
   const resolved = await resolveLearnTarget(user, arg);
