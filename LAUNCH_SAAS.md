@@ -223,6 +223,50 @@ Swap Stripe to live mode: new `sk_live_…`, new price ids, a new webhook endpoi
 signing secret, new Payment Links. Update the secrets, redeploy `stripe-billing`, and run
 step 7 once with a real card.
 
+**Do it in this order.** Every object below is created fresh — test mode and live mode
+share nothing, so none of what you built in test carries over.
+
+1. **Toggle the dashboard to live mode**, then set the two public details while you're
+   there: **account display name** and **statement descriptor** (see the note at the end
+   of this step).
+2. **Recreate the two products and prices.** Note both new `price_…` ids. Prices are
+   immutable, so decide the amount before creating one.
+3. **Create a Payment Link for each price.** Under *After payment* → **Redirect to a page
+   you specify**, paste:
+   ```
+   https://<commercial-ref>.supabase.co/functions/v1/stripe-billing?session_id={CHECKOUT_SESSION_ID}
+   ```
+   `{CHECKOUT_SESSION_ID}` is substituted **only in that redirect field**. Putting the URL
+   in the post-payment *confirmation message* instead leaves the placeholder as literal
+   text and the customer never reaches onboarding — this has already been hit once.
+4. **Register the webhook** at `https://<commercial-ref>.supabase.co/functions/v1/stripe-billing`
+   and copy the new signing secret. Do this *before* redeploying, so the function comes up
+   already able to verify.
+5. **Update six secrets** on the commercial project:
+
+   | Secret | Function | Value |
+   |---|---|---|
+   | `STRIPE_SECRET_KEY` | billing | the new `sk_live_…` |
+   | `STRIPE_WEBHOOK_SECRET` | billing | signing secret from step 4 |
+   | `STRIPE_PRICE_STANDARD` | billing | live Standard `price_…` |
+   | `STRIPE_PRICE_ULTIMATE` | billing | live Pro `price_…` |
+   | `STRIPE_PAYMENT_LINK_STANDARD` | bot | live Standard Payment Link |
+   | `STRIPE_PAYMENT_LINK_ULTIMATE` | bot | live Pro Payment Link |
+
+   Paste carefully: a trailing newline has silently broken a secret here before
+   (`QUOTA_ULTIMATE` once arrived as `"2500\n"`). Every one of these is read through
+   `.trim()` now, but the quotas are compared numerically and the price ids with `===`.
+
+6. **Redeploy both functions** — `stripe-billing` *and* `telegram-bot-saas`. The bot owns
+   the Payment Link buttons; the billing function owns everything else. Shipping only one
+   leaves the intro pointing at dead test links.
+7. **Check both health routes** before touching a card:
+   - `…/stripe-billing?health` → `stripeConfigured: true`, `pricesConfigured: true`,
+     `botUsernameConfigured: true`
+   - `…/telegram-bot-saas?health` → `paymentLinksConfigured: true`, and the version you
+     just shipped
+8. **Run step 7 once with a real card**, then deal with the test tenants below.
+
 > **The test tenants do not survive the swap, and they fail quietly.** Any tenant
 > provisioned in test mode carries a test-mode `stripe_customer_id`. `/billing` mints a
 > customer-portal session from that id, so the moment the key becomes `sk_live_…` the
