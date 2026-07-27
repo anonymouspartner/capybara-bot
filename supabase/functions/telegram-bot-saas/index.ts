@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v13";
+const BUILD_VERSION = "saas-v14";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -74,6 +74,29 @@ const PLAN_QUOTA: Record<PlanKey, number> = {
 };
 
 type PlanKey = "standard" | "ultimate";
+
+// Annotate only what a human wrote, not what the bot wrote back.
+//
+// Every message used to get two annotation passes: one on the original, one on the
+// translation. The second mines vocabulary out of the model's own output -- which is also
+// where a wrong-sense card is most likely, since it re-analyses text that was itself
+// generated under sense pressure. Annotation is ~83% of API spend and this halves it,
+// taking a message from ~$0.012 to ~$0.007.
+//
+// The single-tenant build did this first (v84) and the paid build deliberately did not
+// follow, on the grounds that halving a subscriber's flashcards is a product decision
+// rather than a cost one. The pricing is what settled it: at $0.012/message a Standard
+// subscriber at their 750 cap costs $9.00 of inference, which pins the floor at $9.58 and
+// makes any price under $12 a loss on heavy users. Cutting the machine-written half is
+// what makes a $10 plan honest, and it is the half sourced from Claude rather than from a
+// partner.
+//
+// Flipping this back on is not sufficient on its own: migration 20260727000200 stopped
+// the tenant-scoped backfill_pending_sides from offering translation sides, so re-enabling
+// here without reverting that leaves the newly annotated sides invisible to /backfill.
+// Typed as boolean, not the literal false, so the guarded call sites stay live code to the
+// type checker.
+const ANNOTATE_TRANSLATION_SIDE: boolean = false;
 
 // How much a stranger gets before the wall, and the ceiling across every stranger per day.
 // Passed into consume_trial_message so these constants stay the single source of truth
@@ -1249,13 +1272,14 @@ async function handleBilling(msg: any, user: any): Promise<void> {
 // nothing, and it keeps the numbers in the same place as the text that explains them. If
 // it ever stops being nothing, that is a good problem and the fix is a view.
 
-// ~$0.012 per message on saas-v12, of which annotation is about 83%. Calibrated against
-// real spend rather than modelled -- the cost model came in 20% under the actual bill, so
-// it is scaled to match. Was 0.015 before the annotation work (dropping the write-only
-// grammar/idiom/register fields, skipping unannotatable text, reusing identical repeats).
+// ~$0.007 per message, calibrated against real spend rather than modelled (the cost model
+// came in 20% under the actual bill, so it is scaled to match). The trajectory: $0.015
+// before any of the annotation work, $0.012 after dropping the write-only
+// grammar/idiom/register fields and skipping/reusing what it could, and $0.007 once the
+// machine-translated side stopped being annotated at all.
 // Used only for the estimate below, so drift costs nothing; re-derive it from the
 // Anthropic console after a month of real traffic.
-const EST_COST_PER_MESSAGE_USD = 0.012;
+const EST_COST_PER_MESSAGE_USD = 0.007;
 
 // Supabase free tier database ceiling. The commercial project runs on it for now, so the
 // number that matters operationally is not the bill (there isn't one) but the headroom:
@@ -1843,7 +1867,7 @@ async function handleTextMessage(msg: any, user: any) {
 
   if (inserted) {
     if (isInstanceLang(originalLang, user)) scheduleAnnotation(db, inserted.id, originalText, originalLang, translationTargetLang, "text-original", translationOk ? translated! : undefined);
-    if (translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
+    if (ANNOTATE_TRANSLATION_SIDE && translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
     if (isInstanceLang(originalLang, user)) {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, originalText, originalLang));
     }
@@ -1934,7 +1958,7 @@ async function handleVoiceMessage(msg: any, user: any) {
 
   if (inserted) {
     if (isInstanceLang(originalLang, user)) scheduleAnnotation(db, inserted.id, transcript, originalLang, targetLang, "voice-original", translationOk ? translated! : undefined);
-    if (translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(db, inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
+    if (ANNOTATE_TRANSLATION_SIDE && translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(db, inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
     if (isInstanceLang(originalLang, user)) {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, transcript, originalLang));
     }
@@ -2838,7 +2862,7 @@ async function translateCaptionToPartner(user: any, senderChatId: number, captio
 
   if (inserted) {
     scheduleAnnotation(db, inserted.id, caption, originalLang, translationTargetLang, "caption-original", translationOk ? translated! : undefined);
-    if (translationOk) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
+    if (ANNOTATE_TRANSLATION_SIDE && translationOk) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
     scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, caption, originalLang));
   }
 }

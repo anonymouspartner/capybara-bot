@@ -67,15 +67,17 @@ their own.
 2. Decide the quotas. Defaults are **750** (Standard) and **2500** (Ultimate); the
    `QUOTA_*` secrets below override them.
 
-   Calibration: your own traffic is ~1,650 messages/month. That cost about **$25/month**
-   before the annotation work, and runs at **~$0.012/message** on `saas-v12` — a figure
-   calibrated against real spend, since the cost model came in 20% under the actual bill.
-   Annotation is ~83% of it. So a tenant sitting at the cap costs roughly **$9**
-   (Standard) or **$30** (Ultimate) in inference.
+   Calibration: your own traffic is ~1,650 messages/month, which cost about **$25/month**
+   before any of the annotation work. The rate now is **~$0.007/message** — calibrated
+   against real spend, since the cost model came in 20% under the actual bill. A tenant
+   sitting at the cap therefore costs roughly **$5.25** (Standard) or **$17.50** (Ultimate)
+   in inference.
 
-   Add ~$3/month per tenant for Stripe (2.9% + $0.30) and amortized Supabase Pro, and
-   price above the *cap* cost rather than the average — a quota exists so customers may
-   reach it. At these quotas $15 and $39 clear the cap with margin.
+   Add Stripe (2.9% + $0.30 per charge) and price above the *cap* cost rather than the
+   average — a quota exists so customers may reach it. That puts the break-even floor at
+   about **$5.72** (Standard) and **$18.30** (Ultimate); $10–12 and $29–39 clear it with
+   room. Supabase adds nothing while the project is on the free tier (see
+   "Storage and the free tier" below).
 
    Re-derive `$/message` from the Anthropic console after a month of real traffic rather
    than trusting the figure above; divide real spend by real message count.
@@ -224,15 +226,19 @@ step 7 once with a real card.
 ## Operating notes
 
 **Quota is counted per inbound message**, not per API call, and consumed before any model
-call. One message is one translation plus two annotation passes, so a tenant at the cap
-has cost you roughly `quota × $0.012`.
+call. One message is one translation plus one annotation pass, so a tenant at the cap has
+cost you roughly `quota × $0.007`.
 
-That rate is for `saas-v12`, which annotates **both** sides of every message. The
-single-tenant build stopped annotating the machine-translated side (`v84`), which takes it
-to roughly `quota × $0.007` — the paid build deliberately did not follow, because halving
-the flashcards a subscriber receives is a product decision rather than a cost one. If it
-ever should, the honest place for it is the plan tier (Standard annotates what you write;
-Ultimate annotates both sides) rather than a global constant, so price tracks cost.
+**One** annotation pass, not two, since `saas-v14`. Both builds now annotate only what a
+human wrote, never the machine translation of it — `ANNOTATE_TRANSLATION_SIDE`, with
+`migrations-saas/20260727000200` stopping `/backfill` from offering the other side.
+
+That was originally a personal-bot-only change, on the grounds that halving a subscriber's
+flashcards is a product decision rather than a cost one. Pricing settled it: at $0.012 a
+Standard subscriber at cap cost $9.00, pinning the floor near $9.58 and making any price
+under $12 a loss on heavy users. The half that was cut is the one sourced from Claude's
+output rather than from a partner's actual writing — measured on the personal corpus, the
+remaining half is 53% of Ukrainian and 48% of English card supply, all of it human-written.
 
 **Changing a `QUOTA_*` secret does not move existing customers.** The quota is copied onto
 `tenants.message_quota` at provisioning and rewritten only on a plan change, so a new value
@@ -295,6 +301,29 @@ select count(*) filter (where messages_used >= 5) as exhausted,
 
 Comping someone extra trial messages is `update public.trial_users set messages_used = 0
 where telegram_id = ...`.
+
+## Storage and the free tier
+
+The commercial project runs on the Supabase **free tier**, so there is no monthly bill and
+every subscriber is profitable from the first one. What it costs instead is headroom.
+
+Nothing is ever deleted (see Retention below — that is deliberate), and embeddings are
+~6 KB per message before indexes, an order of magnitude more than the message text. So the
+database only grows, and grows **faster the better the product does**: roughly 4 MB per
+couple per month at the Standard cap. Against a 500 MB ceiling that is somewhere near 100
+couple-months — a year at 8 couples, half that at 16.
+
+`/tenants` reports size against the ceiling and flags at 60%. Two triggers worth setting:
+
+- **First paying customer who isn't you** → start taking a weekly `pg_dump`. The free tier
+  has **no backups and no point-in-time recovery**, and on a product whose value is a
+  private history that is a worse exposure than running out of space. It is also the silent
+  one: storage limits announce themselves, data loss does not.
+- **~5 paying couples, or past 300 MB** → move to Pro. At that point $25/month is under
+  three subscribers' margin, and you are buying backups more than storage.
+
+Free projects also pause after ~7 days of inactivity. Active subscribers prevent it, but a
+quiet week would take the bot down for people who are paying.
 
 ## Retention
 
