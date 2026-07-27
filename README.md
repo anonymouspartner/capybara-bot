@@ -21,8 +21,13 @@ the other person, translating any caption along the way.
 > behind a deliberately strict deploy gate.
 >
 > There is also a **multi-tenant paid build** of the same product in this repo — one bot
-> and one database serving many subscribing couples, with Stripe billing and self-serve
-> onboarding. See [Two products](#two-products).
+> and one database serving many subscribing people, with Stripe billing and self-serve
+> onboarding. It is **wired to live Stripe** and taking real cards: two plans
+> (**Standard $10/mo, 750 messages**; **Pro $39/mo, 2,500**), a five-message free trial,
+> and onboarding that starts inside Telegram rather than with a payment link. Its
+> customer-facing copy is translated into all eight registry languages, so a Ukrainian
+> speaker signs up in Ukrainian. See [Two products](#two-products) and
+> [Localization](#localization-paid-build).
 
 ---
 
@@ -34,6 +39,7 @@ the other person, translating any caption along the way.
 - [The model: one instance per pair](#the-model-one-instance-per-pair)
 - [Two products](#two-products)
 - [Customer onboarding (paid service)](#customer-onboarding-paid-service)
+- [Localization (paid build)](#localization-paid-build)
 - [Data model](#data-model)
 - [Repository map](#repository-map)
 - [Prerequisites](#prerequisites)
@@ -82,9 +88,15 @@ them in a single turn.
   captions are left as-is.)
 
 **2. Language-study corpus.**
-- Every message — and every media **caption** — is **annotated in the background** (Claude) into **vocabulary**
-  (lemma + part of speech + gloss + cross-language translation), **grammar features**,
-  **idioms**, and **register**.
+- Every message — and every media **caption** — is **annotated in the background** (Claude)
+  into **vocabulary**: lemma, part of speech, gloss, and cross-language translation.
+- **Only what something reads.** The schema once also asked for grammar features, idioms
+  and register. Those rows were written on every message and consumed by nothing —
+  `message_annotations` has exactly one reader, the vocabulary view. Output tokens are
+  ~70% of an annotation's cost, so dropping the fields nobody looked at cut the cost per
+  message from **$0.015 to $0.007** without changing anything a user sees. The CHECK
+  constraint still permits all three types, so restoring one is a prompt change with no
+  migration.
 - **Two decks of equal weight** — one per language of your pair (e.g. 🇺🇦 Ukrainian and
   🇬🇧 English) — built from the words that actually came up in *your* conversations. Each
   word's gloss is given in the learner's own language.
@@ -146,7 +158,18 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
 - **Health route.** A side-effect-free `GET …/telegram-bot?health` returns
   `{status, version, adminConfigured}` — used to confirm a deploy actually landed (no
   DB/API/messaging side effects). It sits *before* the secret check so monitors can hit
-  it.
+  it. The paid build adds the configuration a deploy cannot verify for itself:
+  `paymentLinksConfigured`, `pricesConfigured`, and the **effective** quotas with a
+  `quotaSource` saying whether each came from a secret or a code default.
+- **`stripe-billing` reports which Stripe *world* it is in** — `stripeMode`
+  (`live` / `test` / `unset` / `unknown`, from the key's public `sk_live_` / `sk_test_`
+  prefix) plus `priceTails`, the last six characters of each configured price id. This
+  exists because a boolean "is a key present" cannot tell a completed go-live from one
+  where nothing was saved: a test key is exactly as present as a live one. A cutover once
+  reported fully green while every Stripe secret was still the test value, and a test card
+  bought a real-looking subscription. The deploy smoke test now prints the mode and calls
+  out live versus test — reported, not asserted, since a test-mode instance is how the
+  flow gets rehearsed.
 - **Background work.** Annotation and embedding run after the reply is sent, via
   `EdgeRuntime.waitUntil` when available, so the user isn't kept waiting on study-corpus
   bookkeeping.
@@ -199,7 +222,10 @@ products, not different instances, and each has its own file and its own Supabas
 | Tenancy | One couple per project | Many couples, one project |
 | Isolation | The project boundary | `tenant_id` on every table, plus a scoped DB client |
 | Onboarding | Edit `seed_couple.sql`, run it by hand | Stripe Checkout → Telegram deep link → three taps, one for the partner |
-| Billing | None | Stripe subscription, two tiers, per-period message quota |
+| Billing | None | Stripe subscription (live), two tiers, per-period message quota |
+| Plans | n/a | **Standard** $10/mo, 750 messages, annotates what *you* write · **Pro** $39/mo, 2,500, annotates **both** sides |
+| Trial | n/a | Five free messages before any card, with a real flashcard on the first |
+| Interface language | English | The reader's own, across eight languages |
 | Admin | The couple's own `ADMIN_TELEGRAM_ID` | `SUPERADMIN_TELEGRAM_ID` — the operator, never a customer |
 | Deploys | `/update` self-deploy from Telegram, or Actions | Actions only — **no `/update`** (one tap would redeploy every tenant) |
 | Retention | 30-day PII cron | Kept while the account exists; `/delete_account` removes everything |
@@ -220,24 +246,52 @@ order, an end-to-end test) is documented in **`LAUNCH_SAAS.md`**.
 
 ## Customer onboarding (paid service)
 
-Self-serve end to end. The only thing the operator hands out is a Payment Link — no
-website, no email, no manual provisioning step.
+Self-serve end to end — no website, no email, no manual provisioning step. **It starts in
+Telegram**, not with a payment link: a stranger who messages the bot gets an explanation
+and buttons, and can try it before paying. Handing out a bare Stripe link asked people to
+buy something they had never seen.
 
 ```
-Payment Link → Stripe Checkout → success_url hits stripe-billing
-                                      │  verifies the session, creates the tenant
-                                      ▼
-                                 302 → t.me/<bot>?start=<code>
-                                      │  Telegram sends "/start <code>"
-                                      ▼
-                         3 taps: native language, learning language, he/she
+stranger messages the bot  →  intro + plan buttons, in THEIR language
                                       │
-                                      ▼
-                             invite link for their partner
-                                      │  partner taps, picks he/she
-                                      ▼
-                                both set up, code retired
+                     ┌────────────────┴────────────────┐
+                     ▼                                 ▼
+            "Try it free"                        Standard / Pro
+       5 messages, real translation              Stripe Checkout
+       + a real flashcard on the 1st                   │
+                     │                                 ▼
+                     └──── paywall ──────►  success_url hits stripe-billing
+                                                       │  verifies session, creates tenant
+                                                       ▼
+                                            302 → t.me/<bot>?start=<code>
+                                                       │  Telegram sends "/start <code>"
+                                                       ▼
+                                  3 taps: native language, learning language, he/she
+                                                       │
+                                                       ▼
+                                        invite link for their partner
+                                                       │  partner taps, picks he/she
+                                                       ▼
+                                            both set up, code retired
 ```
+
+**The trial** is five messages, tracked in `trial_users` by `telegram_id`, with a daily cap
+and a length limit. It runs the real translation path and shows a real flashcard on the
+first message, so what is being demonstrated is the product rather than a description of
+it. Trial messages are never written to `messages` — a trial is not a corpus, and someone
+who never subscribes leaves nothing behind. The gate **fails closed**: if the database
+cannot be reached the message is refused rather than served free.
+
+**Plans differ in annotation depth**, which is the thing a customer actually feels:
+Standard annotates the side *you wrote*, Pro annotates **both** — so on Pro you also study
+your partner's language from their own words, not only from your attempts at it. It is a
+single predicate (`annotatesBothSides`) read from the plan carried out of the quota gate.
+
+**Commands that cost nothing to serve don't consume quota.** `/help`, `/vocab`, `/learn`,
+`/forget` and the pin commands are pure database reads; billing a message for them charges
+the customer for our disk, and the people who pay that tax are the ones who just subscribed
+and are still exploring. `/recap` and `/note` stay metered — one synthesises, the other
+classifies and embeds.
 
 **Payment → tenant** (`stripe-billing`, the `GET ?session_id=` route):
 
@@ -279,6 +333,57 @@ Three things hold it together:
 The payer can use the bot **solo** in the gap before their partner joins. Once the second
 seat is filled the `pairing_code` is cleared, so a forwarded link is inert from then on,
 and the payer is told their partner arrived.
+
+## Localization (paid build)
+
+The paid build talks to each person **in their own language** — all eight in the registry,
+across every customer-facing surface: the intro a stranger sees, the trial, onboarding,
+`/start`, `/help`, `/billing`, quota warnings, the study commands, the grammar assistant,
+media and voice errors, and the account-deletion goodbyes. **155 keys x 8 languages**, in
+`supabase/functions/telegram-bot-saas/strings.ts`.
+
+This existed because of a real signup: a Ukrainian speaker, with Telegram in Ukrainian,
+was offered a language picker with eight options and then addressed in English whichever
+one she picked. On a product whose whole claim is "write in your language and be read in
+yours", opening in the wrong language is not cosmetic.
+
+**Resolving the reader's language** — `viewerLang(from, user?, trialRow?)`, most
+authoritative first:
+
+1. A registered user's `native_language`. They chose it.
+2. A trial user's chosen pair.
+3. Telegram's own `from.language_code`, normalised (`uk-UA` → `uk`, `pt-BR` → `pt`) and
+   kept only if it is one of the eight. **This is what fixes the first screen** — Telegram
+   sends it on every update, so a stranger's very first message is already in their
+   language, before they have told the bot anything.
+4. English.
+
+Two details that are easy to get backwards:
+
+- **Messages addressed to the *other* person resolve from that person's row**, not the
+  sender's. A partner-forward, the "your partner joined" greeting, and the deletion notice
+  are all read by someone other than whoever triggered them. Getting this wrong is
+  invisible in a same-language test pair and wrong for every real one.
+- **Deck ownership is two keys, not an interpolated possessive.** English forms one by
+  appending `'s` to any noun; Ukrainian and Polish inflect the noun, German and Italian
+  restructure the phrase. `"Added to {owner}'s deck"` is correct in exactly one of the
+  eight languages, so own-deck and partner-deck are separate strings throughout.
+
+**Provenance, stated plainly.** English and Ukrainian are reviewed. **Spanish, French,
+German, Italian, Portuguese and Polish are machine-written and unreviewed** — nobody who
+speaks them has read them. That is recorded in the file's header rather than glossed over,
+because this product sells language quality, and a *missing* translation degrades safely
+to English while a *wrong* one does not announce itself.
+
+The catalog is covered by tests that exist because each caught a real bug: every key has
+all eight languages; no entry renders empty or leaks `undefined`; every interpolating key
+is exercised with real variables; no key is defined twice (`Object.keys` dedupes, so a
+duplicate silently shadows the earlier definition); and no entry contains CJK, kana or
+hangul — a stray Chinese glyph reached the French copy twice.
+
+The single-tenant build is deliberately **not** localized: it serves one pair whose
+languages are known and who are both fluent in its English UI. This is a feature for
+strangers, and that build has none.
 
 ## Data model
 
@@ -322,6 +427,7 @@ database, not Storage).
 |---|---|
 | `supabase/functions/telegram-bot/index.ts` | The entire personal bot — one canonical file. |
 | `supabase/functions/telegram-bot-saas/index.ts` | The multi-tenant paid build (tenant scoping, onboarding, quotas). |
+| `supabase/functions/telegram-bot-saas/strings.ts` | Every customer-facing string, in eight languages. Imported by `index.ts`; ships in the same deploy. |
 | `supabase/functions/stripe-billing/index.ts` | Paid build only: Stripe webhook + the Checkout claim route that provisions a tenant. |
 | `setup.ts` | **Guided setup wizard** — `deno run -A setup.ts` provisions a whole instance end to end. |
 | `start.sh` | Interactive start-up menu for a freshly cloned repo (prereqs + common tasks). |
@@ -649,6 +755,15 @@ deploy-safety and reproducibility handoffs that shaped them.
 - **AI:** Anthropic Claude (Sonnet for translation/annotation/recap synthesis, Haiku for
   query parsing); OpenAI Whisper (voice) and `text-embedding-3-small` (embeddings).
 - **Messaging:** Telegram Bot API (webhook).
-- **Tooling:** Supabase CLI, PowerShell deploy spine, Git.
+- **Billing (paid build):** Stripe — Payment Links, Checkout, subscriptions and webhooks,
+  hit over plain `fetch` with signature verification in ~20 lines of WebCrypto. No SDK, so
+  the one function that decides whether paying customers can start using the product has
+  no CDN dependency.
+- **Tooling:** Supabase CLI, GitHub Actions (primary deploy path), a PowerShell and bash
+  deploy spine for offline use, Git.
+
+**Cost per message: ~$0.007** on the current build, down from $0.015 — measured against
+real spend rather than modelled. That is what makes Standard viable at $10 for 750
+messages; both plans are profitable at the cap, not merely on average.
 </content>
 </invoke>
