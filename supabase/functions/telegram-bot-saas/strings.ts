@@ -1651,6 +1651,81 @@ export const STRINGS: Record<string, Row> = {
     pl: "📝 Zapisane.",
   },
 
+
+  // ---- Leaving a tenant (the second seat's own exit) --------------------------
+
+  leave_confirm: {
+    en: (v: any) => `<b>Leave this account?</b>\n\nYou'll lose access to the translation, and these are deleted:\n• your flashcards\n• your private notes\n• your grammar corrections\n\nThe ${v.n} messages already sent stay with ${v.owner}, who owns the account — a shared conversation isn't one person's to erase.\n\nWant your decks? Send /export first and wait for the file.`,
+    uk: (v: any) => `<b>Вийти з цього акаунту?</b>\n\nТи втратиш доступ до перекладу, і буде видалено:\n• твої картки\n• твої приватні нотатки\n• твої виправлення граматики\n\nНадіслані повідомлення (${v.n}) залишаться в ${v.owner} — власника акаунту: спільна розмова не належить комусь одному.\n\nПотрібні картки? Спочатку надішли /export і дочекайся файлу.`,
+    es: (v: any) => `<b>¿Salir de esta cuenta?</b>\n\nPerderás el acceso a la traducción, y se eliminan:\n• tus tarjetas\n• tus notas privadas\n• tus correcciones de gramática\n\nLos ${v.n} mensajes ya enviados se quedan con ${v.owner}, que es quien tiene la cuenta: una conversación compartida no es de una sola persona.\n\n¿Quieres tus mazos? Envía /export primero y espera el archivo.`,
+    fr: (v: any) => `<b>Quitter ce compte ?</b>\n\nTu perdras l'accès à la traduction, et ceci est supprimé :\n• tes cartes\n• tes notes privées\n• tes corrections de grammaire\n\nLes ${v.n} messages déjà envoyés restent chez ${v.owner}, qui détient le compte — une conversation partagée n'appartient pas à une seule personne.\n\nTu veux tes paquets ? Lance /export d'abord et attends le fichier.`,
+    de: (v: any) => `<b>Dieses Konto verlassen?</b>\n\nDu verlierst den Zugang zur Übersetzung, und das hier wird gelöscht:\n• deine Karteikarten\n• deine privaten Notizen\n• deine Grammatikkorrekturen\n\nDie ${v.n} bereits gesendeten Nachrichten bleiben bei ${v.owner}, dem das Konto gehört — ein gemeinsames Gespräch gehört nicht einer Person allein.\n\nDu willst deine Decks? Schick erst /export und warte auf die Datei.`,
+    it: (v: any) => `<b>Uscire da questo account?</b>\n\nPerderai l'accesso alla traduzione, e verranno eliminati:\n• le tue flashcard\n• le tue note private\n• le tue correzioni di grammatica\n\nI ${v.n} messaggi già inviati restano a ${v.owner}, che possiede l'account: una conversazione condivisa non è di una persona sola.\n\nVuoi i tuoi mazzi? Manda prima /export e aspetta il file.`,
+    pt: (v: any) => `<b>Sair desta conta?</b>\n\nVais perder o acesso à tradução, e isto é apagado:\n• os teus cartões\n• as tuas notas privadas\n• as tuas correções de gramática\n\nAs ${v.n} mensagens já enviadas ficam com ${v.owner}, que é dono da conta — uma conversa partilhada não é de uma pessoa só.\n\nQueres os teus baralhos? Envia /export primeiro e espera pelo ficheiro.`,
+    pl: (v: any) => `<b>Opuścić to konto?</b>\n\nStracisz dostęp do tłumaczenia, a to zostanie usunięte:\n• twoje fiszki\n• twoje prywatne notatki\n• twoje poprawki gramatyczne\n\nWysłane wiadomości (${v.n}) zostaną u ${v.owner}, właściciela konta — wspólna rozmowa nie należy do jednej osoby.\n\nChcesz swoje talie? Najpierw wyślij /export i poczekaj na plik.`,
+  },
+
+  leave_btn: {
+    en: "Leave this account", uk: "Вийти з акаунту", es: "Salir de la cuenta",
+    fr: "Quitter le compte", de: "Konto verlassen", it: "Esci dall'account",
+    pt: "Sair da conta", pl: "Opuść konto",
+  },
+
+  leave_done: {
+    en: "You've left. You no longer have access, and your decks, notes and corrections are deleted.\n\nIf you ever want Capybara again — with anyone — just message me.",
+    uk: "Ти вийшов(ла). Доступу більше немає, а твої картки, нотатки й виправлення видалено.\n\nЯкщо колись знову захочеш Capybara — з ким завгодно — просто напиши мені.",
+    es: "Has salido. Ya no tienes acceso, y tus mazos, notas y correcciones se han eliminado.\n\nSi algún día quieres Capybara otra vez —con quien sea— solo escríbeme.",
+    fr: "C'est fait. Tu n'as plus accès, et tes paquets, notes et corrections sont supprimés.\n\nSi un jour tu reveux Capybara — avec qui que ce soit — écris-moi.",
+    de: "Du bist raus. Du hast keinen Zugang mehr, und deine Decks, Notizen und Korrekturen sind gelöscht.\n\nWenn du Capybara je wieder willst — mit wem auch immer — schreib mir einfach.",
+    it: "Sei uscito/a. Non hai più accesso, e i tuoi mazzi, note e correzioni sono stati eliminati.\n\nSe un giorno rivuoi Capybara — con chiunque — scrivimi.",
+    pt: "Saíste. Já não tens acesso, e os teus baralhos, notas e correções foram apagados.\n\nSe um dia quiseres o Capybara outra vez — com quem for — é só escreveres.",
+    pl: "Gotowe. Nie masz już dostępu, a twoje talie, notatki i poprawki zostały usunięte.\n\nJeśli kiedyś znów zechcesz Capybarę — z kimkolwiek — po prostu napisz.",
+  },
+
+  leave_owner_notice: {
+    en: (v: any) => `${v.name} has left the account. Your messages and study decks are untouched, and your subscription is unchanged.\n\nThe seat is free — here's a new invite link if you'd like to add someone:`,
+    uk: (v: any) => `${v.name} вийшов(ла) з акаунту. Твої повідомлення й картки не змінилися, підписка теж.\n\nМісце звільнилося — ось нове посилання-запрошення, якщо захочеш когось додати:`,
+    es: (v: any) => `${v.name} ha salido de la cuenta. Tus mensajes y mazos siguen intactos, y tu suscripción no cambia.\n\nLa plaza está libre — aquí tienes un enlace nuevo por si quieres añadir a alguien:`,
+    fr: (v: any) => `${v.name} a quitté le compte. Tes messages et tes paquets sont intacts, et ton abonnement ne change pas.\n\nLa place est libre — voici un nouveau lien d'invitation si tu veux ajouter quelqu'un :`,
+    de: (v: any) => `${v.name} hat das Konto verlassen. Deine Nachrichten und Decks sind unverändert, dein Abo auch.\n\nDer Platz ist frei — hier ist ein neuer Einladungslink, falls du jemanden hinzufügen willst:`,
+    it: (v: any) => `${v.name} ha lasciato l'account. I tuoi messaggi e mazzi sono intatti, e l'abbonamento non cambia.\n\nIl posto è libero — ecco un nuovo link di invito se vuoi aggiungere qualcuno:`,
+    pt: (v: any) => `${v.name} saiu da conta. As tuas mensagens e baralhos estão intactos, e a tua subscrição não muda.\n\nO lugar está livre — aqui tens um novo link de convite, caso queiras juntar alguém:`,
+    pl: (v: any) => `${v.name} opuścił(a) konto. Twoje wiadomości i talie są nienaruszone, subskrypcja też.\n\nMiejsce jest wolne — oto nowy link z zaproszeniem, jeśli chcesz kogoś dodać:`,
+  },
+
+  leave_owner_cannot: {
+    en: "You own this subscription, so leaving would leave it running with nobody able to cancel it. Use /delete_account instead — that cancels the subscription and deletes everything.",
+    uk: "Ти власник цієї підписки, тож вихід залишив би її активною, і ніхто не зміг би її скасувати. Скористайся /delete_account — це скасує підписку й видалить усе.",
+    es: "Tú tienes esta suscripción, así que salir la dejaría activa sin nadie que pueda cancelarla. Usa /delete_account: cancela la suscripción y lo borra todo.",
+    fr: "C'est ton abonnement : partir le laisserait actif sans personne pour l'annuler. Utilise /delete_account — ça résilie l'abonnement et supprime tout.",
+    de: "Das Abo gehört dir — zu gehen ließe es weiterlaufen, ohne dass jemand kündigen kann. Nimm /delete_account: das kündigt und löscht alles.",
+    it: "L'abbonamento è tuo, quindi uscire lo lascerebbe attivo senza nessuno che possa annullarlo. Usa /delete_account: annulla l'abbonamento ed elimina tutto.",
+    pt: "A subscrição é tua, por isso sair deixá-la-ia ativa sem ninguém para a cancelar. Usa /delete_account — cancela a subscrição e apaga tudo.",
+    pl: "To twoja subskrypcja, więc odejście zostawiłoby ją aktywną i nikt nie mógłby jej anulować. Użyj /delete_account — anuluje subskrypcję i usuwa wszystko.",
+  },
+
+  leave_solo: {
+    en: "You're the only person on this account, so there's nobody to leave. Use /delete_account to close it and cancel the subscription.",
+    uk: "Ти єдина людина в цьому акаунті, тож виходити нема від кого. Скористайся /delete_account, щоб закрити його й скасувати підписку.",
+    es: "Eres la única persona en esta cuenta, así que no hay de quién salir. Usa /delete_account para cerrarla y cancelar la suscripción.",
+    fr: "Tu es seul·e sur ce compte, il n'y a donc personne à quitter. Utilise /delete_account pour le fermer et résilier l'abonnement.",
+    de: "Du bist die einzige Person in diesem Konto, es gibt also niemanden zu verlassen. Mit /delete_account schließt du es und kündigst das Abo.",
+    it: "Sei l'unica persona su questo account, quindi non c'è nessuno da lasciare. Usa /delete_account per chiuderlo e annullare l'abbonamento.",
+    pt: "És a única pessoa nesta conta, por isso não há de quem sair. Usa /delete_account para a fechar e cancelar a subscrição.",
+    pl: "Jesteś jedyną osobą na tym koncie, więc nie ma kogo opuszczać. Użyj /delete_account, żeby je zamknąć i anulować subskrypcję.",
+  },
+
+  leave_failed: {
+    en: "I couldn't complete that just now — nothing has been changed. Try again in a moment.",
+    uk: "Не вдалося це завершити — нічого не змінено. Спробуй за хвилину.",
+    es: "No he podido completarlo ahora — no se ha cambiado nada. Inténtalo en un momento.",
+    fr: "Je n'ai pas pu aller au bout — rien n'a été modifié. Réessaie dans un instant.",
+    de: "Das hat gerade nicht geklappt — es wurde nichts geändert. Versuch es gleich noch mal.",
+    it: "Non sono riuscito a completare — non è stato cambiato nulla. Riprova tra un momento.",
+    pt: "Não consegui concluir agora — nada foi alterado. Tenta daqui a pouco.",
+    pl: "Nie udało się tego dokończyć — nic nie zostało zmienione. Spróbuj za chwilę.",
+  },
+
 };
 
 // Looks up a string. Falls back to English on a missing translation and warns, so a gap

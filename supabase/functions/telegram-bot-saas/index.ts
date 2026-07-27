@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v23";
+const BUILD_VERSION = "saas-v24";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -509,7 +509,7 @@ async function handleUpdate(update: any) {
   // embeds, so both genuinely spend.
   if (!isSuperadmin(msg.from?.id) &&
       !isCmd(msg.text ?? "", "billing", "plans", "subscribe", "pricing", "delete_account", "export",
-             "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned")) {
+             "leave", "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
       await sendMessage(msg.chat.id, quotaRefusalText(viewerLang(msg.from, user), verdict), "HTML");
@@ -559,6 +559,7 @@ async function handleUpdate(update: any) {
     // someone who already subscribes, "plans and pricing" is what /billing answers.
     { match: t => isCmd(t, "billing", "plans", "subscribe", "pricing"),                 handle: handleBilling },
     { match: t => isCmd(t, "delete_account"),                                           handle: handleDeleteAccount },
+    { match: t => isCmd(t, "leave"),                                                    handle: handleLeave },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
@@ -1062,7 +1063,8 @@ function onboardingRefusal(lang: Lang, outcome: string): string {
 // language, and vice versa.
 async function tenantLanguagePair(tenantId: string): Promise<{ native: string; learning: string } | null> {
   const { data } = await dbAdmin.from("users")
-    .select("native_language, learning_language").eq("tenant_id", tenantId).limit(1).maybeSingle();
+    .select("native_language, learning_language")
+    .eq("tenant_id", tenantId).is("left_at", null).limit(1).maybeSingle();
   if (!data) return null;
   return { native: data.learning_language, learning: data.native_language };
 }
@@ -1266,7 +1268,8 @@ async function finishOnboarding(
   // native_language again: this greeting is read by the person who was already here, so
   // it is their language that decides, not the joiner's.
   const { data: others } = await dbAdmin.from("users")
-    .select("telegram_id, display_name, native_language").eq("tenant_id", tenantId).neq("id", created.id);
+    .select("telegram_id, display_name, native_language")
+    .eq("tenant_id", tenantId).neq("id", created.id).is("left_at", null);
   for (const o of others ?? []) {
     await sendMessage(o.telegram_id,
       t(viewerLang(undefined, o), "ob_partner_joined", { name: displayName }));
@@ -1570,6 +1573,100 @@ async function instanceStorageLine(): Promise<string[] | null> {
 //   3. Delete the tenant row LAST. ON DELETE CASCADE takes every table with it, and it is
 //      the row that makes the rest reachable -- dropping it first would strand both of
 //      the steps above with no way to find what they were meant to clean up.
+// ---------------------------------------------------------------------------- Leaving
+//
+// The second seat's own exit. Until this existed the only way out was /delete_account,
+// which is owner-only and destroys the couple -- so a partner in an ended relationship
+// had no lever at all, and their messages stayed in someone else's account indefinitely.
+//
+// This is a SOFT leave. messages.sender_id is ON DELETE RESTRICT, which is the schema
+// saying a shared conversation is not one participant's to erase: the other person paid
+// for that corpus and /recap is grounded in it. So leaving revokes access and removes
+// what is genuinely personal -- decks, notes, corrections -- and the history stays with
+// the account that owns it. Anyone wanting the whole corpus gone still has
+// /delete_account, which the owner runs and which cancels billing first.
+async function handleLeave(msg: any, user: any): Promise<void> {
+  const lang = viewerLang(msg.from, user);
+  const { data: tenant, error } = await dbAdmin.from("tenants")
+    .select("id, owner_user_id").eq("id", user.tenant_id).maybeSingle();
+  if (error || !tenant) {
+    console.error("leave: tenant read failed:", error);
+    await sendMessage(msg.chat.id, t(lang, "account_load_failed"));
+    return;
+  }
+
+  // The owner cannot leave: the subscription is theirs, and a tenant whose owner walked
+  // out would keep billing with nobody able to reach /billing to stop it.
+  if (tenant.owner_user_id === user.id) {
+    await sendMessage(msg.chat.id, t(lang, "leave_owner_cannot"));
+    return;
+  }
+
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, t(lang, "leave_solo"));
+    return;
+  }
+
+  const { count } = await dbAdmin.from("messages")
+    .select("id", { count: "exact", head: true }).eq("tenant_id", tenant.id);
+
+  await sendMessage(msg.chat.id,
+    t(lang, "leave_confirm", { n: count ?? 0, owner: escapeHtml(partner.display_name) }),
+    "HTML",
+    { inline_keyboard: [[{ text: t(lang, "leave_btn"), callback_data: "lv|confirm" }]] });
+}
+
+async function handleLeaveConfirm(cq: any): Promise<void> {
+  const chatId = cq.message?.chat?.id;
+  // Re-resolve from scratch: the button carries no authority, and ownership could have
+  // changed between the command and the tap.
+  const user = await lookupUser(cq.from);
+  if (!user) { await answerCallbackQuery(cq.id, "Not authorized."); return; }
+  const lang = viewerLang(cq.from, user);
+
+  await answerCallbackQuery(cq.id, "…");
+  if (chatId) await editMessageReplyMarkup(chatId, cq.message.message_id);
+
+  // Read the owner BEFORE leaving: afterwards lookupPartner returns nothing for this
+  // user, and there would be no way left to tell them.
+  const db = tenantDb(user.tenant_id);
+  const owner = await lookupPartner(db, user.id);
+
+  // One RPC so a failure rolls back whole. A half-applied leave -- personal data gone but
+  // the seat still held -- would strand someone with no access and no way to be replaced.
+  const { data, error } = await dbAdmin.rpc("leave_tenant", { p_user_id: user.id });
+  const row = Array.isArray(data) ? data[0] : data;
+  const outcome: string = row?.outcome ?? "error";
+  const code: string | null = row?.pairing_code ?? null;
+
+  if (error || outcome !== "ok") {
+    if (outcome === "is_owner") {
+      await sendMessage(chatId, t(lang, "leave_owner_cannot"));
+      return;
+    }
+    console.error(`leave_tenant failed for ${user.id}:`, error ?? outcome);
+    await sendMessage(chatId, t(lang, "leave_failed"));
+    return;
+  }
+  console.log(`user ${user.id} left tenant ${user.tenant_id}`);
+
+  await sendMessage(chatId, t(lang, "leave_done"));
+
+  // Tell the owner, in THEIR language, and hand them the freed seat. The invite goes as
+  // its own message with no parse_mode -- a bot username contains underscores, and under
+  // Markdown those render as italics, producing a handle that does not exist.
+  if (owner) {
+    const oLang = viewerLang(undefined, owner);
+    await sendMessage(owner.telegram_id,
+      t(oLang, "leave_owner_notice", { name: escapeHtml(user.display_name) }), "HTML");
+    const invite = BOT_USERNAME && code ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+    if (invite) await sendMessage(owner.telegram_id, invite);
+    else if (code) await sendMessage(owner.telegram_id, t(oLang, "ob_invite_code_fallback", { code }));
+  }
+}
+
 async function handleDeleteAccount(msg: any, user: any): Promise<void> {
   const { data: tenant, error } = await dbAdmin.from("tenants")
     .select("id, owner_user_id, stripe_subscription_id, status")
@@ -1628,7 +1725,8 @@ async function handleDeleteAccountConfirm(cq: any): Promise<void> {
   // through to English without any error -- the exact silent failure this catalog exists
   // to remove.
   const { data: members } = await dbAdmin.from("users")
-    .select("telegram_id, native_language").eq("tenant_id", tenant.id).neq("id", user.id);
+    .select("telegram_id, native_language")
+    .eq("tenant_id", tenant.id).neq("id", user.id).is("left_at", null);
 
   // 1. Stop the billing.
   if (tenant.stripe_subscription_id) {
@@ -1750,12 +1848,21 @@ async function lookupUser(tgUser: any) {
   // Unscoped, necessarily: this IS the tenant-resolution step. An incoming update
   // carries only a Telegram id, and which tenant that id belongs to is exactly what
   // this read answers -- there is no tenant context to filter by until it returns.
-  // users.telegram_id is globally unique (see migrations-saas/20260726000000), so the
-  // row it finds determines the tenant for everything downstream.
+  // users.telegram_id is unique among ACTIVE members (a partial index, see
+  // migrations-saas/20260727010000), so the row it finds determines the tenant for
+  // everything downstream.
+  //
+  // is("left_at", null) is what makes leaving mean anything. The departed row is retained
+  // -- messages.sender_id is ON DELETE RESTRICT, so the shared history needs it to stay
+  // attributable -- and without this filter that row keeps resolving, so someone who left
+  // would still be served, still be forwarded messages, and still consume their ex's
+  // quota. Filtering here revokes access in exactly one place: everything downstream
+  // takes a null user as "not a member", which is now true. They fall through to the
+  // stranger path and can subscribe again with anyone.
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const { data, error } = await dbAdmin.from("users").select("*")
-      .eq("telegram_id", tgUser.id).maybeSingle();
+      .eq("telegram_id", tgUser.id).is("left_at", null).maybeSingle();
     if (!error) return data ?? null;
     lastErr = error;
     console.error(`lookupUser read failed (attempt ${attempt}):`, error);
@@ -1773,13 +1880,18 @@ async function lookupPartner(db: TenantDb, userId: string) {
   // configured pair (no en/uk assumption).
   const { data: self } = await db.from("users").select("native_language, learning_language").eq("id", userId).single();
   if (!self) return null;
-  const { data, error } = await db.from("users").select("*").eq("native_language", self.learning_language).maybeSingle();
+  // is("left_at", null): a departed member is not a partner. Without this their row keeps
+  // answering here, so translations would still be forwarded to someone who left and the
+  // remaining person would be told they still have a partner.
+  const { data, error } = await db.from("users").select("*")
+    .eq("native_language", self.learning_language).is("left_at", null).maybeSingle();
   if (error) { console.error("lookupPartner failed:", error); return null; }
   return data;
 }
 
 async function lookupLearnerOfLanguage(db: TenantDb, lang: LangCode): Promise<any | null> {
-  const { data, error } = await db.from("users").select("*").eq("learning_language", lang).maybeSingle();
+  const { data, error } = await db.from("users").select("*")
+    .eq("learning_language", lang).is("left_at", null).maybeSingle();
   if (error) { console.error("lookupLearnerOfLanguage failed:", error); return null; }
   return data;
 }
@@ -2806,6 +2918,7 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   // or an exhausted allowance both dead-end here, so it must not be a command you have to
   // already know about.
   { command: "billing", description: "Subscription, usage and payment details" },
+  { command: "leave", description: "Leave this account (for the partner, not the owner)" },
   // The default menu scope is what a stranger sees before they have ever spoken to the
   // bot, so this is the one command in the list aimed at someone who is not a customer
   // yet: it is how the "/" menu offers a way to subscribe rather than only tools that
@@ -4395,6 +4508,7 @@ async function handleCallbackQuery(cq: any) {
   // handleDeleteAccountConfirm re-resolves the sender and re-checks ownership rather than
   // trusting the button.
   if ((cq.data ?? "") === "del|confirm") { await handleDeleteAccountConfirm(cq); return; }
+  if ((cq.data ?? "") === "lv|confirm") { await handleLeaveConfirm(cq); return; }
 
   // Nothing else issues buttons. Acknowledge so Telegram stops showing a spinner on a
   // stale keyboard from an older build, and do nothing.
