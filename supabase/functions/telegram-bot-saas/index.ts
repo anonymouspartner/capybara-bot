@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v19";
+const BUILD_VERSION = "saas-v20";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -503,7 +503,7 @@ async function handleUpdate(update: any) {
       !isCmd(msg.text ?? "", "billing", "plans", "subscribe", "pricing", "delete_account", "export")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
-      await sendMessage(msg.chat.id, quotaRefusalText(verdict), "Markdown");
+      await sendMessage(msg.chat.id, quotaRefusalText(viewerLang(msg.from, user), verdict), "HTML");
       return;
     }
     // The gate already read the tenant row under lock, so the plan came back with the
@@ -515,8 +515,7 @@ async function handleUpdate(update: any) {
     // refusal. Fires on the single crossing message, not on every one after it.
     if (verdict.quota && verdict.used === Math.floor(verdict.quota * 0.9)) {
       await sendMessage(msg.chat.id,
-        `Heads up: you've used ${verdict.used} of your ${verdict.quota} messages this period. ` +
-        `Type /billing to change plan.`);
+        t(viewerLang(msg.from, user), "quota_heads_up", { used: verdict.used, quota: verdict.quota }));
     }
   } else {
     // Gate skipped: the superadmin, or a command that must work while blocked. The plan
@@ -530,16 +529,16 @@ async function handleUpdate(update: any) {
   type Cmd = { match: (t: string) => boolean; handle: (m: any, u: any) => Promise<void> };
   const COMMANDS: Cmd[] = [
     { match: t => t === "/start", handle: async (m, u) => {
+        const lang = viewerLang(m.from, u);
         const solo = !(await lookupPartner(db, u.id));
-        const media = solo
-          ? `Send a photo, file, GIF, or audio with a caption and I'll translate the caption into your study corpus too.\n\n`
-          : `You can also send photos, videos, files, stickers, GIFs, audio, locations, and contacts — I'll forward them to the other person, and translate any caption.\n\n`;
-        const tail = solo
-          ? `Everything is saved as your personal study corpus, searchable with /recap.\n\nType /help to see what I can do.`
-          : `Everything is saved as a study corpus.\n\nType /help to see what I can do.`;
         await sendMessage(m.chat.id,
-          `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
-          media + tail); } },
+          t(lang, "start_greeting", {
+            name: u.display_name,
+            a: langLabel(u.native_language),
+            b: langLabel(u.learning_language),
+          }) + "\n\n" +
+          t(lang, solo ? "start_media_solo" : "start_media_partner") + "\n\n" +
+          t(lang, solo ? "start_tail_solo" : "start_tail_partner")); } },
     // /plans is in the public menu for strangers, so it is visible to customers too.
     // Without an entry here it would fall through to the media handlers below and get
     // TRANSLATED and forwarded to their partner, costing them a quota message. For
@@ -637,20 +636,21 @@ async function consumeQuota(tenantId: string): Promise<QuotaVerdict> {
   };
 }
 
-function quotaRefusalText(v: QuotaVerdict): string {
+function quotaRefusalText(lang: Lang, v: QuotaVerdict): string {
   if (v.reason === "quota_exceeded") {
+    // Date formatted in the reader's locale rather than always en-GB: "26 серпня" beats
+    // "26 August" for the person being told when their allowance comes back.
     const resumes = v.periodEnd
-      ? ` Your allowance resets on ${new Date(v.periodEnd).toLocaleDateString("en-GB", { day: "numeric", month: "long" })}.`
+      ? t(lang, "quota_resets_on", {
+          date: new Date(v.periodEnd).toLocaleDateString(lang, { day: "numeric", month: "long" }),
+        })
       : "";
-    return `You've used all ${v.quota} messages for this billing period.${resumes}\n\n` +
-      `Type /billing to move to a larger plan.`;
+    return t(lang, "quota_exceeded", { quota: v.quota, resumes });
   }
-  if (v.reason === "inactive_subscription") {
-    return `Your Capybara subscription isn't active right now, so I've paused translating.\n\n` +
-      `Type /billing to update your payment details — nothing is deleted in the meantime.`;
-  }
-  return `I can't verify your subscription at the moment. Type /billing to check it, or try again shortly.`;
+  if (v.reason === "inactive_subscription") return t(lang, "quota_inactive");
+  return t(lang, "quota_unverifiable");
 }
+
 
 // ---------------------------------------------------------------------------- Onboarding
 //
@@ -1287,55 +1287,53 @@ function planLabel(plan: string | null | undefined): string {
 // and giving them a cancel button for someone else's card would be a support incident
 // waiting to happen.
 async function handleBilling(msg: any, user: any): Promise<void> {
+  const lang = viewerLang(msg.from, user);
   const { data: tenant, error } = await dbAdmin.from("tenants")
     .select("stripe_customer_id, owner_user_id, plan, status, message_quota, messages_used, current_period_end")
     .eq("id", user.tenant_id).maybeSingle();
   if (error || !tenant) {
     console.error("billing: tenant read failed:", error);
-    await sendMessage(msg.chat.id, "I couldn't load your subscription just now. Try again shortly.");
+    await sendMessage(msg.chat.id, t(lang, "billing_load_failed"));
     return;
   }
 
   const used = tenant.messages_used ?? 0;
   const quota = tenant.message_quota;
   const renews = tenant.current_period_end
-    ? new Date(tenant.current_period_end).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })
+    ? new Date(tenant.current_period_end).toLocaleDateString(lang, { day: "numeric", month: "long", year: "numeric" })
     : "—";
-  const summary =
-    `*Your Capybara subscription*\n` +
-    `Plan: ${planLabel(tenant.plan)}\n` +
-    `Status: ${tenant.status}\n` +
-    `Used this period: ${used}${quota ? ` of ${quota}` : " (unlimited)"}\n` +
-    `Renews: ${renews}`;
+  const summary = t(lang, "billing_summary", {
+    plan: planLabel(tenant.plan),
+    status: tenant.status,
+    usage: quota ? `${used} / ${quota}` : `${used} (${t(lang, "billing_unlimited")})`,
+    renews,
+  });
 
   // Strict equality: a NULL owner denies everyone, rather than admitting everyone.
   // `owner && owner !== user` reads as an ownership check but is really "deny only if
   // someone else owns it" -- with no owner recorded it grants the Stripe portal, and
   // below it grants irreversible deletion, to whichever partner asks first.
   if (tenant.owner_user_id !== user.id) {
-    await sendMessage(msg.chat.id,
-      `${summary}\n\nBilling is managed by whoever set up the subscription — ask them to run /billing.`,
-      "Markdown");
+    await sendMessage(msg.chat.id, `${summary}\n\n${t(lang, "billing_not_owner")}`, "HTML");
     return;
   }
   if (!STRIPE_SECRET_KEY || !tenant.stripe_customer_id) {
-    await sendMessage(msg.chat.id, `${summary}\n\nSelf-service billing isn't configured on this instance yet.`, "Markdown");
+    await sendMessage(msg.chat.id, `${summary}\n\n${t(lang, "billing_not_configured")}`, "HTML");
     return;
   }
 
   const portalUrl = await createBillingPortalSession(tenant.stripe_customer_id);
   if (!portalUrl) {
-    await sendMessage(msg.chat.id, `${summary}\n\nI couldn't open the billing portal just now. Try again shortly.`, "Markdown");
+    await sendMessage(msg.chat.id, `${summary}\n\n${t(lang, "billing_portal_failed")}`, "HTML");
     return;
   }
+  // /delete_account is surfaced here rather than in the "/" menu: this is where someone
+  // who wants out actually looks, and a destructive command does not belong one tap away
+  // in a menu used every day.
   await sendMessage(msg.chat.id,
-    `${summary}\n\nManage your card, plan or cancellation here — the link is private and expires shortly.\n\n` +
-    // Surfaced here rather than in the "/" menu: this is where someone who wants out
-    // actually looks, and a destructive command does not belong one tap away in a menu
-    // used every day.
-    `To delete your account and all its data permanently, send /delete\\_account.`,
-    "Markdown",
-    { inline_keyboard: [[{ text: "Manage subscription", url: portalUrl }]] });
+    `${summary}\n\n${t(lang, "billing_manage")}`,
+    "HTML",
+    { inline_keyboard: [[{ text: t(lang, "billing_btn_manage"), url: portalUrl }]] });
 }
 
 // ---------------------------------------------------------------------------- /tenants (operator)
@@ -3403,88 +3401,56 @@ async function refreshVocabularyCounts(db: TenantDb) {
 async function handleHelp(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const isAdmin = isSuperadmin(msg.from?.id);
-  const viewerLang = user.native_language === "uk" ? "uk" : "en";
+  const lang = viewerLang(msg.from, user);
   const solo = !(await lookupPartner(db, user.id));
-  const lines: string[] = [];
-  if (viewerLang === "uk") {
-    lines.push(
-      "*\u041a\u043e\u043c\u0430\u043d\u0434\u0438 Capybara*",
-      "",
-      "\u0414\u0432\u0456 \u043a\u043e\u043b\u043e\u0434\u0438: \ud83c\uddfa\ud83c\udde6 \u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0456 \ud83c\uddec\ud83c\udde7 \u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430.",
-      "",
-      solo
-        ? "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u043c\u0456\u0436 \u0442\u0432\u043e\u0457\u043c\u0438 \u0434\u0432\u043e\u043c\u0430 \u043c\u043e\u0432\u0430\u043c\u0438"
-        : "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0456 \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
-      solo
-        ? "\u2022 \u0414\u043e\u0434\u0430\u0439 \u043f\u0456\u0434\u043f\u0438\u0441 \u0434\u043e \u0444\u043e\u0442\u043e/\u0444\u0430\u0439\u043b\u0443 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0439\u043e\u0433\u043e \u0443 \u0442\u0432\u0456\u0439 \u043a\u043e\u0440\u043f\u0443\u0441"
-        : "\u2022 \u041d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0444\u043e\u0442\u043e \u0430\u0431\u043e \u0432\u0456\u0434\u0435\u043e \u2014 \u044f \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u0439\u043e\u0433\u043e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
-      "\u2022 /vocab \u2014 \u041d\u0430\u0439\u0447\u0430\u0441\u0442\u0456\u0448\u0456 \u0441\u043b\u043e\u0432\u0430, \u0449\u0435 \u043d\u0435 \u0432\u0438\u0432\u0447\u0435\u043d\u0456",
-      "\u2022 /learn <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0414\u043e\u0434\u0430\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0434\u043e \u043a\u043e\u043b\u043e\u0434\u0438",
-      "\u2022 /learn top N \u2014 \u041e\u043f\u0442\u043e\u043c \u0434\u043e\u0434\u0430\u0442\u0438 N \u0441\u043b\u0456\u0432",
-      "\u2022 /forget <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0412\u0438\u0434\u0430\u043b\u0438\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0437 \u043a\u043e\u043b\u043e\u0434\u0438",
-      "\u2022 /export \u2014 \u0417\u0430\u0432\u0430\u043d\u0442\u0430\u0436\u0438\u0442\u0438 CSV \u0434\u043b\u044f Anki",
-      "\u2022 /capybara \u2014 \u041f\u0435\u0440\u0435\u0432\u0456\u0440\u043a\u0430 \u0433\u0440\u0430\u043c\u0430\u0442\u0438\u043a\u0438 \u043c\u043e\u0432\u0438, \u044f\u043a\u0443 \u0432\u0438\u0432\u0447\u0430\u0454\u0448 (\u0443\u0432\u0456\u043c\u043a/\u0432\u0438\u043c\u043a)",
-      "",
-      "*\u041f\u0430\u043c'\u044f\u0442\u044c \u0440\u043e\u0437\u043c\u043e\u0432*",
-      "",
-      "\u2022 /ask <\u0437\u0430\u043f\u0438\u0442> \u2014 \u0417\u0430\u043f\u0438\u0442\u0430\u0439 \u043f\u0440\u043e \u0432\u0430\u0448\u0456 \u0440\u043e\u0437\u043c\u043e\u0432\u0438 (\u043f\u0440\u0438\u0432\u0430\u0442\u043d\u043e)",
-      "\u2022 /note <\u043d\u043e\u0442\u0430\u0442\u043a\u0430> \u2014 \u041f\u0440\u0438\u0432\u0430\u0442\u043d\u0430 \u043d\u043e\u0442\u0430\u0442\u043a\u0430",
-      "\u2022 /reconcile \u2014 \u0412\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c \u043d\u0430 \u043f\u043e\u0432\u0456\u0434\u043e\u043c\u043b\u0435\u043d\u043d\u044f, \u0449\u043e\u0431 \u0432\u0438\u043a\u043b\u044e\u0447\u0438\u0442\u0438 \u0437 /ask",
-      "\u2022 /restore \u2014 \u041f\u043e\u0432\u0435\u0440\u043d\u0443\u0442\u0438 \u0432 /ask",
-      "\u2022 /pin \u2014 \u041f\u043e\u0437\u043d\u0430\u0447\u0438\u0442\u0438 \u044f\u043a \u0432\u0430\u0436\u043b\u0438\u0432\u0435",
-      "\u2022 /unpin \u2014 \u0417\u043d\u044f\u0442\u0438 \u043f\u043e\u0437\u043d\u0430\u0447\u043a\u0443",
-      "\u2022 /pinned \u2014 \u0421\u043f\u0438\u0441\u043e\u043a \u0437\u0430\u043a\u0440\u0456\u043f\u043b\u0435\u043d\u0438\u0445",
-      "",
-      "\u2022 /billing \u2014 \u041f\u0456\u0434\u043f\u0438\u0441\u043a\u0430, \u0432\u0438\u043a\u043e\u0440\u0438\u0441\u0442\u0430\u043d\u043d\u044f \u0442\u0430 \u043e\u043f\u043b\u0430\u0442\u0430",
-      "\u2022 /delete\\_account \u2014 \u0412\u0438\u0434\u0430\u043b\u0438\u0442\u0438 \u0430\u043a\u0430\u0443\u043d\u0442 \u0456 \u0432\u0441\u0456 \u0434\u0430\u043d\u0456 (\u043d\u0430\u0437\u0430\u0432\u0436\u0434\u0438)",
-    );
-  } else {
-    lines.push(
-      "*Capybara commands*",
-      "",
-      "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
-      "",
-      solo
-        ? "\u2022 Just type or send a voice message \u2014 I translate it between your two languages"
-        : "\u2022 Just type or send a voice message \u2014 I translate it and forward to the other person",
-      solo
-        ? "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it into your study corpus"
-        : "\u2022 Send a photo, video, file, sticker, GIF, audio, location, or contact \u2014 I forward it to the other person",
-      "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it and add it to your study corpus",
-      "\u2022 /vocab \u2014 Top words still unlearned in each deck",
-      "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
-      "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",
-      "\u2022 /forget <word> \u2014 Remove a word from the matching deck",
-      "\u2022 /export \u2014 Download both decks as a single CSV for Anki",
-      "\u2022 /capybara \u2014 Toggle grammar checks on the language you're learning",
-      "",
-      "*Conversation memory*",
-      "",
-      "\u2022 /ask <question> \u2014 Ask about your conversations (private to you)",
-      "\u2022 /note <note> \u2014 Add a private note only your /ask finds",
-      "\u2022 /reconcile \u2014 Reply to a message to exclude it from /ask",
-      "\u2022 /restore \u2014 Reply to a message to bring it back into /ask",
-      "\u2022 /pin \u2014 Reply to a message to mark it meaningful (small /ask boost)",
-      "\u2022 /unpin \u2014 Reply to a pinned message to remove the pin",
-      "\u2022 /pinned \u2014 List all pinned messages chronologically",
-      "",
-      "\u2022 /billing \u2014 Your subscription, usage this period, and payment details",
-      "\u2022 /delete\\_account \u2014 Permanently delete your account and all its data",
-    );
-  }
+
+  // Built from the user's ACTUAL pair. The previous version hardcoded "a Ukrainian deck
+  // and an English deck" with fixed flags, which is simply wrong for any of the other
+  // fifty-five pairs the picker offers -- a Ukrainian speaker learning Polish was told
+  // they had an English deck.
+  const a = `${langMeta(user.native_language).flag} ${langLabel(user.native_language)}`;
+  const b = `${langMeta(user.learning_language).flag} ${langLabel(user.learning_language)}`;
+
+  const lines: string[] = [
+    t(lang, "help_header"),
+    "",
+    t(lang, "help_decks", { a, b }),
+    "",
+    `• ${t(lang, solo ? "help_write_solo" : "help_write_partner")}`,
+    `• ${t(lang, solo ? "start_media_solo" : "start_media_partner")}`,
+    `• /vocab — ${t(lang, "cmd_vocab")}`,
+    `• /learn &lt;word&gt; — ${t(lang, "cmd_learn")}`,
+    `• /learn top N — ${t(lang, "cmd_learn_top")}`,
+    `• /forget &lt;word&gt; — ${t(lang, "cmd_forget")}`,
+    `• /export — ${t(lang, "cmd_export")}`,
+    `• /capybara — ${t(lang, "cmd_capybara")}`,
+    "",
+    t(lang, "help_memory_header"),
+    "",
+    `• /ask &lt;question&gt; — ${t(lang, "cmd_ask")}`,
+    `• /note &lt;note&gt; — ${t(lang, "cmd_note")}`,
+    `• /reconcile — ${t(lang, "cmd_reconcile")}`,
+    `• /restore — ${t(lang, "cmd_restore")}`,
+    `• /pin — ${t(lang, "cmd_pin")}`,
+    `• /unpin — ${t(lang, "cmd_unpin")}`,
+    `• /pinned — ${t(lang, "cmd_pinned")}`,
+    "",
+    `• /billing — ${t(lang, "cmd_billing")}`,
+    `• /delete_account — ${t(lang, "cmd_delete_account")}`,
+  ];
+
+  // Operator tools stay English and stay out of a customer's help: one person reads them.
   if (isAdmin) {
-    lines.push("");
-    lines.push("_Admin:_");
-    lines.push("\u2022 /backfill \u2014 Annotate one batch of unprocessed messages");
-    lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
-    lines.push("\u2022 /backfill\\_senses \u2014 Re-fix flashcard translations to match their example sentence");
-    lines.push("\u2022 /backfill\\_grammar \u2014 Fill in card fields for older grammar corrections");
-    lines.push("\u2022 /annotate\\_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)");
-    lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
-    lines.push("\u2022 /tenants \u2014 Service overview: signups needing attention, quotas, API spend");
-    lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
+    lines.push(
+      "",
+      "<b>Operator</b>",
+      "• /tenants — service-wide view",
+      "• /diag — diagnostics",
+      "• /annotate_ab — annotation model comparison",
+      "• /backfill, /backfill_translations, /backfill_senses, /backfill_grammar, /recap_backfill",
+    );
   }
-  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
+  await sendMessage(msg.chat.id, lines.join("\n"), "HTML");
 }
 
 async function fetchTopUnlearned(db: TenantDb, lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
