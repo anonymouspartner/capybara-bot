@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v16";
+const BUILD_VERSION = "saas-v17";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -917,7 +917,7 @@ async function handleTrialMessage(msg: any): Promise<void> {
 
   const used: number = row.used ?? 0;
   const left = Math.max(0, TRIAL_MESSAGE_LIMIT - used);
-  let body = `${langMeta(to).flag} ${translated}`;
+  let body = `${langMeta(to).flag} ${escapeHtml(translated)}`;
 
   // The deck is the thing a price list can't convey and a translation app doesn't do, so
   // the first message shows it. Only the first: annotation is ~83% of per-message cost,
@@ -926,8 +926,8 @@ async function handleTrialMessage(msg: any): Promise<void> {
     const sample = await trialFlashcards(text, from, to, translated);
     if (sample) body += `\n\n${sample}`;
   }
-  body += `\n\n_${left} free ${left === 1 ? "message" : "messages"} left._`;
-  await sendMessage(chatId, body, "Markdown");
+  body += `\n\n<i>${left} free ${left === 1 ? "message" : "messages"} left.</i>`;
+  await sendMessage(chatId, body, "HTML");
 }
 
 // A few flashcards from the trial message, formatted for chat. Returns null rather than
@@ -941,7 +941,7 @@ async function trialFlashcards(text: string, from: LangCode, to: LangCode, trans
       .filter((v: any) => v?.lemma && v?.lemma_translation)
       .slice(0, 4);
     if (rows.length === 0) return null;
-    const lines = rows.map((v: any) => `• *${v.lemma}* — ${v.lemma_translation}`).join("\n");
+    const lines = rows.map((v: any) => `• <b>${escapeHtml(String(v.lemma))}</b> — ${escapeHtml(String(v.lemma_translation))}`).join("\n");
     return `Flashcards this would add to your deck:\n${lines}`;
   } catch (e) {
     console.error("trial flashcards failed:", e);
@@ -1927,7 +1927,7 @@ async function handleTextMessage(msg: any, user: any) {
   if (insertErr) console.error("messages insert (text) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(msg.chat.id, `\ud83d\udd24 Translation (${translationTargetLang}):\n${translated}`, "Markdown");
+    await sendMessage(msg.chat.id, `\ud83d\udd24 Translation (${translationTargetLang}):\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, originalText, translated!, originalLang, translationTargetLang);
   } else {
     await sendMessage(msg.chat.id, `\u26a0\ufe0f Translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} Your message was saved.`);
@@ -2018,7 +2018,7 @@ async function handleVoiceMessage(msg: any, user: any) {
   if (insertErr) console.error("messages insert (voice) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${transcript}\n\n\ud83d\udd24 Translation (${targetLang}):\n${translated}`, "Markdown");
+    await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${escapeHtml(transcript)}\n\n\ud83d\udd24 Translation (${targetLang}):\n${escapeHtml(translated)}`, "HTML");
     await forwardVoiceToPartner(user, voice.file_id, transcript, translated!, originalLang, targetLang);
   } else {
     await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${transcript}\n\n\u26a0\ufe0f Translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The transcript was saved.`);
@@ -2575,6 +2575,14 @@ async function annotateMessage(db: TenantDb, messageId: string, text: string, la
   await db.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
 }
 
+// Escapes text for Telegram's HTML parse mode. Only these three characters are special,
+// which is the whole reason the user-content messages use HTML rather than Markdown:
+// legacy Markdown has no reliable escape and silently eats the underscores in a name like
+// @capybara_translate_bot, turning a working handle into one that does not exist.
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 async function sendMessage(chatId: number, text: string, parseMode?: string, replyMarkup?: any) {
   const body: any = { chat_id: chatId, text };
   if (parseMode) body.parse_mode = parseMode;
@@ -2589,6 +2597,23 @@ async function sendMessage(chatId: number, text: string, parseMode?: string, rep
     const respBody = respBodyRaw.length > 500 ? respBodyRaw.slice(0, 500) + "\u2026" : respBodyRaw;
     const preview = text.length > 200 ? text.slice(0, 200) + "\u2026" : text;
     console.error(`sendMessage failed: chat=${chatId} status=${resp.status} body=${respBody} preview=${JSON.stringify(preview)}`);
+// Telegram rejects a whole message when parse_mode is set and the text does not parse --
+// legacy Markdown breaks on a single unbalanced _ * ` or [. User text routinely contains
+// those (a bot @user_name, a snippet of code, an emoticon), and until this fallback existed
+// the send simply failed: the error was logged and the message never arrived, with the
+// sender given no sign. Retrying once as plain text costs the formatting and keeps the
+// message, which is the right trade every time.
+    if (parseMode && /can't parse entities|can not parse entities/i.test(respBodyRaw)) {
+      const retryBody: any = { chat_id: chatId, text };
+      if (replyMarkup) retryBody.reply_markup = replyMarkup;
+      const retry = await fetch(`${TELEGRAM_API}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(retryBody),
+      });
+      if (retry.ok) console.warn(`sendMessage: delivered as plain text after a ${parseMode} parse failure (chat=${chatId})`);
+      else console.error(`sendMessage: plain-text retry also failed (chat=${chatId}, status=${retry.status})`);
+    }
   }
 }
 
@@ -2813,7 +2838,7 @@ async function forwardToPartner(sender: any, original: string, translated: strin
   const partner = await lookupPartner(db, sender.id);
   if (!partner) return;
   const senderName = sender.display_name;
-  await sendMessage(partner.telegram_id, `\ud83d\udcac ${senderName} says (${transLang}):\n${translated}\n\n_Original (${origLang}):_\n${original}`, "Markdown");
+  await sendMessage(partner.telegram_id, `\ud83d\udcac ${escapeHtml(senderName)} says (${transLang}):\n${escapeHtml(translated)}\n\n<i>Original (${origLang}):</i>\n${escapeHtml(original)}`, "HTML");
 }
 
 async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcript: string, translated: string, origLang: string, transLang: string) {
@@ -2822,7 +2847,7 @@ async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcrip
   if (!partner) return;
   const senderName = sender.display_name;
   await sendVoice(partner.telegram_id, voiceFileId);
-  await sendMessage(partner.telegram_id, `\ud83d\udcac ${senderName} said (${transLang}):\n${translated}\n\n_Original (${origLang}):_\n${transcript}`, "Markdown");
+  await sendMessage(partner.telegram_id, `\ud83d\udcac ${escapeHtml(senderName)} said (${transLang}):\n${escapeHtml(translated)}\n\n<i>Original (${origLang}):</i>\n${escapeHtml(transcript)}`, "HTML");
 }
 
 // Videos are forwarded as-is by Telegram file_id (no transcription/translation).
@@ -2922,7 +2947,7 @@ async function translateCaptionToPartner(user: any, senderChatId: number, captio
   if (insertErr) console.error("messages insert (caption) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(senderChatId, `🔤 Caption translation (${translationTargetLang}):\n${translated}`, "Markdown");
+    await sendMessage(senderChatId, `🔤 Caption translation (${translationTargetLang}):\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, caption, translated!, originalLang, translationTargetLang);
   } else {
     await sendMessage(senderChatId, `⚠️ Caption translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The media was still forwarded.`);
