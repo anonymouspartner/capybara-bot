@@ -786,7 +786,7 @@ async function plansMessage(prefix?: string): Promise<{ text: string; keyboard: 
   const prices = await stripePriceText();
   const body = plansConfigured()
     ? `${planComparison(prices)}\n\nAfter paying you'll get a link that sets everything up in ` +
-      `a couple of taps — plus one to invite a language partner, whenever you want it.`
+      `three taps — plus one to invite a language partner, whenever you want it.`
     : `Subscriptions aren't open through the bot just yet — message the person who sent you here.`;
   return { text: `${prefix ? prefix + "\n\n" : ""}${body}`, keyboard: planKeyboard(prices, false) };
 }
@@ -990,7 +990,7 @@ async function beginOnboarding(msg: any, code: string): Promise<void> {
   if ((row.seats_taken ?? 0) === 0) {
     // First seat: the person who paid. They choose the language pair for the couple.
     await sendMessage(msg.chat.id,
-      `Welcome to Capybara! Let's set up your account — two quick questions.\n\n` +
+      `Welcome to Capybara! Let's get you set up — three taps and you're done.\n\n` +
       `First: which language do you speak natively?`,
       undefined, langPickerKeyboard(`ob|l|${code}`));
     return;
