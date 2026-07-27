@@ -75,28 +75,33 @@ const PLAN_QUOTA: Record<PlanKey, number> = {
 
 type PlanKey = "standard" | "ultimate";
 
-// Annotate only what a human wrote, not what the bot wrote back.
+// Annotation depth is what separates the plans.
 //
-// Every message used to get two annotation passes: one on the original, one on the
-// translation. The second mines vocabulary out of the model's own output -- which is also
-// where a wrong-sense card is most likely, since it re-analyses text that was itself
-// generated under sense pressure. Annotation is ~83% of API spend and this halves it,
-// taking a message from ~$0.012 to ~$0.007.
+// Every message has two annotatable sides: the text a human wrote, and the bot's
+// translation of it. Annotating both doubles the flashcards and very nearly doubles the
+// cost, since annotation is ~83% of API spend -- roughly $0.007 a message against $0.012.
 //
-// The single-tenant build did this first (v84) and the paid build deliberately did not
-// follow, on the grounds that halving a subscriber's flashcards is a product decision
-// rather than a cost one. The pricing is what settled it: at $0.012/message a Standard
-// subscriber at their 750 cap costs $9.00 of inference, which pins the floor at $9.58 and
-// makes any price under $12 a loss on heavy users. Cutting the machine-written half is
-// what makes a $10 plan honest, and it is the half sourced from Claude rather than from a
-// partner.
+//   Standard  -> the human-written side only
+//   Ultimate  -> both sides
 //
-// Flipping this back on is not sufficient on its own: migration 20260727000200 stopped
-// the tenant-scoped backfill_pending_sides from offering translation sides, so re-enabling
-// here without reverting that leaves the newly annotated sides invisible to /backfill.
-// Typed as boolean, not the literal false, so the guarded call sites stay live code to the
-// type checker.
-const ANNOTATE_TRANSLATION_SIDE: boolean = false;
+// This started life as a cost cut (the single-tenant bot dropped the machine side in v84)
+// and became the product axis because the pricing forced the question. At $0.012 a
+// Standard subscriber at their 750 cap cost $9.00 of inference, pinning the break-even
+// floor near $9.58 and making any price under $12 a loss on heavy users -- a 60% cost
+// ratio. Rather than discount into that, the plans now differ by something a customer can
+// understand and that tracks what it actually costs to serve them.
+//
+// The half Standard gives up is the one sourced from Claude's output rather than a
+// partner's actual writing, and it is where a wrong-sense card is most likely, since it
+// re-analyses text that was itself generated under sense pressure. Measured on a real
+// corpus, what remains is 53% of Ukrainian and 48% of English card supply.
+//
+// backfill_pending_sides (migrations-saas/20260727000200) applies the SAME rule, reading
+// the plan off the tenant row. If these two ever disagree the distinction is fiction: the
+// grind would quietly annotate what the live path declined to.
+function annotatesBothSides(plan: string | null | undefined): boolean {
+  return plan === "ultimate";
+}
 
 // How much a stranger gets before the wall, and the ceiling across every stranger per day.
 // Passed into consume_trial_message so these constants stay the single source of truth
@@ -487,6 +492,11 @@ async function handleUpdate(update: any) {
       await sendMessage(msg.chat.id, quotaRefusalText(verdict), "Markdown");
       return;
     }
+    // The gate already read the tenant row under lock, so the plan came back with the
+    // verdict for free. Annotation depth is per-plan and the handlers that schedule it
+    // are several frames down, so it rides on the user object for the rest of this
+    // update rather than being fetched again in each of them.
+    user.plan = verdict.plan;
     // One heads-up as they approach the cap, so the first they hear of it isn't a
     // refusal. Fires on the single crossing message, not on every one after it.
     if (verdict.quota && verdict.used === Math.floor(verdict.quota * 0.9)) {
@@ -494,6 +504,13 @@ async function handleUpdate(update: any) {
         `Heads up: you've used ${verdict.used} of your ${verdict.quota} messages this period. ` +
         `Type /billing to change plan.`);
     }
+  } else {
+    // Gate skipped: the superadmin, or a command that must work while blocked. The plan
+    // still has to be right -- otherwise the operator's own tenant would silently be
+    // annotated at Standard depth no matter what they pay for, which is exactly the
+    // account used to test that Ultimate looks different.
+    const { data: t } = await dbAdmin.from("tenants").select("plan").eq("id", user.tenant_id).maybeSingle();
+    user.plan = t?.plan ?? null;
   }
   // Command dispatch table — to add a command, append one entry here.
   type Cmd = { match: (t: string) => boolean; handle: (m: any, u: any) => Promise<void> };
@@ -579,6 +596,11 @@ type QuotaVerdict = {
   used: number;
   quota: number | null;
   periodEnd: string | null;
+  // The tenant's plan, carried out of the gate so the caller can pick annotation depth
+  // without a second read. Null when the gate could not read it (an RPC error, or a
+  // superadmin bypassing the gate entirely), which annotationDepth treats as Standard --
+  // the cheaper of the two, so an unknown plan never bills for what it did not sell.
+  plan: string | null;
 };
 
 async function consumeQuota(tenantId: string): Promise<QuotaVerdict> {
@@ -588,7 +610,7 @@ async function consumeQuota(tenantId: string): Promise<QuotaVerdict> {
     // problem, and the downside is bounded -- a handful of messages past the cap during
     // an outage, versus telling everyone their subscription is broken.
     console.error("consume_message_quota failed; allowing message:", error);
-    return { allowed: true, reason: "rpc_error", used: 0, quota: null, periodEnd: null };
+    return { allowed: true, reason: "rpc_error", used: 0, quota: null, periodEnd: null, plan: null };
   }
   const row = Array.isArray(data) ? data[0] : data;
   return {
@@ -597,6 +619,7 @@ async function consumeQuota(tenantId: string): Promise<QuotaVerdict> {
     used: row?.used ?? 0,
     quota: row?.quota ?? null,
     periodEnd: row?.period_end ?? null,
+    plan: row?.plan ?? null,
   };
 }
 
@@ -708,6 +731,21 @@ function planKeyboard(prices: Record<PlanKey, string>, includeTrial: boolean) {
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
+// The plans differ by more than a number, so the copy has to say what. Quota alone reads
+// as "same thing, bigger" and gives nobody a reason to upgrade beyond running out; the
+// deck depth is the real difference and it is the one that tracks what each plan costs to
+// run. Stated in terms of what the customer gets, never "one annotation pass".
+function planComparison(prices: Record<PlanKey, string>): string {
+  return (
+    `*Standard* — ${prices.standard}\n` +
+    `${PLAN_QUOTA.standard.toLocaleString()} messages/month. Flashcards from what *you* write.\n\n` +
+    `*Ultimate* — ${prices.ultimate}\n` +
+    `${PLAN_QUOTA.ultimate.toLocaleString()} messages/month. Flashcards from *both* sides — ` +
+    `what you write and what you read. Roughly double the deck.\n\n` +
+    `One subscription covers both of you.`
+  );
+}
+
 function plansConfigured(): boolean {
   return Boolean(PAYMENT_LINK_STANDARD || PAYMENT_LINK_ULTIMATE);
 }
@@ -716,10 +754,7 @@ function plansConfigured(): boolean {
 // makes it different from a translation app, both plans, and a way in.
 async function introMessage(): Promise<{ text: string; keyboard: any }> {
   const prices = await stripePriceText();
-  const plans = plansConfigured()
-    ? `*Standard* — ${prices.standard}, ${PLAN_QUOTA.standard.toLocaleString()} messages/month\n` +
-      `*Ultimate* — ${prices.ultimate}, ${PLAN_QUOTA.ultimate.toLocaleString()} messages/month\n\n` +
-      `One subscription covers both of you.`
+  const plans = plansConfigured() ? planComparison(prices)
     : `Subscriptions aren't open through the bot just yet — message the person who sent you here and they'll get you set up.`;
   return {
     text:
@@ -740,10 +775,8 @@ async function introMessage(): Promise<{ text: string; keyboard: any }> {
 async function plansMessage(prefix?: string): Promise<{ text: string; keyboard: any }> {
   const prices = await stripePriceText();
   const body = plansConfigured()
-    ? `*Standard* — ${prices.standard}, ${PLAN_QUOTA.standard.toLocaleString()} messages/month\n` +
-      `*Ultimate* — ${prices.ultimate}, ${PLAN_QUOTA.ultimate.toLocaleString()} messages/month\n\n` +
-      `One subscription covers both of you. After paying you'll get a link that sets ` +
-      `everything up in a couple of taps, plus one to send your partner.`
+    ? `${planComparison(prices)}\n\nAfter paying you'll get a link that sets everything up in ` +
+      `a couple of taps, plus one to send your partner.`
     : `Subscriptions aren't open through the bot just yet — message the person who sent you here.`;
   return { text: `${prefix ? prefix + "\n\n" : ""}${body}`, keyboard: planKeyboard(prices, false) };
 }
@@ -1272,14 +1305,16 @@ async function handleBilling(msg: any, user: any): Promise<void> {
 // nothing, and it keeps the numbers in the same place as the text that explains them. If
 // it ever stops being nothing, that is a good problem and the fix is a view.
 
-// ~$0.007 per message, calibrated against real spend rather than modelled (the cost model
-// came in 20% under the actual bill, so it is scaled to match). The trajectory: $0.015
-// before any of the annotation work, $0.012 after dropping the write-only
-// grammar/idiom/register fields and skipping/reusing what it could, and $0.007 once the
-// machine-translated side stopped being annotated at all.
-// Used only for the estimate below, so drift costs nothing; re-derive it from the
-// Anthropic console after a month of real traffic.
-const EST_COST_PER_MESSAGE_USD = 0.007;
+// Per-message cost BY PLAN, since Ultimate annotates both sides and Standard does not --
+// a single blended constant would misreport whichever mix you actually have. Calibrated
+// against real spend rather than modelled (the cost model came in 20% under the actual
+// bill, so it is scaled to match). The trajectory: $0.015 before any of the annotation
+// work, $0.012 after dropping the write-only grammar/idiom/register fields and
+// skipping/reusing what it could, and $0.007 again for the side that is no longer
+// annotated. Used only for the estimate in /tenants, so drift costs nothing; re-derive
+// from the Anthropic console after a month of real traffic.
+const EST_COST_PER_MESSAGE_USD: Record<string, number> = { standard: 0.007, ultimate: 0.012 };
+const EST_COST_FALLBACK_USD = 0.012;
 
 // Supabase free tier database ceiling. The commercial project runs on it for now, so the
 // number that matters operationally is not the bill (there isn't one) but the headroom:
@@ -1309,6 +1344,7 @@ async function handleTenants(msg: any, _user: any): Promise<void> {
 
   const byStatus = new Map<string, number>();
   const byPlan = new Map<string, number>();
+  const usedByPlan = new Map<string, number>();
   let totalUsed = 0;
   const unclaimed: any[] = [];   // paid, nobody has set up at all
   const halfSet: any[] = [];     // one seat taken, partner never joined
@@ -1318,6 +1354,9 @@ async function handleTenants(msg: any, _user: any): Promise<void> {
   for (const t of tenants) {
     byStatus.set(t.status, (byStatus.get(t.status) ?? 0) + 1);
     totalUsed += t.messages_used ?? 0;
+    // Priced per plan: Ultimate annotates both sides and costs about twice as much per
+    // message, so a blended rate would misreport whichever mix actually exists.
+    usedByPlan.set(t.plan, (usedByPlan.get(t.plan) ?? 0) + (t.messages_used ?? 0));
 
     const entitled = t.status === "active" || t.status === "trialing";
     if (entitled) {
@@ -1382,7 +1421,7 @@ async function handleTenants(msg: any, _user: any): Promise<void> {
     `• ${totalUsed.toLocaleString("en-GB")} messages`,
     // Cost, not revenue: revenue lives in Stripe and duplicating it here would just be a
     // number that goes stale. This is the side Stripe cannot tell you.
-    `• ~$${(totalUsed * EST_COST_PER_MESSAGE_USD).toFixed(2)} estimated API spend`);
+    `• ~$${estimatedSpend(usedByPlan).toFixed(2)} estimated API spend`);
 
   // Storage headroom. On the free tier this is the limit that actually bites: there is no
   // bill to warn you, nothing is ever deleted, and the database grows FASTER the better
@@ -1392,6 +1431,16 @@ async function handleTenants(msg: any, _user: any): Promise<void> {
   if (storage) lines.push("", ...storage);
 
   await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
+}
+
+// Spend priced per plan rather than blended. An unrecognised plan is charged at the
+// dearer rate: an estimate that flatters the bill is worse than one that doesn't.
+function estimatedSpend(usedByPlan: Map<string, number>): number {
+  let total = 0;
+  for (const [plan, used] of usedByPlan) {
+    total += used * (EST_COST_PER_MESSAGE_USD[plan] ?? EST_COST_FALLBACK_USD);
+  }
+  return total;
 }
 
 // The storage section of /tenants. Returns null rather than throwing or explaining itself:
@@ -1867,7 +1916,7 @@ async function handleTextMessage(msg: any, user: any) {
 
   if (inserted) {
     if (isInstanceLang(originalLang, user)) scheduleAnnotation(db, inserted.id, originalText, originalLang, translationTargetLang, "text-original", translationOk ? translated! : undefined);
-    if (ANNOTATE_TRANSLATION_SIDE && translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
+    if (annotatesBothSides(user.plan) && translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
     if (isInstanceLang(originalLang, user)) {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, originalText, originalLang));
     }
@@ -1958,7 +2007,7 @@ async function handleVoiceMessage(msg: any, user: any) {
 
   if (inserted) {
     if (isInstanceLang(originalLang, user)) scheduleAnnotation(db, inserted.id, transcript, originalLang, targetLang, "voice-original", translationOk ? translated! : undefined);
-    if (ANNOTATE_TRANSLATION_SIDE && translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(db, inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
+    if (annotatesBothSides(user.plan) && translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(db, inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
     if (isInstanceLang(originalLang, user)) {
       scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, transcript, originalLang));
     }
@@ -2862,7 +2911,7 @@ async function translateCaptionToPartner(user: any, senderChatId: number, captio
 
   if (inserted) {
     scheduleAnnotation(db, inserted.id, caption, originalLang, translationTargetLang, "caption-original", translationOk ? translated! : undefined);
-    if (ANNOTATE_TRANSLATION_SIDE && translationOk) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
+    if (annotatesBothSides(user.plan) && translationOk) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
     scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, caption, originalLang));
   }
 }

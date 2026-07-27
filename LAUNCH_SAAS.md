@@ -68,16 +68,20 @@ their own.
    `QUOTA_*` secrets below override them.
 
    Calibration: your own traffic is ~1,650 messages/month, which cost about **$25/month**
-   before any of the annotation work. The rate now is **~$0.007/message** — calibrated
-   against real spend, since the cost model came in 20% under the actual bill. A tenant
-   sitting at the cap therefore costs roughly **$5.25** (Standard) or **$17.50** (Ultimate)
-   in inference.
+   before any of the annotation work. The rate now is **~$0.007/message on Standard** and
+   **~$0.012 on Ultimate** (which annotates both sides) — calibrated against real spend,
+   since the cost model came in 20% under the actual bill. A tenant sitting at the cap
+   therefore costs roughly **$5.25** (Standard) or **$30.00** (Ultimate) in inference.
 
    Add Stripe (2.9% + $0.30 per charge) and price above the *cap* cost rather than the
    average — a quota exists so customers may reach it. That puts the break-even floor at
-   about **$5.72** (Standard) and **$18.30** (Ultimate); $10–12 and $29–39 clear it with
-   room. Supabase adds nothing while the project is on the free tier (see
-   "Storage and the free tier" below).
+   about **$5.72** (Standard, one annotation pass) and **$31.20** (Ultimate, two);
+   $10–12 and $39 clear them. Supabase adds nothing while the project is on the free tier
+   (see "Storage and the free tier" below).
+
+   Note the asymmetry: Ultimate's floor is high because it buys twice the annotation, not
+   just more messages. Do not discount Ultimate below ~$32 without also revisiting what it
+   includes.
 
    Re-derive `$/message` from the Anthropic console after a month of real traffic rather
    than trusting the figure above; divide real spend by real message count.
@@ -229,16 +233,27 @@ step 7 once with a real card.
 call. One message is one translation plus one annotation pass, so a tenant at the cap has
 cost you roughly `quota × $0.007`.
 
-**One** annotation pass, not two, since `saas-v14`. Both builds now annotate only what a
-human wrote, never the machine translation of it — `ANNOTATE_TRANSLATION_SIDE`, with
-`migrations-saas/20260727000200` stopping `/backfill` from offering the other side.
+**Annotation depth is the plan axis**, since `saas-v14`:
 
-That was originally a personal-bot-only change, on the grounds that halving a subscriber's
-flashcards is a product decision rather than a cost one. Pricing settled it: at $0.012 a
-Standard subscriber at cap cost $9.00, pinning the floor near $9.58 and making any price
-under $12 a loss on heavy users. The half that was cut is the one sourced from Claude's
-output rather than from a partner's actual writing — measured on the personal corpus, the
-remaining half is 53% of Ukrainian and 48% of English card supply, all of it human-written.
+| | quota | annotates | ~$/message |
+|---|---|---|---|
+| Standard | 750 | what you write | **$0.007** |
+| Ultimate | 2,500 | both sides | **$0.012** |
+
+So a tenant at cap costs about **$5.25** (Standard) or **$30.00** (Ultimate).
+
+Two places enforce it and they must agree, or the distinction is fiction: `annotatesBothSides`
+in the bot, and the plan gate on the translation arm of `backfill_pending_sides`
+(`migrations-saas/20260727000200`) — otherwise the grind quietly annotates what the live
+path declined to. Both read the plan off the tenant row, so an upgrade takes effect on the
+next message with nothing else to change.
+
+This began as a cost cut on the personal bot (`v84`) and became the product axis because
+pricing forced the question: at $0.012 a Standard subscriber at cap cost $9.00, pinning the
+break-even floor near $9.58 and making any price under $12 a loss on heavy users — a 60%
+cost ratio. The half Standard gives up is the one sourced from Claude's output rather than
+a partner's actual writing, and it is where a wrong-sense card is most likely. Measured on
+the personal corpus, what remains is 53% of Ukrainian and 48% of English card supply.
 
 **Changing a `QUOTA_*` secret does not move existing customers.** The quota is copied onto
 `tenants.message_quota` at provisioning and rewritten only on a plan change, so a new value
