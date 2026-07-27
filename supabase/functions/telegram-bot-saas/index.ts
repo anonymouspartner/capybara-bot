@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v17";
+const BUILD_VERSION = "saas-v18";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -1190,15 +1190,31 @@ async function finishOnboarding(
 
     const invite = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
     await sendMessage(chatId,
-      `You're all set, ${displayName}! I'll translate between ${langLabel(native)} and ${langLabel(learning)}.\n\n` +
-      `*Start now, on your own* — write in either language and I'll translate it, and every ` +
+      `You're all set, ${escapeHtml(displayName)}! I'll translate between ${langLabel(native)} and ${langLabel(learning)}.\n\n` +
+      `<b>Start now, on your own</b> — write in either language and I'll translate it, and every ` +
       `message builds your study deck. Nothing else is needed.\n\n` +
-      `*Or add a language partner*, whenever you like. They read you in their language and ` +
-      `you read them in yours, and you both get a deck out of it. This link sets them up in ` +
-      `one tap:\n` +
-      (invite ? `${invite}\n\n` : `send them your setup code: \`${code}\`\n\n`) +
+      `<b>Or add a language partner</b>, whenever you like. They read you in their language and ` +
+      `you read them in yours, and you both get a deck out of it — forward them the link below.\n\n` +
       `Type /help to see everything.`,
-      "Markdown");
+      "HTML");
+
+    // The invite goes out as its OWN message, with no parse_mode at all.
+    //
+    // Two reasons, and the first is not stylistic. A bot username legitimately contains
+    // underscores (@capybara_translate_bot), and under Markdown those are italic markers:
+    // the link rendered as @capybaratranslatebot, a handle that does not exist, so the
+    // second seat could never be claimed. Telegram linkifies a bare URL on its own, so
+    // sending it unformatted is both correct and unbreakable -- no escaping to get wrong
+    // later.
+    //
+    // The second is that a link alone is forwardable. Buried in a paragraph, the partner
+    // receives a wall of text about someone else's account; on its own they receive the
+    // one thing they need to tap.
+    if (invite) {
+      await sendMessage(chatId, invite);
+    } else {
+      await sendMessage(chatId, `Their setup code: ${code}`);
+    }
     return;
   }
 
