@@ -4,11 +4,11 @@ import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.39.0";
 const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY")!;
-const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
+const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v15";
+const BUILD_VERSION = "saas-v16";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -32,7 +32,7 @@ const BOT_USERNAME = (() => {
 // Used to mint Stripe customer-portal links for /billing, and to read the live price of
 // each plan for the intro message. Unset degrades /billing to a read-only summary and the
 // intro to its fallback prices, rather than breaking either.
-const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY") ?? "";
+const STRIPE_SECRET_KEY = (Deno.env.get("STRIPE_SECRET_KEY") ?? "").trim();
 
 // --- The front door -----------------------------------------------------------------
 // Where a stranger who finds this bot on Telegram goes to subscribe. Until these were
@@ -48,8 +48,14 @@ const PAYMENT_LINK_ULTIMATE = (Deno.env.get("STRIPE_PAYMENT_LINK_ULTIMATE") ?? "
 // reads is by construction the number their card is charged. A displayed price that
 // disagrees with the charged one is the one bug in this feature that costs trust rather
 // than money, and hardcoding the copy is how that happens.
-const PRICE_ID_STANDARD = Deno.env.get("STRIPE_PRICE_STANDARD") ?? "";
-const PRICE_ID_ULTIMATE = Deno.env.get("STRIPE_PRICE_ULTIMATE") ?? "";
+// .trim() is not defensive padding -- a trailing newline in this secret was observed on
+// the live project (QUOTA_ULTIMATE was stored as "2500\n"). Number() tolerates that, so
+// the quota was fine; an === comparison does not. planForPrice matches a Checkout
+// session's price id against these by identity, so one invisible newline means every
+// purchase of that plan is refused: the customer is charged and never provisioned, with
+// nothing in the UI to suggest why.
+const PRICE_ID_STANDARD = (Deno.env.get("STRIPE_PRICE_STANDARD") ?? "").trim();
+const PRICE_ID_ULTIMATE = (Deno.env.get("STRIPE_PRICE_ULTIMATE") ?? "").trim();
 
 // Shown only when Stripe cannot be reached. Deliberately vague rather than a precise
 // wrong number: "from $15" that turns out to be $19 reads as a bait and switch, where an

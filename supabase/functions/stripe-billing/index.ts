@@ -28,12 +28,15 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 
-const BUILD_VERSION = "billing-v8";
+const BUILD_VERSION = "billing-v9";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY") ?? "";
-const STRIPE_WEBHOOK_SECRET = Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "";
+const STRIPE_SECRET_KEY = (Deno.env.get("STRIPE_SECRET_KEY") ?? "").trim();
+// Trimmed for the same reason as the price ids below, but the failure here is worse: this
+// is the HMAC key, so a trailing newline rejects EVERY Stripe webhook with a valid
+// signature error, and subscription lifecycle events stop arriving silently.
+const STRIPE_WEBHOOK_SECRET = (Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "").trim();
 // The bot's @username, used to build the deep link the customer is redirected to after
 // paying. Normalized and then VALIDATED, because this is the single most brittle string
 // in the product: it is set by hand, and a wrong one breaks the handoff at the worst
@@ -60,8 +63,14 @@ const TELEGRAM_BOT_USERNAME = (() => {
 // re-pointed, renamed or superseded without a migration. These two ids are the whole
 // definition of what this service sells: a Checkout session for anything else is not a
 // Capybara purchase and is refused (see planForPrice).
-const PRICE_STANDARD = Deno.env.get("STRIPE_PRICE_STANDARD") ?? "";
-const PRICE_ULTIMATE = Deno.env.get("STRIPE_PRICE_ULTIMATE") ?? "";
+// .trim() is not defensive padding -- a trailing newline in this secret was observed on
+// the live project (QUOTA_ULTIMATE was stored as "2500\n"). Number() tolerates that, so
+// the quota was fine; an === comparison does not. planForPrice matches a Checkout
+// session's price id against these by identity, so one invisible newline means every
+// purchase of that plan is refused: the customer is charged and never provisioned, with
+// nothing in the UI to suggest why.
+const PRICE_STANDARD = (Deno.env.get("STRIPE_PRICE_STANDARD") ?? "").trim();
+const PRICE_ULTIMATE = (Deno.env.get("STRIPE_PRICE_ULTIMATE") ?? "").trim();
 // Quotas are the only thing standing between a heavy couple and an unbounded API bill, so
 // they are set from measured cost, not from a round number. At ~$0.012/message on
 // saas-v12 (calibrated against real spend, not modelled), a tenant at these caps costs
