@@ -59,10 +59,19 @@ const PLAN_FALLBACK: Record<PlanKey, string> = {
   ultimate: "see link for price",
 };
 
-// Quotas quoted in the intro. stripe-billing owns the real values (it is what writes
-// tenants.message_quota at provisioning); these are display copy and must be kept in step
-// with it -- LAUNCH_SAAS.md says so in the one place someone changing a plan will look.
-const PLAN_QUOTA: Record<PlanKey, number> = { standard: 750, ultimate: 2500 };
+// Quotas quoted in the intro. Read from the SAME secrets, with the same defaults, as
+// stripe-billing's QUOTA_STANDARD / QUOTA_ULTIMATE -- which is what actually writes
+// tenants.message_quota at provisioning.
+//
+// Hardcoding these would mean setting QUOTA_STANDARD to 1000 makes the bot advertise 750
+// while provisioning 1000: a number a customer reads that isn't the number they get. That
+// is the same failure the live Stripe price lookup exists to prevent, and there is no
+// reason to fix it for price and not for quota. Both functions must be given the secret,
+// and both must be redeployed when it changes.
+const PLAN_QUOTA: Record<PlanKey, number> = {
+  standard: Number(Deno.env.get("QUOTA_STANDARD") ?? 750),
+  ultimate: Number(Deno.env.get("QUOTA_ULTIMATE") ?? 2500),
+};
 
 type PlanKey = "standard" | "ultimate";
 
@@ -327,6 +336,11 @@ Deno.serve(async (req) => {
       paymentLinksConfigured: Boolean(PAYMENT_LINK_STANDARD) && Boolean(PAYMENT_LINK_ULTIMATE),
       // False means the intro falls back to vague price copy rather than live amounts.
       pricesConfigured: Boolean(STRIPE_SECRET_KEY) && Boolean(PRICE_ID_STANDARD) && Boolean(PRICE_ID_ULTIMATE),
+      // The quotas this build ADVERTISES. stripe-billing reports the ones it PROVISIONS
+      // from the same secrets; if the two disagree, one of the functions is running an
+      // older deploy and customers are being told a number they will not get.
+      quotaStandard: PLAN_QUOTA.standard,
+      quotaUltimate: PLAN_QUOTA.ultimate,
     };
     // Opt-in seed check (?seed): a read-only count so a post-deploy smoke test can
     // catch an instance that cannot serve anyone. Kept off the default probe so plain

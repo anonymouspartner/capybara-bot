@@ -109,28 +109,31 @@ their own.
 | `STRIPE_WEBHOOK_SECRET` | billing | `whsec_…`, from step 5 |
 | `STRIPE_PRICE_STANDARD` | billing | `price_…` |
 | `STRIPE_PRICE_ULTIMATE` | billing | `price_…` |
-| `QUOTA_STANDARD` | billing | Messages/period. Defaults to 750. **Omit unless you mean to override** |
-| `QUOTA_ULTIMATE` | billing | Messages/period. Defaults to 2500. **Omit unless you mean to override** |
+| `QUOTA_STANDARD` | **bot + billing** | Messages/period. Defaults to 750. Billing provisions it, the bot advertises it |
+| `QUOTA_ULTIMATE` | **bot + billing** | Messages/period. Defaults to 2500. Same |
 | `STRIPE_PAYMENT_LINK_STANDARD` | bot | The Payment Link from step 2. Without it the intro shows no Standard button |
 | `STRIPE_PAYMENT_LINK_ULTIMATE` | bot | Same, for Ultimate |
 | `STRIPE_PRICE_STANDARD` | **bot** + billing | The bot reads the live amount so displayed price always matches what is charged |
 | `STRIPE_PRICE_ULTIMATE` | **bot** + billing | Same |
 
-> **The two `QUOTA_*` secrets are the only ones that silently win over the code.** Set them
-> once and a later change to the defaults deploys cleanly, reports healthy, and keeps
-> provisioning tenants at the old cap — and Supabase will not show you a secret's value, so
-> nothing contradicts it until the bill does. Prefer leaving them unset and letting
-> `stripe-billing` carry the numbers.
+> **Changing a quota means redeploying BOTH functions.** `stripe-billing` provisions the
+> number; `telegram-bot-saas` advertises it in the intro. They read the same two secrets,
+> but each picks them up only at its own next deploy — so shipping one and not the other
+> means customers are quoted a cap they will not be given.
 >
-> Either way, don't try to remember which state you're in — ask:
+> Supabase will not show you a secret's value after it is set, so don't try to remember
+> which state you're in. Ask both:
 >
 > ```bash
-> curl -s "https://<commercial-ref>.supabase.co/functions/v1/stripe-billing?health" \
->   | grep -o '"quota[^,]*'
+> for fn in stripe-billing telegram-bot-saas; do
+>   echo -n "$fn: "
+>   curl -s "https://<commercial-ref>.supabase.co/functions/v1/$fn?health" \
+>     | grep -o '"quota[^,}]*' | tr '\n' ' '; echo
+> done
 > ```
 >
-> `quotaStandard` / `quotaUltimate` are the numbers new tenants will actually be
-> provisioned with, and `quotaSource` says whether each came from the code or a secret.
+> The two lines must agree. `stripe-billing` additionally reports `quotaSource`, saying
+> whether each number came from a secret or from the code default.
 
 There is no `/update` self-deploy command in this build and no `GITHUB_*` secrets to set.
 The single-tenant bot has one; here a single tap would redeploy the function serving every
