@@ -223,6 +223,24 @@ Swap Stripe to live mode: new `sk_live_…`, new price ids, a new webhook endpoi
 signing secret, new Payment Links. Update the secrets, redeploy `stripe-billing`, and run
 step 7 once with a real card.
 
+> **The test tenants do not survive the swap, and they fail quietly.** Any tenant
+> provisioned in test mode carries a test-mode `stripe_customer_id`. `/billing` mints a
+> customer-portal session from that id, so the moment the key becomes `sk_live_…` the
+> lookup 404s and those customers get "I couldn't open the billing portal" forever — not
+> as a transient error. Translation keeps working, because plan and quota live on the
+> tenant row and never touch Stripe, so nothing looks broken until someone tries to
+> manage their subscription.
+>
+> Re-subscribe each real tenant through the live Payment Link and delete the test rows.
+> **Do not hand-edit the Stripe ids on an existing row to point at live objects:** it
+> fabricates a subscription the live account never sold, and `current_period_end` then
+> drifts from what Stripe actually bills.
+
+Two account-level settings are worth fixing before the first live charge, since both are
+customer-visible and neither is in the code: the **account display name** (shown on the
+Checkout page and the receipt) and the **statement descriptor** (the line on your
+customer's card statement). An unrecognised descriptor is a leading cause of chargebacks.
+
 ---
 
 ## Operating notes

@@ -907,6 +907,206 @@ export const STRINGS: Record<string, Row> = {
     pt: "Algo correu mal ao verificar esse link. Tenta outra vez daqui a pouco.",
     pl: "Coś poszło nie tak przy sprawdzaniu linku. Spróbuj za chwilę.",
   },
+
+  // ---- Media forwarding, voice, and translation furniture -------------------
+  //
+  // The media keys take the emoji as a parameter rather than baking one key per media
+  // type. Ten near-identical rows ("Got your photo...", "Got your sticker...") would be
+  // ten chances for the noun's gender to be wrong in six languages nobody here can check,
+  // and the noun earns nothing: the person just sent the thing, and their partner gets
+  // the media itself immediately after this line. The icon carries the type; the sentence
+  // stays grammatical everywhere.
+
+  fwd_no_partner: {
+    en: (v: any) => `${v.icon} Got it, but there's no partner to forward it to yet.`,
+    uk: (v: any) => `${v.icon} Отримав, але поки немає партнера, щоб переслати.`,
+    es: (v: any) => `${v.icon} Recibido, pero aún no hay pareja a quien reenviarlo.`,
+    fr: (v: any) => `${v.icon} Bien reçu, mais il n'y a pas encore de partenaire à qui le transmettre.`,
+    de: (v: any) => `${v.icon} Angekommen, aber es gibt noch niemanden, an den ich es weiterleiten kann.`,
+    it: (v: any) => `${v.icon} Ricevuto, ma non c'è ancora un partner a cui inoltrarlo.`,
+    pt: (v: any) => `${v.icon} Recebido, mas ainda não há parceiro para quem reencaminhar.`,
+    pl: (v: any) => `${v.icon} Mam to, ale nie ma jeszcze partnera, komu przekazać.`,
+  },
+
+  fwd_done: {
+    en: (v: any) => `${v.icon} Forwarded to your partner.`,
+    uk: (v: any) => `${v.icon} Переслав твоєму партнеру.`,
+    es: (v: any) => `${v.icon} Reenviado a tu pareja.`,
+    fr: (v: any) => `${v.icon} Transmis à ton partenaire.`,
+    de: (v: any) => `${v.icon} An deinen Partner weitergeleitet.`,
+    it: (v: any) => `${v.icon} Inoltrato al tuo partner.`,
+    pt: (v: any) => `${v.icon} Reencaminhado para o teu parceiro.`,
+    pl: (v: any) => `${v.icon} Przekazane twojemu partnerowi.`,
+  },
+
+  fwd_partner_sent: {
+    en: (v: any) => `${v.icon} ${v.name} sent this.`,
+    uk: (v: any) => `${v.icon} ${v.name} надіслав(ла) це.`,
+    es: (v: any) => `${v.icon} ${v.name} ha enviado esto.`,
+    fr: (v: any) => `${v.icon} ${v.name} a envoyé ceci.`,
+    de: (v: any) => `${v.icon} ${v.name} hat das geschickt.`,
+    it: (v: any) => `${v.icon} ${v.name} ha inviato questo.`,
+    pt: (v: any) => `${v.icon} ${v.name} enviou isto.`,
+    pl: (v: any) => `${v.icon} ${v.name} to wysłał(a).`,
+  },
+
+  fwd_album_done: {
+    en: (v: any) => `${v.icon} Album forwarded to your partner (${v.n} item${v.n === 1 ? "" : "s"}).`,
+    uk: (v: any) => `${v.icon} Переслав альбом твоєму партнеру (${v.n} ${plUk(v.n, "елемент", "елементи", "елементів")}).`,
+    es: (v: any) => `${v.icon} Álbum reenviado a tu pareja (${v.n} elemento${v.n === 1 ? "" : "s"}).`,
+    fr: (v: any) => `${v.icon} Album transmis à ton partenaire (${v.n} élément${v.n === 1 ? "" : "s"}).`,
+    de: (v: any) => `${v.icon} Album an deinen Partner weitergeleitet (${v.n} Element${v.n === 1 ? "" : "e"}).`,
+    it: (v: any) => `${v.icon} Album inoltrato al tuo partner (${v.n} element${v.n === 1 ? "o" : "i"}).`,
+    pt: (v: any) => `${v.icon} Álbum reencaminhado para o teu parceiro (${v.n} item${v.n === 1 ? "" : "s"}).`,
+    pl: (v: any) => `${v.icon} Album przekazany partnerowi (${v.n} ${plUk(v.n, "element", "elementy", "elementów")}).`,
+  },
+
+  fwd_partner_album: {
+    en: (v: any) => `${v.icon} ${v.name} sent an album of ${v.n}.`,
+    uk: (v: any) => `${v.icon} ${v.name} надіслав(ла) альбом із ${v.n} ${plUk(v.n, "елемента", "елементів", "елементів")}.`,
+    es: (v: any) => `${v.icon} ${v.name} ha enviado un álbum de ${v.n}.`,
+    fr: (v: any) => `${v.icon} ${v.name} a envoyé un album de ${v.n}.`,
+    de: (v: any) => `${v.icon} ${v.name} hat ein Album mit ${v.n} geschickt.`,
+    it: (v: any) => `${v.icon} ${v.name} ha inviato un album di ${v.n}.`,
+    pt: (v: any) => `${v.icon} ${v.name} enviou um álbum de ${v.n}.`,
+    pl: (v: any) => `${v.icon} ${v.name} wysłał(a) album z ${v.n}.`,
+  },
+
+  fwd_says: {
+    en: (v: any) => `💬 ${v.name} says (${v.lang}):`,
+    uk: (v: any) => `💬 ${v.name} каже (${v.lang}):`,
+    es: (v: any) => `💬 ${v.name} dice (${v.lang}):`,
+    fr: (v: any) => `💬 ${v.name} dit (${v.lang}) :`,
+    de: (v: any) => `💬 ${v.name} sagt (${v.lang}):`,
+    it: (v: any) => `💬 ${v.name} dice (${v.lang}):`,
+    pt: (v: any) => `💬 ${v.name} diz (${v.lang}):`,
+    pl: (v: any) => `💬 ${v.name} mówi (${v.lang}):`,
+  },
+
+  fwd_said: {
+    en: (v: any) => `💬 ${v.name} said (${v.lang}):`,
+    uk: (v: any) => `💬 ${v.name} сказав(ла) (${v.lang}):`,
+    es: (v: any) => `💬 ${v.name} ha dicho (${v.lang}):`,
+    fr: (v: any) => `💬 ${v.name} a dit (${v.lang}) :`,
+    de: (v: any) => `💬 ${v.name} sagte (${v.lang}):`,
+    it: (v: any) => `💬 ${v.name} ha detto (${v.lang}):`,
+    pt: (v: any) => `💬 ${v.name} disse (${v.lang}):`,
+    pl: (v: any) => `💬 ${v.name} powiedział(a) (${v.lang}):`,
+  },
+
+  translation_header: {
+    en: (v: any) => `🔤 Translation (${v.lang}):`,
+    uk: (v: any) => `🔤 Переклад (${v.lang}):`,
+    es: (v: any) => `🔤 Traducción (${v.lang}):`,
+    fr: (v: any) => `🔤 Traduction (${v.lang}) :`,
+    de: (v: any) => `🔤 Übersetzung (${v.lang}):`,
+    it: (v: any) => `🔤 Traduzione (${v.lang}):`,
+    pt: (v: any) => `🔤 Tradução (${v.lang}):`,
+    pl: (v: any) => `🔤 Tłumaczenie (${v.lang}):`,
+  },
+
+  caption_translation_header: {
+    en: (v: any) => `🔤 Caption translation (${v.lang}):`,
+    uk: (v: any) => `🔤 Переклад підпису (${v.lang}):`,
+    es: (v: any) => `🔤 Traducción del pie (${v.lang}):`,
+    fr: (v: any) => `🔤 Traduction de la légende (${v.lang}) :`,
+    de: (v: any) => `🔤 Übersetzung der Bildunterschrift (${v.lang}):`,
+    it: (v: any) => `🔤 Traduzione della didascalia (${v.lang}):`,
+    pt: (v: any) => `🔤 Tradução da legenda (${v.lang}):`,
+    pl: (v: any) => `🔤 Tłumaczenie podpisu (${v.lang}):`,
+  },
+
+
+  caption_translation_failed: {
+    en: (v: any) => `⚠️ Caption translation failed: ${v.err} The media was still forwarded.`,
+    uk: (v: any) => `⚠️ Не вдалося перекласти підпис: ${v.err} Медіа все одно переслано.`,
+    es: (v: any) => `⚠️ La traducción del pie ha fallado: ${v.err} El archivo se ha reenviado igualmente.`,
+    fr: (v: any) => `⚠️ La traduction de la légende a échoué : ${v.err} Le média a quand même été transmis.`,
+    de: (v: any) => `⚠️ Übersetzung der Bildunterschrift fehlgeschlagen: ${v.err} Das Medium wurde trotzdem weitergeleitet.`,
+    it: (v: any) => `⚠️ Traduzione della didascalia non riuscita: ${v.err} Il media è stato inoltrato comunque.`,
+    pt: (v: any) => `⚠️ A tradução da legenda falhou: ${v.err} O ficheiro foi reencaminhado à mesma.`,
+    pl: (v: any) => `⚠️ Tłumaczenie podpisu się nie udało: ${v.err} Plik i tak został przekazany.`,
+  },
+
+  voice_heard: {
+    en: (v: any) => `🎙️ Heard (${v.lang}):`,
+    uk: (v: any) => `🎙️ Почув (${v.lang}):`,
+    es: (v: any) => `🎙️ He oído (${v.lang}):`,
+    fr: (v: any) => `🎙️ Entendu (${v.lang}) :`,
+    de: (v: any) => `🎙️ Gehört (${v.lang}):`,
+    it: (v: any) => `🎙️ Sentito (${v.lang}):`,
+    pt: (v: any) => `🎙️ Ouvi (${v.lang}):`,
+    pl: (v: any) => `🎙️ Usłyszałem (${v.lang}):`,
+  },
+
+  voice_reach_failed: {
+    en: "Couldn't reach Telegram to fetch the voice file. Try again in a moment.",
+    uk: "Не вдалося зв'язатися з Telegram, щоб отримати голосове. Спробуй за хвилину.",
+    es: "No he podido contactar con Telegram para obtener el audio. Inténtalo en un momento.",
+    fr: "Impossible de joindre Telegram pour récupérer le vocal. Réessaie dans un instant.",
+    de: "Telegram war nicht erreichbar, um die Sprachnachricht zu holen. Versuch es gleich noch mal.",
+    it: "Non sono riuscito a contattare Telegram per il vocale. Riprova tra un momento.",
+    pt: "Não consegui contactar o Telegram para obter o áudio. Tenta daqui a pouco.",
+    pl: "Nie udało się połączyć z Telegramem po wiadomość głosową. Spróbuj za chwilę.",
+  },
+
+  voice_download_failed: {
+    en: "Couldn't download the voice file from Telegram. Try again in a moment.",
+    uk: "Не вдалося завантажити голосове з Telegram. Спробуй за хвилину.",
+    es: "No he podido descargar el audio de Telegram. Inténtalo en un momento.",
+    fr: "Impossible de télécharger le vocal depuis Telegram. Réessaie dans un instant.",
+    de: "Die Sprachnachricht konnte nicht heruntergeladen werden. Versuch es gleich noch mal.",
+    it: "Non sono riuscito a scaricare il vocale da Telegram. Riprova tra un momento.",
+    pt: "Não consegui descarregar o áudio do Telegram. Tenta daqui a pouco.",
+    pl: "Nie udało się pobrać wiadomości głosowej z Telegrama. Spróbuj za chwilę.",
+  },
+
+  voice_transcribe_failed: {
+    en: (v: any) => `⚠️ Transcription failed: ${v.err}\n\nThe audio was saved, so it can be retried later.`,
+    uk: (v: any) => `⚠️ Не вдалося розшифрувати: ${v.err}\n\nАудіо збережено, тож можна спробувати пізніше.`,
+    es: (v: any) => `⚠️ La transcripción ha fallado: ${v.err}\n\nEl audio se ha guardado, así que puede reintentarse.`,
+    fr: (v: any) => `⚠️ La transcription a échoué : ${v.err}\n\nL'audio est enregistré, on pourra réessayer.`,
+    de: (v: any) => `⚠️ Transkription fehlgeschlagen: ${v.err}\n\nDas Audio wurde gespeichert und kann später erneut versucht werden.`,
+    it: (v: any) => `⚠️ Trascrizione non riuscita: ${v.err}\n\nL'audio è stato salvato, si può riprovare più tardi.`,
+    pt: (v: any) => `⚠️ A transcrição falhou: ${v.err}\n\nO áudio foi guardado, por isso pode tentar-se de novo.`,
+    pl: (v: any) => `⚠️ Transkrypcja się nie udała: ${v.err}\n\nDźwięk został zapisany, więc można spróbować później.`,
+  },
+
+
+  original_label: {
+    en: (v: any) => `<i>Original (${v.lang}):</i>`,
+    uk: (v: any) => `<i>Оригінал (${v.lang}):</i>`,
+    es: (v: any) => `<i>Original (${v.lang}):</i>`,
+    fr: (v: any) => `<i>Original (${v.lang}) :</i>`,
+    de: (v: any) => `<i>Original (${v.lang}):</i>`,
+    it: (v: any) => `<i>Originale (${v.lang}):</i>`,
+    pt: (v: any) => `<i>Original (${v.lang}):</i>`,
+    pl: (v: any) => `<i>Oryginał (${v.lang}):</i>`,
+  },
+
+
+  translation_failed_saved: {
+    en: (v: any) => `⚠️ Translation failed: ${v.err} Your message was saved.`,
+    uk: (v: any) => `⚠️ Не вдалося перекласти: ${v.err} Твоє повідомлення збережено.`,
+    es: (v: any) => `⚠️ La traducción ha fallado: ${v.err} Tu mensaje se ha guardado.`,
+    fr: (v: any) => `⚠️ La traduction a échoué : ${v.err} Ton message a été enregistré.`,
+    de: (v: any) => `⚠️ Übersetzung fehlgeschlagen: ${v.err} Deine Nachricht wurde gespeichert.`,
+    it: (v: any) => `⚠️ Traduzione non riuscita: ${v.err} Il tuo messaggio è stato salvato.`,
+    pt: (v: any) => `⚠️ A tradução falhou: ${v.err} A tua mensagem foi guardada.`,
+    pl: (v: any) => `⚠️ Tłumaczenie się nie udało: ${v.err} Twoja wiadomość została zapisana.`,
+  },
+
+  translation_failed_transcript: {
+    en: (v: any) => `⚠️ Translation failed: ${v.err} The transcript was saved.`,
+    uk: (v: any) => `⚠️ Не вдалося перекласти: ${v.err} Розшифровку збережено.`,
+    es: (v: any) => `⚠️ La traducción ha fallado: ${v.err} La transcripción se ha guardado.`,
+    fr: (v: any) => `⚠️ La traduction a échoué : ${v.err} La transcription a été enregistrée.`,
+    de: (v: any) => `⚠️ Übersetzung fehlgeschlagen: ${v.err} Das Transkript wurde gespeichert.`,
+    it: (v: any) => `⚠️ Traduzione non riuscita: ${v.err} La trascrizione è stata salvata.`,
+    pt: (v: any) => `⚠️ A tradução falhou: ${v.err} A transcrição foi guardada.`,
+    pl: (v: any) => `⚠️ Tłumaczenie się nie udało: ${v.err} Transkrypcja została zapisana.`,
+  },
+
 };
 
 // Looks up a string. Falls back to English on a missing translation and warns, so a gap

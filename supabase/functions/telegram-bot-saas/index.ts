@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v21";
+const BUILD_VERSION = "saas-v22";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -499,8 +499,17 @@ async function handleUpdate(update: any) {
   // The exempt list is every command a customer might need precisely BECAUSE they are
   // blocked -- billing and its aliases must stay reachable when the subscription has
   // lapsed or the allowance is spent, or the way out is behind the wall it opens.
+  //
+  // It also covers the commands that cost nothing to serve. A message is the billable
+  // unit because a message means a translation plus an annotation pass; /help and /vocab
+  // are pure database reads with no model call behind them, and charging an allowance
+  // for them bills the customer for our disk. The people who pay that tax are the ones
+  // who just subscribed and are still finding their way around -- exactly the wrong
+  // ones. /recap and /note are NOT here: /recap synthesises and /note classifies then
+  // embeds, so both genuinely spend.
   if (!isSuperadmin(msg.from?.id) &&
-      !isCmd(msg.text ?? "", "billing", "plans", "subscribe", "pricing", "delete_account", "export")) {
+      !isCmd(msg.text ?? "", "billing", "plans", "subscribe", "pricing", "delete_account", "export",
+             "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
       await sendMessage(msg.chat.id, quotaRefusalText(viewerLang(msg.from, user), verdict), "HTML");
@@ -518,10 +527,15 @@ async function handleUpdate(update: any) {
         t(viewerLang(msg.from, user), "quota_heads_up", { used: verdict.used, quota: verdict.quota }));
     }
   } else {
-    // Gate skipped: the superadmin, or a command that must work while blocked. The plan
-    // still has to be right -- otherwise the operator's own tenant would silently be
-    // annotated at Standard depth no matter what they pay for, which is exactly the
-    // account used to test that Ultimate looks different.
+    // Gate skipped: the superadmin, a command that must work while blocked, or one that
+    // costs nothing to serve. The plan still has to be right -- otherwise the operator's
+    // own tenant would silently be annotated at Standard depth no matter what they pay
+    // for, which is exactly the account used to test that Ultimate looks different.
+    //
+    // Note this also means a lapsed tenant keeps read access to the study data it already
+    // built -- /vocab, /learn, /pinned. That matches /export, which was always exempt for
+    // the same reason: refusing someone their own corpus is a hostage tactic, not a
+    // subscription gate, and it costs nothing to keep serving.
     const { data: t } = await dbAdmin.from("tenants").select("plan").eq("id", user.tenant_id).maybeSingle();
     user.plan = t?.plan ?? null;
   }
@@ -1961,10 +1975,10 @@ async function handleTextMessage(msg: any, user: any) {
   if (insertErr) console.error("messages insert (text) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(msg.chat.id, `\ud83d\udd24 Translation (${translationTargetLang}):\n${escapeHtml(translated)}`, "HTML");
+    await sendMessage(msg.chat.id, `${t(viewerLang(msg.from, user), "translation_header", { lang: translationTargetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, originalText, translated!, originalLang, translationTargetLang);
   } else {
-    await sendMessage(msg.chat.id, `\u26a0\ufe0f Translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} Your message was saved.`);
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "translation_failed_saved", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) }));
   }
 
   if (inserted) {
@@ -1993,10 +2007,10 @@ async function handleVoiceMessage(msg: any, user: any) {
     fileInfo = await fetch(`${TELEGRAM_API}/getFile?file_id=${voice.file_id}`).then(r => r.json());
   } catch (e) {
     console.error("getFile fetch failed:", e);
-    await sendMessage(msg.chat.id, "Couldn't reach Telegram to fetch the voice file. Try again in a moment.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_reach_failed"));
     return;
   }
-  if (!fileInfo?.ok) { await sendMessage(msg.chat.id, "Couldn't fetch voice file from Telegram."); return; }
+  if (!fileInfo?.ok) { await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_fetch_failed")); return; }
   const filePath = fileInfo.result.file_path;
   let audioBlob: Blob;
   try {
@@ -2004,7 +2018,7 @@ async function handleVoiceMessage(msg: any, user: any) {
     audioBlob = await audioResp.blob();
   } catch (e) {
     console.error("audio fetch failed:", e);
-    await sendMessage(msg.chat.id, "Couldn't download the voice file from Telegram. Try again in a moment.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_download_failed"));
     return;
   }
   // Tenant-prefixed. The bucket is private and only the service role touches it, so this
@@ -2017,7 +2031,7 @@ async function handleVoiceMessage(msg: any, user: any) {
 
   const transcribeResult = await transcribeWithWhisper(audioBlob, user);
   if (!transcribeResult.ok) {
-    await sendMessage(msg.chat.id, `\u26a0\ufe0f Transcription failed: ${transcribeResult.error}\n\nThe audio was saved; try sending again in a moment.`);
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_transcribe_failed", { err: transcribeResult.error }));
     return;
   }
   const transcript = transcribeResult.text;
@@ -2052,10 +2066,10 @@ async function handleVoiceMessage(msg: any, user: any) {
   if (insertErr) console.error("messages insert (voice) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${escapeHtml(transcript)}\n\n\ud83d\udd24 Translation (${targetLang}):\n${escapeHtml(translated)}`, "HTML");
+    await sendMessage(msg.chat.id, `${t(viewerLang(msg.from, user), "voice_heard", { lang: originalLang })}\n${escapeHtml(transcript)}\n\n${t(viewerLang(msg.from, user), "translation_header", { lang: targetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardVoiceToPartner(user, voice.file_id, transcript, translated!, originalLang, targetLang);
   } else {
-    await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${transcript}\n\n\u26a0\ufe0f Translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The transcript was saved.`);
+    await sendMessage(msg.chat.id, `${t(viewerLang(msg.from, user), "voice_heard", { lang: originalLang })}\n${transcript}\n\n${t(viewerLang(msg.from, user), "translation_failed_transcript", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) })}`);
   }
 
   if (inserted) {
@@ -2847,7 +2861,12 @@ async function forwardToPartner(sender: any, original: string, translated: strin
   const partner = await lookupPartner(db, sender.id);
   if (!partner) return;
   const senderName = sender.display_name;
-  await sendMessage(partner.telegram_id, `\ud83d\udcac ${escapeHtml(senderName)} says (${transLang}):\n${escapeHtml(translated)}\n\n<i>Original (${origLang}):</i>\n${escapeHtml(original)}`, "HTML");
+  // The partner is the one reading this, so the furniture is in THEIR language --
+  // viewerLang off the partner row, not the sender's.
+  const pLang = viewerLang(undefined, partner);
+  await sendMessage(partner.telegram_id,
+    `${t(pLang, "fwd_says", { name: escapeHtml(senderName), lang: transLang })}\n${escapeHtml(translated)}\n\n${t(pLang, "original_label", { lang: origLang })}\n${escapeHtml(original)}`,
+    "HTML");
 }
 
 async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcript: string, translated: string, origLang: string, transLang: string) {
@@ -2856,7 +2875,10 @@ async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcrip
   if (!partner) return;
   const senderName = sender.display_name;
   await sendVoice(partner.telegram_id, voiceFileId);
-  await sendMessage(partner.telegram_id, `\ud83d\udcac ${escapeHtml(senderName)} said (${transLang}):\n${escapeHtml(translated)}\n\n<i>Original (${origLang}):</i>\n${escapeHtml(transcript)}`, "HTML");
+  const pLang = viewerLang(undefined, partner);
+  await sendMessage(partner.telegram_id,
+    `${t(pLang, "fwd_said", { name: escapeHtml(senderName), lang: transLang })}\n${escapeHtml(translated)}\n\n${t(pLang, "original_label", { lang: origLang })}\n${escapeHtml(transcript)}`,
+    "HTML");
 }
 
 // Videos are forwarded as-is by Telegram file_id (no transcription/translation).
@@ -2870,24 +2892,24 @@ async function handleVideoMessage(msg: any, user: any) {
 
   if (msg.video_note) {
     if (!partner) {
-      await sendMessage(msg.chat.id, "\ud83c\udfa5 Got your video message, but there's no partner to forward it to yet.");
+      await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "\ud83c\udfa5" }));
       return;
     }
     await sendVideoNote(partner.telegram_id, msg.video_note.file_id);
-    await sendMessage(partner.telegram_id, `\ud83c\udfa5 ${senderName} sent a video message.`);
-    await sendMessage(msg.chat.id, "\ud83c\udfa5 Video message forwarded to your partner.");
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "\ud83c\udfa5", name: senderName }));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "\ud83c\udfa5" }));
     return;
   }
 
   // Regular video (e.g. shared from the gallery), optionally with a caption.
   const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
   if (!partner) {
-    await sendMessage(msg.chat.id, "\ud83c\udfa5 Got your video, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "\ud83c\udfa5" }));
     return;
   }
   const partnerCaption = caption ? `\ud83c\udfa5 ${senderName}: ${caption}` : `\ud83c\udfa5 ${senderName} sent a video.`;
   await sendVideo(partner.telegram_id, msg.video.file_id, partnerCaption);
-  await sendMessage(msg.chat.id, "\ud83c\udfa5 Video forwarded to your partner.");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "\ud83c\udfa5" }));
 }
 
 // Photos are forwarded as-is by Telegram file_id (no download/translation step),
@@ -2897,7 +2919,7 @@ async function handlePhotoMessage(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "🖼️ Got your photo, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🖼️" }));
     return;
   }
   const largest = msg.photo[msg.photo.length - 1];
@@ -2912,7 +2934,7 @@ async function handleDocumentMessage(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "📎 Got your file, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "📎" }));
     return;
   }
   const doc = msg.document;
@@ -2956,10 +2978,11 @@ async function translateCaptionToPartner(user: any, senderChatId: number, captio
   if (insertErr) console.error("messages insert (caption) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(senderChatId, `🔤 Caption translation (${translationTargetLang}):\n${escapeHtml(translated)}`, "HTML");
+    await sendMessage(senderChatId, `${t(viewerLang(undefined, user), "caption_translation_header", { lang: translationTargetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, caption, translated!, originalLang, translationTargetLang);
   } else {
-    await sendMessage(senderChatId, `⚠️ Caption translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The media was still forwarded.`);
+    await sendMessage(senderChatId,
+      t(viewerLang(undefined, user), "caption_translation_failed", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) }));
   }
 
   if (inserted) {
@@ -2989,7 +3012,7 @@ async function handleAudioMessage(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "🎵 Got your audio, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎵" }));
     return;
   }
   await sendAudio(partner.telegram_id, msg.audio.file_id);
@@ -3002,7 +3025,7 @@ async function handleAnimationMessage(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "🎞️ Got your GIF, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎞️" }));
     return;
   }
   await sendAnimation(partner.telegram_id, msg.animation.file_id);
@@ -3014,12 +3037,12 @@ async function handleStickerMessage(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "🎭 Got your sticker, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎭" }));
     return;
   }
   await sendSticker(partner.telegram_id, msg.sticker.file_id);
-  await sendMessage(partner.telegram_id, `🎭 ${user.display_name} sent a sticker.`);
-  await sendMessage(msg.chat.id, "🎭 Sticker forwarded to your partner.");
+  await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "🎭", name: user.display_name }));
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "🎭" }));
 }
 
 // Location or venue. A venue message ALSO carries msg.location, so the dispatch and
@@ -3028,19 +3051,19 @@ async function handleLocationMessage(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "📍 Got your location, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "📍" }));
     return;
   }
   const senderName = user.display_name;
   if (msg.venue) {
     const v = msg.venue;
     await sendVenue(partner.telegram_id, v.location.latitude, v.location.longitude, v.title ?? "", v.address ?? "");
-    await sendMessage(partner.telegram_id, `📍 ${senderName} shared a place.`);
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "📍", name: senderName }));
   } else {
     await sendLocation(partner.telegram_id, msg.location.latitude, msg.location.longitude);
-    await sendMessage(partner.telegram_id, `📍 ${senderName} shared a location.`);
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "📍", name: senderName }));
   }
-  await sendMessage(msg.chat.id, "📍 Location forwarded to your partner.");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "📍" }));
 }
 
 // Shared contact card. No translation.
@@ -3048,13 +3071,13 @@ async function handleContactMessage(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "👤 Got your contact, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "👤" }));
     return;
   }
   const c = msg.contact;
   await sendContact(partner.telegram_id, c.phone_number, c.first_name ?? "", c.last_name, c.vcard);
-  await sendMessage(partner.telegram_id, `👤 ${user.display_name} shared a contact.`);
-  await sendMessage(msg.chat.id, "👤 Contact forwarded to your partner.");
+  await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "👤", name: user.display_name }));
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "👤" }));
 }
 
 // --- Album (media group) forwarding -----------------------------------------
@@ -3138,7 +3161,7 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   const senderChatId = groupRows[0].chat_id;
   const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    await sendMessage(senderChatId, "🖼️ Got your album, but there's no partner to forward it to yet.");
+    await sendMessage(senderChatId, t(viewerLang(undefined, user), "fwd_no_partner", { icon: "🖼️" }));
     return;
   }
 
@@ -3146,13 +3169,13 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   if (items.length === 1) {
     // A lone late orphan — sendMediaGroup needs >= 2, so send it as a single item.
     await sendSingleMediaItem(partner.telegram_id, items[0].item);
-    await sendMessage(partner.telegram_id, `🖼️ ${user.display_name} sent an item.`);
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "🖼️", name: user.display_name }));
   } else {
     const media = items.map((r: any) => ({ type: r.item.type, media: r.item.file_id }));
     await sendMediaGroup(partner.telegram_id, media);
-    await sendMessage(partner.telegram_id, `🖼️ ${user.display_name} sent an album of ${items.length}.`);
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_album", { icon: "🖼️", name: user.display_name, n: items.length }));
   }
-  await sendMessage(senderChatId, `🖼️ Album forwarded to your partner (${items.length} item${items.length === 1 ? "" : "s"}).`);
+  await sendMessage(senderChatId, t(viewerLang(undefined, user), "fwd_album_done", { icon: "🖼️", n: items.length }));
 
   // The album caption (Telegram attaches it to one item) — translate + corpus, unless the
   // album is entirely videos (no video-caption translation, per requirement).
@@ -3600,7 +3623,7 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true });
   if (insertErr) {
     console.error("learn top flashcard insert failed:", insertErr);
-    await sendMessage(msg.chat.id, "Couldn't add to the deck. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "deck_update_failed"));
     return;
   }
   const lines = unlearned.map((v: any, i: number) => {
@@ -3683,7 +3706,7 @@ async function handleLearn(msg: any, user: any) {
     .select("vocabulary_id");
   if (insertErr) {
     console.error("learn flashcard insert failed:", insertErr);
-    await sendMessage(msg.chat.id, "Couldn't add to the deck. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "deck_update_failed"));
     return;
   }
   const insertedIds = new Set((inserted ?? []).map((r: any) => r.vocabulary_id));
@@ -3749,7 +3772,7 @@ async function handleForget(msg: any, user: any) {
     .select("vocabulary_id");
   if (error) {
     console.error("forget delete failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't update the deck. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "deck_update_failed"));
     return;
   }
   const deckOwnerLabel = isPartnerDeck ? `${targetUser.display_name}'s` : "your";
