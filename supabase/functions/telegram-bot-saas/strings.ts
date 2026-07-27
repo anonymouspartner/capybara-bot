@@ -1107,6 +1107,550 @@ export const STRINGS: Record<string, Row> = {
     pl: (v: any) => `⚠️ Tłumaczenie się nie udało: ${v.err} Transkrypcja została zapisana.`,
   },
 
+
+  // ---- Onboarding tail, account deletion ------------------------------------
+
+  ob_step_expired: {
+    en: "That setup step is no longer available. Open your invite link again.",
+    uk: "Цей крок налаштування вже недоступний. Відкрий своє посилання-запрошення ще раз.",
+    es: "Ese paso de configuración ya no está disponible. Abre tu enlace de invitación otra vez.",
+    fr: "Cette étape de configuration n'est plus disponible. Rouvre ton lien d'invitation.",
+    de: "Dieser Einrichtungsschritt ist nicht mehr verfügbar. Öffne deinen Einladungslink erneut.",
+    it: "Questo passaggio non è più disponibile. Riapri il tuo link di invito.",
+    pt: "Esse passo já não está disponível. Abre outra vez o teu link de convite.",
+    pl: "Ten krok konfiguracji jest już niedostępny. Otwórz ponownie swój link z zaproszeniem.",
+  },
+
+  ob_partner_joined: {
+    en: (v: any) => `${v.name} just joined. You're both set up — send a message and I'll translate it.`,
+    uk: (v: any) => `${v.name} щойно приєднався(лась). Ви обоє готові — надішли повідомлення, і я перекладу.`,
+    es: (v: any) => `${v.name} acaba de unirse. Ya estáis listos: envía un mensaje y lo traduzco.`,
+    fr: (v: any) => `${v.name} vient de rejoindre. Vous êtes prêts tous les deux — envoie un message et je le traduis.`,
+    de: (v: any) => `${v.name} ist gerade beigetreten. Ihr seid beide startklar — schick eine Nachricht, ich übersetze sie.`,
+    it: (v: any) => `${v.name} si è appena unito/a. Siete pronti entrambi: manda un messaggio e lo traduco.`,
+    pt: (v: any) => `${v.name} acabou de entrar. Estão os dois prontos — envia uma mensagem e eu traduzo.`,
+    pl: (v: any) => `${v.name} właśnie dołączył(a). Oboje jesteście gotowi — wyślij wiadomość, a ja ją przetłumaczę.`,
+  },
+
+  account_deleted_self: {
+    en: "Your account and all its data have been deleted, and your subscription is cancelled. Take care. 🐹",
+    uk: "Твій акаунт і всі його дані видалено, підписку скасовано. Бережи себе. 🐹",
+    es: "Tu cuenta y todos sus datos se han eliminado, y tu suscripción está cancelada. Cuídate. 🐹",
+    fr: "Ton compte et toutes ses données ont été supprimés, et ton abonnement est résilié. Prends soin de toi. 🐹",
+    de: "Dein Konto und alle Daten wurden gelöscht, dein Abo ist gekündigt. Mach's gut. 🐹",
+    it: "Il tuo account e tutti i suoi dati sono stati eliminati, e l'abbonamento è annullato. Stammi bene. 🐹",
+    pt: "A tua conta e todos os dados foram eliminados, e a subscrição foi cancelada. Fica bem. 🐹",
+    pl: "Twoje konto i wszystkie dane zostały usunięte, a subskrypcja anulowana. Trzymaj się. 🐹",
+  },
+
+  account_deleted_partner: {
+    en: "Capybara here — the account you shared has been deleted by its owner. All of its data is gone. Take care. 🐹",
+    uk: "Це Capybara — акаунт, який ви ділили, видалено його власником. Усі його дані зникли. Бережи себе. 🐹",
+    es: "Soy Capybara: la cuenta que compartíais ha sido eliminada por su propietario. Todos sus datos han desaparecido. Cuídate. 🐹",
+    fr: "Ici Capybara — le compte que vous partagiez a été supprimé par son propriétaire. Toutes ses données ont disparu. Prends soin de toi. 🐹",
+    de: "Hier ist Capybara — das gemeinsame Konto wurde vom Inhaber gelöscht. Alle Daten sind weg. Mach's gut. 🐹",
+    it: "Qui Capybara: l'account che condividevate è stato eliminato dal proprietario. Tutti i suoi dati non ci sono più. Stammi bene. 🐹",
+    pt: "Fala a Capybara — a conta que partilhavam foi eliminada pelo dono. Todos os seus dados desapareceram. Fica bem. 🐹",
+    pl: "Tu Capybara — konto, które współdzieliliście, zostało usunięte przez właściciela. Wszystkie jego dane zniknęły. Trzymaj się. 🐹",
+  },
+
+  // ---- /export ---------------------------------------------------------------
+
+  export_building: {
+    en: "⏳ Building your export…",
+    uk: "⏳ Готую експорт…",
+    es: "⏳ Preparando tu exportación…",
+    fr: "⏳ Préparation de ton export…",
+    de: "⏳ Export wird erstellt…",
+    it: "⏳ Sto preparando l'esportazione…",
+    pt: "⏳ A preparar a tua exportação…",
+    pl: "⏳ Przygotowuję eksport…",
+  },
+
+  export_failed: {
+    en: "Couldn't build the export. Check function logs.",
+    uk: "Не вдалося зібрати експорт. Перевір логи функції.",
+    es: "No he podido generar la exportación. Revisa los registros.",
+    fr: "Impossible de générer l'export. Vérifie les journaux.",
+    de: "Der Export konnte nicht erstellt werden. Prüf die Logs.",
+    it: "Non sono riuscito a creare l'esportazione. Controlla i log.",
+    pt: "Não consegui criar a exportação. Verifica os registos.",
+    pl: "Nie udało się zbudować eksportu. Sprawdź logi funkcji.",
+  },
+
+  export_empty: {
+    en: "Nothing to export yet.\n\nUse /vocab and /learn to add words, or turn on /capybara so your corrections build a grammar deck.",
+    uk: "Поки нема чого експортувати.\n\nСкористайся /vocab і /learn, щоб додати слова, або увімкни /capybara — і твої виправлення побудують граматичну колоду.",
+    es: "Todavía no hay nada que exportar.\n\nUsa /vocab y /learn para añadir palabras, o activa /capybara para que tus correcciones formen un mazo de gramática.",
+    fr: "Rien à exporter pour l'instant.\n\nUtilise /vocab et /learn pour ajouter des mots, ou active /capybara pour que tes corrections forment un paquet de grammaire.",
+    de: "Noch nichts zu exportieren.\n\nNutz /vocab und /learn, um Wörter hinzuzufügen, oder schalte /capybara ein, damit deine Korrekturen ein Grammatik-Deck bilden.",
+    it: "Non c'è ancora nulla da esportare.\n\nUsa /vocab e /learn per aggiungere parole, o attiva /capybara così le tue correzioni creano un mazzo di grammatica.",
+    pt: "Ainda não há nada para exportar.\n\nUsa /vocab e /learn para juntar palavras, ou liga o /capybara para que as tuas correções criem um baralho de gramática.",
+    pl: "Nie ma jeszcze czego eksportować.\n\nUżyj /vocab i /learn, żeby dodać słowa, albo włącz /capybara, żeby twoje poprawki zbudowały talię gramatyczną.",
+  },
+
+  // ---- /learn and /forget ----------------------------------------------------
+  //
+  // Own-deck and partner-deck are separate keys rather than one key with a
+  // "your"/"Kika's" possessive spliced in. English builds a possessive by appending
+  // 's to any noun; Ukrainian and Polish inflect the noun itself, and German and
+  // Italian restructure the phrase. An interpolated possessive is correct in exactly
+  // one of the eight languages.
+
+  learn_lang_unrecognized: {
+    en: (v: any) => `Didn't recognise "${v.token}" as a language. Use ${v.codes}.`,
+    uk: (v: any) => `Не розпізнав "${v.token}" як мову. Використай ${v.codes}.`,
+    es: (v: any) => `No he reconocido "${v.token}" como idioma. Usa ${v.codes}.`,
+    fr: (v: any) => `Je n'ai pas reconnu "${v.token}" comme une langue. Utilise ${v.codes}.`,
+    de: (v: any) => `"${v.token}" ist keine mir bekannte Sprache. Nimm ${v.codes}.`,
+    it: (v: any) => `Non ho riconosciuto "${v.token}" come lingua. Usa ${v.codes}.`,
+    pt: (v: any) => `Não reconheci "${v.token}" como idioma. Usa ${v.codes}.`,
+    pl: (v: any) => `Nie rozpoznałem "${v.token}" jako języka. Użyj ${v.codes}.`,
+  },
+
+  learn_no_learner: {
+    en: (v: any) => `Couldn't find anyone learning ${v.lang}. No deck to add to.`,
+    uk: (v: any) => `Не знайшов нікого, хто вивчає ${v.lang}. Немає колоди, куди додати.`,
+    es: (v: any) => `No he encontrado a nadie que esté aprendiendo ${v.lang}. No hay mazo al que añadir.`,
+    fr: (v: any) => `Personne n'apprend ${v.lang}. Aucun paquet où ajouter.`,
+    de: (v: any) => `Niemand lernt ${v.lang}. Es gibt kein Deck zum Hinzufügen.`,
+    it: (v: any) => `Non ho trovato nessuno che stia imparando ${v.lang}. Nessun mazzo a cui aggiungere.`,
+    pt: (v: any) => `Não encontrei ninguém a aprender ${v.lang}. Não há baralho para juntar.`,
+    pl: (v: any) => `Nie znalazłem nikogo, kto uczy się ${v.lang}. Nie ma talii, do której dodać.`,
+  },
+
+  learn_none_unlearned_own: {
+    en: (v: any) => `No unlearned ${v.lang} words available for your deck.\n\nRun /vocab to see the current top words.`,
+    uk: (v: any) => `Немає невивчених ${v.lang} слів для твоєї колоди.\n\nЗапусти /vocab, щоб побачити поточні найчастіші слова.`,
+    es: (v: any) => `No hay palabras de ${v.lang} sin aprender para tu mazo.\n\nUsa /vocab para ver las más frecuentes.`,
+    fr: (v: any) => `Aucun mot de ${v.lang} non appris pour ton paquet.\n\nLance /vocab pour voir les mots les plus fréquents.`,
+    de: (v: any) => `Keine ungelernten ${v.lang}-Wörter für dein Deck.\n\nMit /vocab siehst du die häufigsten Wörter.`,
+    it: (v: any) => `Nessuna parola di ${v.lang} non ancora imparata per il tuo mazzo.\n\nUsa /vocab per vedere le più frequenti.`,
+    pt: (v: any) => `Não há palavras de ${v.lang} por aprender para o teu baralho.\n\nUsa /vocab para veres as mais frequentes.`,
+    pl: (v: any) => `Brak nienauczonych słów (${v.lang}) do twojej talii.\n\nUżyj /vocab, żeby zobaczyć najczęstsze słowa.`,
+  },
+
+  learn_none_unlearned_partner: {
+    en: (v: any) => `No unlearned ${v.lang} words available for ${v.name}'s deck.\n\nRun /vocab to see the current top words.`,
+    uk: (v: any) => `Немає невивчених ${v.lang} слів для колоди ${v.name}.\n\nЗапусти /vocab, щоб побачити поточні найчастіші слова.`,
+    es: (v: any) => `No hay palabras de ${v.lang} sin aprender para el mazo de ${v.name}.\n\nUsa /vocab para ver las más frecuentes.`,
+    fr: (v: any) => `Aucun mot de ${v.lang} non appris pour le paquet de ${v.name}.\n\nLance /vocab pour voir les mots les plus fréquents.`,
+    de: (v: any) => `Keine ungelernten ${v.lang}-Wörter für das Deck von ${v.name}.\n\nMit /vocab siehst du die häufigsten Wörter.`,
+    it: (v: any) => `Nessuna parola di ${v.lang} non ancora imparata per il mazzo di ${v.name}.\n\nUsa /vocab per vedere le più frequenti.`,
+    pt: (v: any) => `Não há palavras de ${v.lang} por aprender para o baralho de ${v.name}.\n\nUsa /vocab para veres as mais frequentes.`,
+    pl: (v: any) => `Brak nienauczonych słów (${v.lang}) do talii ${v.name}.\n\nUżyj /vocab, żeby zobaczyć najczęstsze słowa.`,
+  },
+
+  learn_added_top_own: {
+    en: (v: any) => `✅ Added ${v.n} ${v.lang} word${v.n === 1 ? "" : "s"} to your ${v.deck}:`,
+    uk: (v: any) => `✅ Додав ${v.n} ${plUk(v.n, "слово", "слова", "слів")} (${v.lang}) до твоєї колоди ${v.deck}:`,
+    es: (v: any) => `✅ Añadidas ${v.n} palabra${v.n === 1 ? "" : "s"} de ${v.lang} a tu ${v.deck}:`,
+    fr: (v: any) => `✅ ${v.n} mot${v.n === 1 ? "" : "s"} de ${v.lang} ajouté${v.n === 1 ? "" : "s"} à ton ${v.deck} :`,
+    de: (v: any) => `✅ ${v.n} ${v.lang}-Wort${v.n === 1 ? "" : "e"} zu deinem ${v.deck} hinzugefügt:`,
+    it: (v: any) => `✅ Aggiunte ${v.n} parol${v.n === 1 ? "a" : "e"} di ${v.lang} al tuo ${v.deck}:`,
+    pt: (v: any) => `✅ Adicionadas ${v.n} palavra${v.n === 1 ? "" : "s"} de ${v.lang} ao teu ${v.deck}:`,
+    pl: (v: any) => `✅ Dodano ${v.n} ${plUk(v.n, "słowo", "słowa", "słów")} (${v.lang}) do twojej talii ${v.deck}:`,
+  },
+
+  learn_added_top_partner: {
+    en: (v: any) => `✅ Added ${v.n} ${v.lang} word${v.n === 1 ? "" : "s"} to ${v.name}'s ${v.deck}:`,
+    uk: (v: any) => `✅ Додав ${v.n} ${plUk(v.n, "слово", "слова", "слів")} (${v.lang}) до колоди ${v.name} ${v.deck}:`,
+    es: (v: any) => `✅ Añadidas ${v.n} palabra${v.n === 1 ? "" : "s"} de ${v.lang} al ${v.deck} de ${v.name}:`,
+    fr: (v: any) => `✅ ${v.n} mot${v.n === 1 ? "" : "s"} de ${v.lang} ajouté${v.n === 1 ? "" : "s"} au ${v.deck} de ${v.name} :`,
+    de: (v: any) => `✅ ${v.n} ${v.lang}-Wort${v.n === 1 ? "" : "e"} zum ${v.deck} von ${v.name} hinzugefügt:`,
+    it: (v: any) => `✅ Aggiunte ${v.n} parol${v.n === 1 ? "a" : "e"} di ${v.lang} al ${v.deck} di ${v.name}:`,
+    pt: (v: any) => `✅ Adicionadas ${v.n} palavra${v.n === 1 ? "" : "s"} de ${v.lang} ao ${v.deck} de ${v.name}:`,
+    pl: (v: any) => `✅ Dodano ${v.n} ${plUk(v.n, "słowo", "słowa", "słów")} (${v.lang}) do talii ${v.name} ${v.deck}:`,
+  },
+
+  learn_capped: {
+    en: (v: any) => `\n\n<i>(Capped at ${v.max}; requested ${v.requested}.)</i>`,
+    uk: (v: any) => `\n\n<i>(Обмежено до ${v.max}; запитано ${v.requested}.)</i>`,
+    es: (v: any) => `\n\n<i>(Limitado a ${v.max}; solicitadas ${v.requested}.)</i>`,
+    fr: (v: any) => `\n\n<i>(Limité à ${v.max} ; ${v.requested} demandés.)</i>`,
+    de: (v: any) => `\n\n<i>(Auf ${v.max} begrenzt; ${v.requested} angefragt.)</i>`,
+    it: (v: any) => `\n\n<i>(Limitato a ${v.max}; richieste ${v.requested}.)</i>`,
+    pt: (v: any) => `\n\n<i>(Limitado a ${v.max}; pedidas ${v.requested}.)</i>`,
+    pl: (v: any) => `\n\n<i>(Ograniczono do ${v.max}; zażądano ${v.requested}.)</i>`,
+  },
+
+  learn_export_hint_own: {
+    en: "\n\n<i>Run /export when you want to import into Anki.</i>",
+    uk: "\n\n<i>Запусти /export, коли захочеш імпортувати в Anki.</i>",
+    es: "\n\n<i>Usa /export cuando quieras importar a Anki.</i>",
+    fr: "\n\n<i>Lance /export quand tu veux importer dans Anki.</i>",
+    de: "\n\n<i>Nutz /export, wenn du nach Anki importieren willst.</i>",
+    it: "\n\n<i>Usa /export quando vuoi importare in Anki.</i>",
+    pt: "\n\n<i>Usa /export quando quiseres importar para o Anki.</i>",
+    pl: "\n\n<i>Użyj /export, gdy zechcesz zaimportować do Anki.</i>",
+  },
+
+  learn_export_hint_partner: {
+    en: (v: any) => `\n\n<i>${v.name} can run /export to import into Anki.</i>`,
+    uk: (v: any) => `\n\n<i>${v.name} може запустити /export, щоб імпортувати в Anki.</i>`,
+    es: (v: any) => `\n\n<i>${v.name} puede usar /export para importar a Anki.</i>`,
+    fr: (v: any) => `\n\n<i>${v.name} peut lancer /export pour importer dans Anki.</i>`,
+    de: (v: any) => `\n\n<i>${v.name} kann /export nutzen, um nach Anki zu importieren.</i>`,
+    it: (v: any) => `\n\n<i>${v.name} può usare /export per importare in Anki.</i>`,
+    pt: (v: any) => `\n\n<i>${v.name} pode usar /export para importar para o Anki.</i>`,
+    pl: (v: any) => `\n\n<i>${v.name} może użyć /export, żeby zaimportować do Anki.</i>`,
+  },
+
+  vocab_word_not_found: {
+    en: (v: any) => `Couldn't find "${v.word}" in the ${v.lang} vocabulary.\n\nRun /vocab to see words that have appeared in your conversations.`,
+    uk: (v: any) => `Не знайшов "${v.word}" у словнику (${v.lang}).\n\nЗапусти /vocab, щоб побачити слова з ваших розмов.`,
+    es: (v: any) => `No he encontrado "${v.word}" en el vocabulario de ${v.lang}.\n\nUsa /vocab para ver las palabras que han aparecido.`,
+    fr: (v: any) => `"${v.word}" est introuvable dans le vocabulaire ${v.lang}.\n\nLance /vocab pour voir les mots déjà apparus.`,
+    de: (v: any) => `"${v.word}" ist im ${v.lang}-Wortschatz nicht zu finden.\n\nMit /vocab siehst du die bisher aufgetauchten Wörter.`,
+    it: (v: any) => `Non trovo "${v.word}" nel vocabolario di ${v.lang}.\n\nUsa /vocab per vedere le parole già comparse.`,
+    pt: (v: any) => `Não encontrei "${v.word}" no vocabulário de ${v.lang}.\n\nUsa /vocab para veres as palavras que já apareceram.`,
+    pl: (v: any) => `Nie znalazłem "${v.word}" w słownictwie (${v.lang}).\n\nUżyj /vocab, żeby zobaczyć słowa z waszych rozmów.`,
+  },
+
+  vocab_word_not_found_short: {
+    en: (v: any) => `Couldn't find "${v.word}" in the ${v.lang} vocabulary.`,
+    uk: (v: any) => `Не знайшов "${v.word}" у словнику (${v.lang}).`,
+    es: (v: any) => `No he encontrado "${v.word}" en el vocabulario de ${v.lang}.`,
+    fr: (v: any) => `"${v.word}" est introuvable dans le vocabulaire ${v.lang}.`,
+    de: (v: any) => `"${v.word}" ist im ${v.lang}-Wortschatz nicht zu finden.`,
+    it: (v: any) => `Non trovo "${v.word}" nel vocabolario di ${v.lang}.`,
+    pt: (v: any) => `Não encontrei "${v.word}" no vocabulário de ${v.lang}.`,
+    pl: (v: any) => `Nie znalazłem "${v.word}" w słownictwie (${v.lang}).`,
+  },
+
+  learn_already_own: {
+    en: (v: any) => `"${v.word}" is already in your ${v.deck}.`,
+    uk: (v: any) => `"${v.word}" уже є у твоїй колоді ${v.deck}.`,
+    es: (v: any) => `"${v.word}" ya está en tu ${v.deck}.`,
+    fr: (v: any) => `"${v.word}" est déjà dans ton ${v.deck}.`,
+    de: (v: any) => `"${v.word}" ist schon in deinem ${v.deck}.`,
+    it: (v: any) => `"${v.word}" è già nel tuo ${v.deck}.`,
+    pt: (v: any) => `"${v.word}" já está no teu ${v.deck}.`,
+    pl: (v: any) => `"${v.word}" jest już w twojej talii ${v.deck}.`,
+  },
+
+  learn_already_partner: {
+    en: (v: any) => `"${v.word}" is already in ${v.name}'s ${v.deck}.`,
+    uk: (v: any) => `"${v.word}" уже є в колоді ${v.name} ${v.deck}.`,
+    es: (v: any) => `"${v.word}" ya está en el ${v.deck} de ${v.name}.`,
+    fr: (v: any) => `"${v.word}" est déjà dans le ${v.deck} de ${v.name}.`,
+    de: (v: any) => `"${v.word}" ist schon im ${v.deck} von ${v.name}.`,
+    it: (v: any) => `"${v.word}" è già nel ${v.deck} di ${v.name}.`,
+    pt: (v: any) => `"${v.word}" já está no ${v.deck} de ${v.name}.`,
+    pl: (v: any) => `"${v.word}" jest już w talii ${v.name} ${v.deck}.`,
+  },
+
+  learn_added_own: {
+    en: (v: any) => v.n === 1 ? `✅ Added to your ${v.deck}:` : `✅ Added ${v.n} entries to your ${v.deck}:`,
+    uk: (v: any) => v.n === 1 ? `✅ Додав до твоєї колоди ${v.deck}:` : `✅ Додав ${v.n} ${plUk(v.n, "запис", "записи", "записів")} до твоєї колоди ${v.deck}:`,
+    es: (v: any) => v.n === 1 ? `✅ Añadido a tu ${v.deck}:` : `✅ Añadidas ${v.n} entradas a tu ${v.deck}:`,
+    fr: (v: any) => v.n === 1 ? `✅ Ajouté à ton ${v.deck} :` : `✅ ${v.n} entrées ajoutées à ton ${v.deck} :`,
+    de: (v: any) => v.n === 1 ? `✅ Zu deinem ${v.deck} hinzugefügt:` : `✅ ${v.n} Einträge zu deinem ${v.deck} hinzugefügt:`,
+    it: (v: any) => v.n === 1 ? `✅ Aggiunto al tuo ${v.deck}:` : `✅ Aggiunte ${v.n} voci al tuo ${v.deck}:`,
+    pt: (v: any) => v.n === 1 ? `✅ Adicionado ao teu ${v.deck}:` : `✅ Adicionadas ${v.n} entradas ao teu ${v.deck}:`,
+    pl: (v: any) => v.n === 1 ? `✅ Dodano do twojej talii ${v.deck}:` : `✅ Dodano ${v.n} ${plUk(v.n, "wpis", "wpisy", "wpisów")} do twojej talii ${v.deck}:`,
+  },
+
+  learn_added_partner: {
+    en: (v: any) => v.n === 1 ? `✅ Added to ${v.name}'s ${v.deck}:` : `✅ Added ${v.n} entries to ${v.name}'s ${v.deck}:`,
+    uk: (v: any) => v.n === 1 ? `✅ Додав до колоди ${v.name} ${v.deck}:` : `✅ Додав ${v.n} ${plUk(v.n, "запис", "записи", "записів")} до колоди ${v.name} ${v.deck}:`,
+    es: (v: any) => v.n === 1 ? `✅ Añadido al ${v.deck} de ${v.name}:` : `✅ Añadidas ${v.n} entradas al ${v.deck} de ${v.name}:`,
+    fr: (v: any) => v.n === 1 ? `✅ Ajouté au ${v.deck} de ${v.name} :` : `✅ ${v.n} entrées ajoutées au ${v.deck} de ${v.name} :`,
+    de: (v: any) => v.n === 1 ? `✅ Zum ${v.deck} von ${v.name} hinzugefügt:` : `✅ ${v.n} Einträge zum ${v.deck} von ${v.name} hinzugefügt:`,
+    it: (v: any) => v.n === 1 ? `✅ Aggiunto al ${v.deck} di ${v.name}:` : `✅ Aggiunte ${v.n} voci al ${v.deck} di ${v.name}:`,
+    pt: (v: any) => v.n === 1 ? `✅ Adicionado ao ${v.deck} de ${v.name}:` : `✅ Adicionadas ${v.n} entradas ao ${v.deck} de ${v.name}:`,
+    pl: (v: any) => v.n === 1 ? `✅ Dodano do talii ${v.name} ${v.deck}:` : `✅ Dodano ${v.n} ${plUk(v.n, "wpis", "wpisy", "wpisów")} do talii ${v.name} ${v.deck}:`,
+  },
+
+  learn_matched_as: {
+    en: (v: any) => `\n\nMatched as "${v.lemma}" (dictionary form of "${v.arg}").`,
+    uk: (v: any) => `\n\nЗнайдено як "${v.lemma}" (словникова форма "${v.arg}").`,
+    es: (v: any) => `\n\nEncontrado como "${v.lemma}" (forma de diccionario de "${v.arg}").`,
+    fr: (v: any) => `\n\nTrouvé sous "${v.lemma}" (forme de dictionnaire de "${v.arg}").`,
+    de: (v: any) => `\n\nGefunden als "${v.lemma}" (Grundform von "${v.arg}").`,
+    it: (v: any) => `\n\nTrovato come "${v.lemma}" (forma base di "${v.arg}").`,
+    pt: (v: any) => `\n\nEncontrado como "${v.lemma}" (forma de dicionário de "${v.arg}").`,
+    pl: (v: any) => `\n\nDopasowano jako "${v.lemma}" (forma słownikowa "${v.arg}").`,
+  },
+
+  learn_skipped: {
+    en: (v: any) => `\n\n<i>(${v.n} already in deck, skipped)</i>`,
+    uk: (v: any) => `\n\n<i>(${v.n} уже в колоді, пропущено)</i>`,
+    es: (v: any) => `\n\n<i>(${v.n} ya en el mazo, omitidas)</i>`,
+    fr: (v: any) => `\n\n<i>(${v.n} déjà dans le paquet, ignorés)</i>`,
+    de: (v: any) => `\n\n<i>(${v.n} schon im Deck, übersprungen)</i>`,
+    it: (v: any) => `\n\n<i>(${v.n} già nel mazzo, saltate)</i>`,
+    pt: (v: any) => `\n\n<i>(${v.n} já no baralho, ignoradas)</i>`,
+    pl: (v: any) => `\n\n<i>(${v.n} już w talii, pominięto)</i>`,
+  },
+
+  forget_not_in_own: {
+    en: (v: any) => `"${v.word}" wasn't in your ${v.deck}.`,
+    uk: (v: any) => `"${v.word}" не було у твоїй колоді ${v.deck}.`,
+    es: (v: any) => `"${v.word}" no estaba en tu ${v.deck}.`,
+    fr: (v: any) => `"${v.word}" n'était pas dans ton ${v.deck}.`,
+    de: (v: any) => `"${v.word}" war nicht in deinem ${v.deck}.`,
+    it: (v: any) => `"${v.word}" non era nel tuo ${v.deck}.`,
+    pt: (v: any) => `"${v.word}" não estava no teu ${v.deck}.`,
+    pl: (v: any) => `"${v.word}" nie było w twojej talii ${v.deck}.`,
+  },
+
+  forget_not_in_partner: {
+    en: (v: any) => `"${v.word}" wasn't in ${v.name}'s ${v.deck}.`,
+    uk: (v: any) => `"${v.word}" не було в колоді ${v.name} ${v.deck}.`,
+    es: (v: any) => `"${v.word}" no estaba en el ${v.deck} de ${v.name}.`,
+    fr: (v: any) => `"${v.word}" n'était pas dans le ${v.deck} de ${v.name}.`,
+    de: (v: any) => `"${v.word}" war nicht im ${v.deck} von ${v.name}.`,
+    it: (v: any) => `"${v.word}" non era nel ${v.deck} di ${v.name}.`,
+    pt: (v: any) => `"${v.word}" não estava no ${v.deck} de ${v.name}.`,
+    pl: (v: any) => `"${v.word}" nie było w talii ${v.name} ${v.deck}.`,
+  },
+
+  forget_removed_own: {
+    en: (v: any) => v.n === 1 ? `➖ Removed from your ${v.deck}:` : `➖ Removed ${v.n} entries from your ${v.deck}:`,
+    uk: (v: any) => v.n === 1 ? `➖ Прибрав із твоєї колоди ${v.deck}:` : `➖ Прибрав ${v.n} ${plUk(v.n, "запис", "записи", "записів")} із твоєї колоди ${v.deck}:`,
+    es: (v: any) => v.n === 1 ? `➖ Eliminado de tu ${v.deck}:` : `➖ Eliminadas ${v.n} entradas de tu ${v.deck}:`,
+    fr: (v: any) => v.n === 1 ? `➖ Retiré de ton ${v.deck} :` : `➖ ${v.n} entrées retirées de ton ${v.deck} :`,
+    de: (v: any) => v.n === 1 ? `➖ Aus deinem ${v.deck} entfernt:` : `➖ ${v.n} Einträge aus deinem ${v.deck} entfernt:`,
+    it: (v: any) => v.n === 1 ? `➖ Rimosso dal tuo ${v.deck}:` : `➖ Rimosse ${v.n} voci dal tuo ${v.deck}:`,
+    pt: (v: any) => v.n === 1 ? `➖ Removido do teu ${v.deck}:` : `➖ Removidas ${v.n} entradas do teu ${v.deck}:`,
+    pl: (v: any) => v.n === 1 ? `➖ Usunięto z twojej talii ${v.deck}:` : `➖ Usunięto ${v.n} ${plUk(v.n, "wpis", "wpisy", "wpisów")} z twojej talii ${v.deck}:`,
+  },
+
+  forget_removed_partner: {
+    en: (v: any) => v.n === 1 ? `➖ Removed from ${v.name}'s ${v.deck}:` : `➖ Removed ${v.n} entries from ${v.name}'s ${v.deck}:`,
+    uk: (v: any) => v.n === 1 ? `➖ Прибрав із колоди ${v.name} ${v.deck}:` : `➖ Прибрав ${v.n} ${plUk(v.n, "запис", "записи", "записів")} із колоди ${v.name} ${v.deck}:`,
+    es: (v: any) => v.n === 1 ? `➖ Eliminado del ${v.deck} de ${v.name}:` : `➖ Eliminadas ${v.n} entradas del ${v.deck} de ${v.name}:`,
+    fr: (v: any) => v.n === 1 ? `➖ Retiré du ${v.deck} de ${v.name} :` : `➖ ${v.n} entrées retirées du ${v.deck} de ${v.name} :`,
+    de: (v: any) => v.n === 1 ? `➖ Aus dem ${v.deck} von ${v.name} entfernt:` : `➖ ${v.n} Einträge aus dem ${v.deck} von ${v.name} entfernt:`,
+    it: (v: any) => v.n === 1 ? `➖ Rimosso dal ${v.deck} di ${v.name}:` : `➖ Rimosse ${v.n} voci dal ${v.deck} di ${v.name}:`,
+    pt: (v: any) => v.n === 1 ? `➖ Removido do ${v.deck} de ${v.name}:` : `➖ Removidas ${v.n} entradas do ${v.deck} de ${v.name}:`,
+    pl: (v: any) => v.n === 1 ? `➖ Usunięto z talii ${v.name} ${v.deck}:` : `➖ Usunięto ${v.n} ${plUk(v.n, "wpis", "wpisy", "wpisów")} z talii ${v.name} ${v.deck}:`,
+  },
+
+  forget_anki_note: {
+    en: "\n\n<i>If this card was already imported into Anki, delete it there too.</i>",
+    uk: "\n\n<i>Якщо цю картку вже імпортовано в Anki, видали її і там.</i>",
+    es: "\n\n<i>Si esta tarjeta ya se importó a Anki, elimínala también allí.</i>",
+    fr: "\n\n<i>Si cette carte a déjà été importée dans Anki, supprime-la aussi là-bas.</i>",
+    de: "\n\n<i>Falls diese Karte schon in Anki importiert wurde, lösch sie auch dort.</i>",
+    it: "\n\n<i>Se questa carta è già stata importata in Anki, eliminala anche lì.</i>",
+    pt: "\n\n<i>Se este cartão já foi importado para o Anki, apaga-o também lá.</i>",
+    pl: "\n\n<i>Jeśli ta karta trafiła już do Anki, usuń ją również tam.</i>",
+  },
+
+
+  // ---- /recap satellites: pins, notes, reconcile --------------------------------
+
+  msg_not_in_corpus: {
+    en: "Couldn't find that message in the corpus.",
+    uk: "Не знайшов цього повідомлення в корпусі.",
+    es: "No he encontrado ese mensaje en el corpus.",
+    fr: "Je ne trouve pas ce message dans le corpus.",
+    de: "Diese Nachricht ist nicht im Korpus zu finden.",
+    it: "Non trovo quel messaggio nel corpus.",
+    pt: "Não encontrei essa mensagem no corpus.",
+    pl: "Nie znalazłem tej wiadomości w korpusie.",
+  },
+
+  reconcile_usage: {
+    en: "Reply to a message with /reconcile to exclude it from /recap results.",
+    uk: "Відповідай на повідомлення командою /reconcile, щоб виключити його з результатів /recap.",
+    es: "Responde a un mensaje con /reconcile para excluirlo de los resultados de /recap.",
+    fr: "Réponds à un message avec /reconcile pour l'exclure des résultats de /recap.",
+    de: "Antworte auf eine Nachricht mit /reconcile, um sie aus /recap auszuschließen.",
+    it: "Rispondi a un messaggio con /reconcile per escluderlo dai risultati di /recap.",
+    pt: "Responde a uma mensagem com /reconcile para a excluir dos resultados de /recap.",
+    pl: "Odpowiedz na wiadomość komendą /reconcile, żeby wykluczyć ją z wyników /recap.",
+  },
+
+  reconcile_not_found: {
+    en: "Couldn't find that message in the corpus. /reconcile works on replies to messages I've stored in this conversation.",
+    uk: "Не знайшов цього повідомлення в корпусі. /reconcile працює з відповідями на повідомлення, які я зберіг у цій розмові.",
+    es: "No he encontrado ese mensaje en el corpus. /reconcile funciona sobre respuestas a mensajes que he guardado en esta conversación.",
+    fr: "Je ne trouve pas ce message dans le corpus. /reconcile fonctionne sur les réponses aux messages que j'ai enregistrés ici.",
+    de: "Diese Nachricht ist nicht im Korpus. /reconcile funktioniert bei Antworten auf Nachrichten, die ich hier gespeichert habe.",
+    it: "Non trovo quel messaggio nel corpus. /reconcile funziona sulle risposte ai messaggi che ho salvato in questa conversazione.",
+    pt: "Não encontrei essa mensagem no corpus. O /reconcile funciona em respostas a mensagens que guardei nesta conversa.",
+    pl: "Nie znalazłem tej wiadomości w korpusie. /reconcile działa na odpowiedziach do wiadomości zapisanych w tej rozmowie.",
+  },
+
+  reconcile_failed: {
+    en: "Couldn't reconcile that message. Check function logs.",
+    uk: "Не вдалося виключити це повідомлення. Перевір логи функції.",
+    es: "No he podido excluir ese mensaje. Revisa los registros.",
+    fr: "Impossible d'exclure ce message. Vérifie les journaux.",
+    de: "Die Nachricht konnte nicht ausgeschlossen werden. Prüf die Logs.",
+    it: "Non sono riuscito a escludere quel messaggio. Controlla i log.",
+    pt: "Não consegui excluir essa mensagem. Verifica os registos.",
+    pl: "Nie udało się wykluczyć tej wiadomości. Sprawdź logi funkcji.",
+  },
+
+  restore_usage: {
+    en: "Reply to a message with /restore to bring it back into /recap results.",
+    uk: "Відповідай на повідомлення командою /restore, щоб повернути його в результати /recap.",
+    es: "Responde a un mensaje con /restore para devolverlo a los resultados de /recap.",
+    fr: "Réponds à un message avec /restore pour le réintégrer aux résultats de /recap.",
+    de: "Antworte auf eine Nachricht mit /restore, um sie wieder in /recap aufzunehmen.",
+    it: "Rispondi a un messaggio con /restore per riportarlo nei risultati di /recap.",
+    pt: "Responde a uma mensagem com /restore para a trazer de volta aos resultados de /recap.",
+    pl: "Odpowiedz na wiadomość komendą /restore, żeby wróciła do wyników /recap.",
+  },
+
+  restore_failed: {
+    en: "Couldn't restore that message. Check function logs.",
+    uk: "Не вдалося відновити це повідомлення. Перевір логи функції.",
+    es: "No he podido restaurar ese mensaje. Revisa los registros.",
+    fr: "Impossible de restaurer ce message. Vérifie les journaux.",
+    de: "Die Nachricht konnte nicht wiederhergestellt werden. Prüf die Logs.",
+    it: "Non sono riuscito a ripristinare quel messaggio. Controlla i log.",
+    pt: "Não consegui restaurar essa mensagem. Verifica os registos.",
+    pl: "Nie udało się przywrócić tej wiadomości. Sprawdź logi funkcji.",
+  },
+
+  restore_not_reconciled: {
+    en: "That message wasn't reconciled.",
+    uk: "Це повідомлення не було виключене.",
+    es: "Ese mensaje no estaba excluido.",
+    fr: "Ce message n'était pas exclu.",
+    de: "Diese Nachricht war nicht ausgeschlossen.",
+    it: "Quel messaggio non era escluso.",
+    pt: "Essa mensagem não estava excluída.",
+    pl: "Ta wiadomość nie była wykluczona.",
+  },
+
+  restore_ok: {
+    en: "✅ Restored. This message is back in /recap.",
+    uk: "✅ Відновлено. Це повідомлення знову в /recap.",
+    es: "✅ Restaurado. Ese mensaje vuelve a estar en /recap.",
+    fr: "✅ Restauré. Ce message est de nouveau dans /recap.",
+    de: "✅ Wiederhergestellt. Die Nachricht ist wieder in /recap.",
+    it: "✅ Ripristinato. Quel messaggio è di nuovo in /recap.",
+    pt: "✅ Restaurada. Essa mensagem voltou ao /recap.",
+    pl: "✅ Przywrócono. Ta wiadomość jest znów w /recap.",
+  },
+
+  pin_usage: {
+    en: "Reply to a message with /pin to mark it as meaningful.",
+    uk: "Відповідай на повідомлення командою /pin, щоб позначити його як важливе.",
+    es: "Responde a un mensaje con /pin para marcarlo como significativo.",
+    fr: "Réponds à un message avec /pin pour le marquer comme important.",
+    de: "Antworte auf eine Nachricht mit /pin, um sie als bedeutsam zu markieren.",
+    it: "Rispondi a un messaggio con /pin per segnarlo come significativo.",
+    pt: "Responde a uma mensagem com /pin para a marcares como importante.",
+    pl: "Odpowiedz na wiadomość komendą /pin, żeby oznaczyć ją jako ważną.",
+  },
+
+  pin_failed: {
+    en: "Couldn't pin that message. Check function logs.",
+    uk: "Не вдалося закріпити це повідомлення. Перевір логи функції.",
+    es: "No he podido fijar ese mensaje. Revisa los registros.",
+    fr: "Impossible d'épingler ce message. Vérifie les journaux.",
+    de: "Die Nachricht konnte nicht angeheftet werden. Prüf die Logs.",
+    it: "Non sono riuscito a fissare quel messaggio. Controlla i log.",
+    pt: "Não consegui fixar essa mensagem. Verifica os registos.",
+    pl: "Nie udało się przypiąć tej wiadomości. Sprawdź logi funkcji.",
+  },
+
+  unpin_usage: {
+    en: "Reply to a pinned message with /unpin to remove the pin.",
+    uk: "Відповідай на закріплене повідомлення командою /unpin, щоб зняти позначку.",
+    es: "Responde a un mensaje fijado con /unpin para quitar la marca.",
+    fr: "Réponds à un message épinglé avec /unpin pour retirer l'épingle.",
+    de: "Antworte auf eine angeheftete Nachricht mit /unpin, um sie zu lösen.",
+    it: "Rispondi a un messaggio fissato con /unpin per togliere il segno.",
+    pt: "Responde a uma mensagem fixada com /unpin para retirares a marca.",
+    pl: "Odpowiedz na przypiętą wiadomość komendą /unpin, żeby zdjąć przypięcie.",
+  },
+
+  unpin_failed: {
+    en: "Couldn't unpin that message. Check function logs.",
+    uk: "Не вдалося відкріпити це повідомлення. Перевір логи функції.",
+    es: "No he podido quitar la marca. Revisa los registros.",
+    fr: "Impossible de retirer l'épingle. Vérifie les journaux.",
+    de: "Die Markierung konnte nicht entfernt werden. Prüf die Logs.",
+    it: "Non sono riuscito a togliere il segno. Controlla i log.",
+    pt: "Não consegui retirar a marca. Verifica os registos.",
+    pl: "Nie udało się odpiąć tej wiadomości. Sprawdź logi funkcji.",
+  },
+
+  unpin_not_pinned: {
+    en: "That message wasn't pinned.",
+    uk: "Це повідомлення не було закріплене.",
+    es: "Ese mensaje no estaba fijado.",
+    fr: "Ce message n'était pas épinglé.",
+    de: "Diese Nachricht war nicht angeheftet.",
+    it: "Quel messaggio non era fissato.",
+    pt: "Essa mensagem não estava fixada.",
+    pl: "Ta wiadomość nie była przypięta.",
+  },
+
+  unpin_ok: {
+    en: "✅ Unpinned.",
+    uk: "✅ Відкріплено.",
+    es: "✅ Marca quitada.",
+    fr: "✅ Épingle retirée.",
+    de: "✅ Markierung entfernt.",
+    it: "✅ Segno rimosso.",
+    pt: "✅ Marca retirada.",
+    pl: "✅ Odpięto.",
+  },
+
+  pinned_fetch_failed: {
+    en: "Couldn't fetch pinned messages. Check function logs.",
+    uk: "Не вдалося отримати закріплені повідомлення. Перевір логи функції.",
+    es: "No he podido cargar los mensajes fijados. Revisa los registros.",
+    fr: "Impossible de charger les messages épinglés. Vérifie les journaux.",
+    de: "Angeheftete Nachrichten konnten nicht geladen werden. Prüf die Logs.",
+    it: "Non sono riuscito a caricare i messaggi fissati. Controlla i log.",
+    pt: "Não consegui carregar as mensagens fixadas. Verifica os registos.",
+    pl: "Nie udało się pobrać przypiętych wiadomości. Sprawdź logi funkcji.",
+  },
+
+  pinned_empty: {
+    en: "No pinned messages yet. Reply to any message with /pin to mark it.",
+    uk: "Поки немає закріплених повідомлень. Відповідай на будь-яке командою /pin, щоб позначити.",
+    es: "Aún no hay mensajes fijados. Responde a cualquiera con /pin para marcarlo.",
+    fr: "Aucun message épinglé pour l'instant. Réponds à n'importe lequel avec /pin.",
+    de: "Noch keine angehefteten Nachrichten. Antworte auf eine beliebige mit /pin.",
+    it: "Nessun messaggio fissato per ora. Rispondi a uno qualsiasi con /pin.",
+    pt: "Ainda não há mensagens fixadas. Responde a qualquer uma com /pin.",
+    pl: "Nie ma jeszcze przypiętych wiadomości. Odpowiedz na dowolną komendą /pin.",
+  },
+
+  note_usage: {
+    en: "Usage: /note &lt;note&gt; (or /remember)\n\nAdds a private note that only your own /ask will find.",
+    uk: "Використання: /note &lt;нотатка&gt; (або /remember)\n\nДодає приватну нотатку, яку знайде лише твій власний /ask.",
+    es: "Uso: /note &lt;nota&gt; (o /remember)\n\nAñade una nota privada que solo encontrará tu propio /ask.",
+    fr: "Usage : /note &lt;note&gt; (ou /remember)\n\nAjoute une note privée que seul ton propre /ask retrouvera.",
+    de: "Benutzung: /note &lt;Notiz&gt; (oder /remember)\n\nLegt eine private Notiz an, die nur dein eigenes /ask findet.",
+    it: "Uso: /note &lt;nota&gt; (o /remember)\n\nAggiunge una nota privata che solo il tuo /ask troverà.",
+    pt: "Uso: /note &lt;nota&gt; (ou /remember)\n\nJunta uma nota privada que só o teu /ask encontra.",
+    pl: "Użycie: /note &lt;notatka&gt; (lub /remember)\n\nDodaje prywatną notatkę, którą znajdzie tylko twoje /ask.",
+  },
+
+  note_save_failed: {
+    en: "Couldn't save that note. Check function logs.",
+    uk: "Не вдалося зберегти нотатку. Перевір логи функції.",
+    es: "No he podido guardar la nota. Revisa los registros.",
+    fr: "Impossible d'enregistrer la note. Vérifie les journaux.",
+    de: "Die Notiz konnte nicht gespeichert werden. Prüf die Logs.",
+    it: "Non sono riuscito a salvare la nota. Controlla i log.",
+    pt: "Não consegui guardar a nota. Verifica os registos.",
+    pl: "Nie udało się zapisać notatki. Sprawdź logi funkcji.",
+  },
+
+  note_saved: {
+    en: "📝 Noted.",
+    uk: "📝 Записав.",
+    es: "📝 Anotado.",
+    fr: "📝 Noté.",
+    de: "📝 Notiert.",
+    it: "📝 Annotato.",
+    pt: "📝 Anotado.",
+    pl: "📝 Zapisane.",
+  },
+
 };
 
 // Looks up a string. Falls back to English on a missing translation and warns, so a gap

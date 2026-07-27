@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v22";
+const BUILD_VERSION = "saas-v23";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -1120,7 +1120,7 @@ async function handleOnboardingCallback(cq: any): Promise<void> {
   }
   if (step === "p" && seatsTaken !== 1) {
     await answerCallbackQuery(cq.id);
-    await sendMessage(chatId, "That setup step is no longer available. Open your invite link again.");
+    await sendMessage(chatId, t(viewerLang(cq.from), "ob_step_expired"));
     return;
   }
 
@@ -1263,10 +1263,13 @@ async function finishOnboarding(
 
   // Tell the first person their partner arrived -- they have been waiting on it, and it
   // is the only signal that the couple is now fully set up.
+  // native_language again: this greeting is read by the person who was already here, so
+  // it is their language that decides, not the joiner's.
   const { data: others } = await dbAdmin.from("users")
-    .select("telegram_id, display_name").eq("tenant_id", tenantId).neq("id", created.id);
+    .select("telegram_id, display_name, native_language").eq("tenant_id", tenantId).neq("id", created.id);
   for (const o of others ?? []) {
-    await sendMessage(o.telegram_id, `${displayName} just joined. You're both set up — send a message and I'll translate it.`);
+    await sendMessage(o.telegram_id,
+      t(viewerLang(undefined, o), "ob_partner_joined", { name: displayName }));
   }
 }
 
@@ -1620,8 +1623,12 @@ async function handleDeleteAccountConfirm(cq: any): Promise<void> {
 
   // Tell the partner before the data goes. Once the tenant row is gone there is no way
   // left to find out who they were.
+  // native_language rides along because the goodbye below is addressed to THEM, not to
+  // the owner doing the deleting. Selecting only telegram_id would make viewerLang fall
+  // through to English without any error -- the exact silent failure this catalog exists
+  // to remove.
   const { data: members } = await dbAdmin.from("users")
-    .select("telegram_id").eq("tenant_id", tenant.id).neq("id", user.id);
+    .select("telegram_id, native_language").eq("tenant_id", tenant.id).neq("id", user.id);
 
   // 1. Stop the billing.
   if (tenant.stripe_subscription_id) {
@@ -1651,9 +1658,9 @@ async function handleDeleteAccountConfirm(cq: any): Promise<void> {
   }
   console.log(`deleted tenant ${tenant.id} at owner request`);
 
-  await sendMessage(chatId, "Your account and all its data have been deleted, and your subscription is cancelled. Take care. 🐹");
+  await sendMessage(chatId, t(viewerLang(cq.from, user), "account_deleted_self"));
   for (const m of members ?? []) {
-    await sendMessage(m.telegram_id, "Capybara here — the account you shared has been deleted by its owner. All of its data is gone. Take care. 🐹");
+    await sendMessage(m.telegram_id, t(viewerLang(undefined, m), "account_deleted_partner"));
   }
 }
 
@@ -3202,7 +3209,7 @@ function csvEscape(value: string | null | undefined): string {
 // before retrying an update: a retry would re-run the whole build and deliver the file
 // twice. The user gets an immediate acknowledgement instead of a silent pause.
 async function handleExport(msg: any, user: any) {
-  await sendMessage(msg.chat.id, "\u23f3 Building your export\u2026");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "export_building"));
   scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user));
 }
 
@@ -3215,7 +3222,7 @@ async function exportRun(chatId: number, user: any) {
 
   if (error) {
     console.error("export query failed:", error);
-    await sendMessage(chatId, "Couldn't build the export. Check function logs.");
+    await sendMessage(chatId, t(viewerLang(undefined, user), "export_failed"));
     return;
   }
 
@@ -3231,7 +3238,7 @@ async function exportRun(chatId: number, user: any) {
   const grammarRows = corrections ?? [];
 
   if ((!cards || cards.length === 0) && grammarRows.length === 0) {
-    await sendMessage(chatId, "Nothing to export yet.\n\nUse /vocab and /learn to add words, or turn on /capybara so your corrections build a grammar deck.");
+    await sendMessage(chatId, t(viewerLang(undefined, user), "export_empty"));
     return;
   }
 
@@ -3581,7 +3588,9 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   if (langTokenRaw) {
     const parsed = parseLangArg(langTokenRaw);
     if (!parsed) {
-      await sendMessage(msg.chat.id, `Didn't recognize "${langTokenRaw}" as a language. Use \`uk\` or \`en\`.`, "Markdown");
+      await sendMessage(msg.chat.id,
+      t(viewerLang(msg.from, user), "learn_lang_unrecognized",
+        { token: escapeHtml(langTokenRaw), codes: deckCodes(user) }), "HTML");
       return;
     }
     targetLang = parsed;
@@ -3599,7 +3608,7 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   } else {
     const learner = await lookupLearnerOfLanguage(db, targetLang);
     if (!learner) {
-      await sendMessage(msg.chat.id, `Couldn't find anyone learning ${targetLangLabel}. No deck to add to.`);
+      await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "learn_no_learner", { lang: targetLangLabel }));
       return;
     }
     targetUser = learner;
@@ -3611,7 +3620,9 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   catch (e) { console.error("refreshVocabularyCounts (learn top) failed:", e); }
   const unlearned = await fetchTopUnlearned(db, targetLang, targetUser.id, N);
   if (unlearned.length === 0) {
-    await sendMessage(msg.chat.id, `No unlearned ${targetLangLabel} words available for ${deckOwnerLabel} deck.\n\nRun /vocab to see the current top words.`);
+    await sendMessage(msg.chat.id, isOwnDeck
+      ? t(viewerLang(msg.from, user), "learn_none_unlearned_own", { lang: targetLangLabel })
+      : t(viewerLang(msg.from, user), "learn_none_unlearned_partner", { lang: targetLangLabel, name: targetUser.display_name }));
     return;
   }
   const newCards = unlearned.map((v: any) => ({
@@ -3626,18 +3637,23 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "deck_update_failed"));
     return;
   }
+  // HTML rather than Markdown: lemmas and glosses are model output interpolated into
+  // the message, and an unbalanced * or _ makes Telegram reject the whole send. HTML has
+  // a defined escape, so escapeHtml makes this safe by construction.
   const lines = unlearned.map((v: any, i: number) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
-    const gloss = v.gloss ?? "?";
-    return `${i + 1}. *${v.lemma}*${pos} \u2014 ${gloss}`;
+    const pos = v.part_of_speech ? ` <i>(${escapeHtml(String(v.part_of_speech))})</i>` : "";
+    const gloss = escapeHtml(String(v.gloss ?? "?"));
+    return `${i + 1}. <b>${escapeHtml(String(v.lemma))}</b>${pos} \u2014 ${gloss}`;
   });
-  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel} deck`;
-  const header = `\u2705 Added ${unlearned.length} ${targetLangLabel} word${unlearned.length === 1 ? "" : "s"} to ${deckOwnerLabel} ${deckLabel}:`;
-  const truncatedNote = n > N ? `\n\n_(Capped at ${N}; requested ${n}.)_` : "";
+  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel}`;
+  const header = isOwnDeck
+    ? t(lang, "learn_added_top_own", { n: unlearned.length, lang: targetLangLabel, deck: deckLabel })
+    : t(lang, "learn_added_top_partner", { n: unlearned.length, lang: targetLangLabel, deck: deckLabel, name: escapeHtml(targetUser.display_name) });
+  const truncatedNote = n > N ? t(lang, "learn_capped", { max: N, requested: n }) : "";
   const exportHint = isOwnDeck
-    ? `\n\n_Run \`/export\` when you want to import into Anki._`
-    : `\n\n_${targetUser.display_name} can run \`/export\` to import into Anki._`;
-  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${truncatedNote}${exportHint}`, "Markdown");
+    ? t(lang, "learn_export_hint_own")
+    : t(lang, "learn_export_hint_partner", { name: escapeHtml(targetUser.display_name) });
+  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${truncatedNote}${exportHint}`, "HTML");
 }
 
 async function resolveLearnTarget(user: any, word: string): Promise<
@@ -3693,7 +3709,8 @@ async function handleLearn(msg: any, user: any) {
     }
   }
   if (vocabRows.length === 0) {
-    await sendMessage(msg.chat.id, `Couldn't find "${arg}" in the ${targetLangLabel} vocabulary.\n\nRun /vocab to see words that have appeared in your conversations.`);
+    await sendMessage(msg.chat.id,
+      t(viewerLang(msg.from, user), "vocab_word_not_found", { word: escapeHtml(arg), lang: targetLangLabel }), "HTML");
     return;
   }
   const newCards = vocabRows.map((v: any) => ({
@@ -3711,24 +3728,27 @@ async function handleLearn(msg: any, user: any) {
   }
   const insertedIds = new Set((inserted ?? []).map((r: any) => r.vocabulary_id));
   const toAdd = vocabRows.filter((v: any) => insertedIds.has(v.id));
-  const deckOwnerLabel = isPartnerDeck ? `${targetUser.display_name}'s` : "your";
-  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel} deck`;
+  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel}`;
+  const ownerName = escapeHtml(targetUser.display_name);
   if (toAdd.length === 0) {
-    await sendMessage(msg.chat.id, `"${lemmaUsed}" is already in ${deckOwnerLabel} ${deckLabel}.`, "Markdown");
+    await sendMessage(msg.chat.id, isPartnerDeck
+      ? t(lang, "learn_already_partner", { word: escapeHtml(lemmaUsed), deck: deckLabel, name: ownerName })
+      : t(lang, "learn_already_own", { word: escapeHtml(lemmaUsed), deck: deckLabel }), "HTML");
     return;
   }
   const lines = toAdd.map((v: any) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
-    const gloss = v.gloss ?? "?";
-    return `\u2022 *${v.lemma}*${pos} \u2014 ${gloss}`;
+    const pos = v.part_of_speech ? ` <i>(${escapeHtml(String(v.part_of_speech))})</i>` : "";
+    const gloss = escapeHtml(String(v.gloss ?? "?"));
+    return `\u2022 <b>${escapeHtml(String(v.lemma))}</b>${pos} \u2014 ${gloss}`;
   });
   const skipped = vocabRows.length - toAdd.length;
-  const header = toAdd.length === 1
-    ? `\u2705 Added to ${deckOwnerLabel} ${deckLabel}:`
-    : `\u2705 Added ${toAdd.length} entries to ${deckOwnerLabel} ${deckLabel}:`;
-  const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase() ? `\n\nMatched as "${lemmaUsed}" (dictionary form of "${arg}").` : "";
-  const footer = skipped > 0 ? `\n\n_(${skipped} already in deck, skipped)_` : "";
-  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${footer}`, "Markdown");
+  const header = isPartnerDeck
+    ? t(lang, "learn_added_partner", { n: toAdd.length, deck: deckLabel, name: ownerName })
+    : t(lang, "learn_added_own", { n: toAdd.length, deck: deckLabel });
+  const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase()
+    ? t(lang, "learn_matched_as", { lemma: escapeHtml(lemmaUsed), arg: escapeHtml(arg) }) : "";
+  const footer = skipped > 0 ? t(lang, "learn_skipped", { n: skipped }) : "";
+  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${footer}`, "HTML");
 }
 
 async function handleForget(msg: any, user: any) {
@@ -3761,7 +3781,8 @@ async function handleForget(msg: any, user: any) {
     }
   }
   if (vocabRows.length === 0) {
-    await sendMessage(msg.chat.id, `Couldn't find "${arg}" in the ${targetLangLabel} vocabulary.`);
+    await sendMessage(msg.chat.id,
+      t(viewerLang(msg.from, user), "vocab_word_not_found_short", { word: escapeHtml(arg), lang: targetLangLabel }), "HTML");
     return;
   }
   const vocabIds = vocabRows.map((v: any) => v.id);
@@ -3775,25 +3796,29 @@ async function handleForget(msg: any, user: any) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "deck_update_failed"));
     return;
   }
-  const deckOwnerLabel = isPartnerDeck ? `${targetUser.display_name}'s` : "your";
-  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel} deck`;
+  const lang = viewerLang(msg.from, user);
+  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel}`;
+  const ownerName = escapeHtml(targetUser.display_name);
   if (!deleted || deleted.length === 0) {
-    await sendMessage(msg.chat.id, `"${lemmaUsed}" wasn't in ${deckOwnerLabel} ${deckLabel}.`, "Markdown");
+    await sendMessage(msg.chat.id, isPartnerDeck
+      ? t(lang, "forget_not_in_partner", { word: escapeHtml(lemmaUsed), deck: deckLabel, name: ownerName })
+      : t(lang, "forget_not_in_own", { word: escapeHtml(lemmaUsed), deck: deckLabel }), "HTML");
     return;
   }
   const deletedIds = new Set(deleted.map((r: any) => r.vocabulary_id));
   const removed = vocabRows.filter((v: any) => deletedIds.has(v.id));
   const lines = removed.map((v: any) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
-    const gloss = v.gloss ?? "?";
-    return `\u2022 *${v.lemma}*${pos} \u2014 ${gloss}`;
+    const pos = v.part_of_speech ? ` <i>(${escapeHtml(String(v.part_of_speech))})</i>` : "";
+    const gloss = escapeHtml(String(v.gloss ?? "?"));
+    return `\u2022 <b>${escapeHtml(String(v.lemma))}</b>${pos} \u2014 ${gloss}`;
   });
-  const header = removed.length === 1
-    ? `\u2796 Removed from ${deckOwnerLabel} ${deckLabel}:`
-    : `\u2796 Removed ${removed.length} entries from ${deckOwnerLabel} ${deckLabel}:`;
-  const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase() ? `\n\nMatched as "${lemmaUsed}" (dictionary form of "${arg}").` : "";
-  const note = `\n\n_If this card was already imported into Anki, delete it there too._`;
-  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${note}`, "Markdown");
+  const header = isPartnerDeck
+    ? t(lang, "forget_removed_partner", { n: removed.length, deck: deckLabel, name: ownerName })
+    : t(lang, "forget_removed_own", { n: removed.length, deck: deckLabel });
+  const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase()
+    ? t(lang, "learn_matched_as", { lemma: escapeHtml(lemmaUsed), arg: escapeHtml(arg) }) : "";
+  const note = t(lang, "forget_anki_note");
+  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${note}`, "HTML");
 }
 
 async function handleBackfill(msg: any, user: any) {
@@ -4568,12 +4593,12 @@ async function handleReconcile(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, "Reply to a message with /reconcile to exclude it from /recap results.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "reconcile_usage"));
     return;
   }
   const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, "Couldn't find that message in the corpus. /reconcile works on replies to messages I've stored in this conversation.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "reconcile_not_found"));
     return;
   }
   const { data: inserted, error } = await db
@@ -4582,7 +4607,7 @@ async function handleReconcile(msg: any, user: any) {
     .select("message_id");
   if (error) {
     console.error("reconcile upsert failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't reconcile that message. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "reconcile_failed"));
     return;
   }
   const wasNew = (inserted ?? []).length > 0;
@@ -4595,12 +4620,12 @@ async function handleRestore(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, "Reply to a message with /restore to bring it back into /recap results.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "restore_usage"));
     return;
   }
   const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "msg_not_in_corpus"));
     return;
   }
   const { data: deleted, error } = await db
@@ -4610,26 +4635,26 @@ async function handleRestore(msg: any, user: any) {
     .select("message_id");
   if (error) {
     console.error("restore delete failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't restore that message. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "restore_failed"));
     return;
   }
   if (!deleted || deleted.length === 0) {
-    await sendMessage(msg.chat.id, "That message wasn't reconciled.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "restore_not_reconciled"));
     return;
   }
-  await sendMessage(msg.chat.id, "\u2705 Restored. This message is back in /recap.");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "restore_ok"));
 }
 
 async function handlePin(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, "Reply to a message with /pin to mark it as meaningful.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "pin_usage"));
     return;
   }
   const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "msg_not_in_corpus"));
     return;
   }
   const { data: inserted, error } = await db
@@ -4638,7 +4663,7 @@ async function handlePin(msg: any, user: any) {
     .select("message_id");
   if (error) {
     console.error("pin upsert failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't pin that message. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "pin_failed"));
     return;
   }
   const wasNew = (inserted ?? []).length > 0;
@@ -4649,12 +4674,12 @@ async function handleUnpin(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, "Reply to a pinned message with /unpin to remove the pin.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unpin_usage"));
     return;
   }
   const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "msg_not_in_corpus"));
     return;
   }
   const { data: deleted, error } = await db
@@ -4664,14 +4689,14 @@ async function handleUnpin(msg: any, user: any) {
     .select("message_id");
   if (error) {
     console.error("unpin delete failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't unpin that message. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unpin_failed"));
     return;
   }
   if (!deleted || deleted.length === 0) {
-    await sendMessage(msg.chat.id, "That message wasn't pinned.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unpin_not_pinned"));
     return;
   }
-  await sendMessage(msg.chat.id, "\u2705 Unpinned.");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unpin_ok"));
 }
 
 async function handlePinned(msg: any, user: any) {
@@ -4683,11 +4708,11 @@ async function handlePinned(msg: any, user: any) {
     .limit(50);
   if (error) {
     console.error("pinned query failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't fetch pinned messages. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "pinned_fetch_failed"));
     return;
   }
   if (!data || data.length === 0) {
-    await sendMessage(msg.chat.id, "No pinned messages yet. Reply to any message with /pin to mark it.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "pinned_empty"));
     return;
   }
   const persons = buildPersonMap(user, await lookupPartner(db, user.id));
@@ -4711,7 +4736,7 @@ async function handleRemember(msg: any, user: any) {
   const firstSpace = text.indexOf(" ");
   const note = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
   if (!note) {
-    await sendMessage(msg.chat.id, "Usage: `/note <note>` (or `/remember`)\n\nAdds a private note that only your own /ask will find.", "Markdown");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "note_usage"), "HTML");
     return;
   }
   const language = await classifyLanguage(note, user.native_language, user.learning_language);
@@ -4722,11 +4747,11 @@ async function handleRemember(msg: any, user: any) {
     .single();
   if (error || !inserted) {
     console.error("remember insert failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't save that note. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "note_save_failed"));
     return;
   }
   scheduleBackgroundWork(`embedNote (${inserted.id})`, embedNoteBackground(db.tenantId, inserted.id, note, language));
-  await sendMessage(msg.chat.id, "\ud83d\udcdd Noted.");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "note_saved"));
 }
 
 type ParseOutput = {
