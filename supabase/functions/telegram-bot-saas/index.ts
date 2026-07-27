@@ -1249,9 +1249,19 @@ async function handleBilling(msg: any, user: any): Promise<void> {
 // nothing, and it keeps the numbers in the same place as the text that explains them. If
 // it ever stops being nothing, that is a good problem and the fix is a view.
 
-// Established by measuring real traffic with /annotate_ab: ~$0.015 per message, of which
-// annotation is about 85%. Used only for the estimate below, so drift costs nothing.
-const EST_COST_PER_MESSAGE_USD = 0.015;
+// ~$0.012 per message on saas-v12, of which annotation is about 83%. Calibrated against
+// real spend rather than modelled -- the cost model came in 20% under the actual bill, so
+// it is scaled to match. Was 0.015 before the annotation work (dropping the write-only
+// grammar/idiom/register fields, skipping unannotatable text, reusing identical repeats).
+// Used only for the estimate below, so drift costs nothing; re-derive it from the
+// Anthropic console after a month of real traffic.
+const EST_COST_PER_MESSAGE_USD = 0.012;
+
+// Supabase free tier database ceiling. The commercial project runs on it for now, so the
+// number that matters operationally is not the bill (there isn't one) but the headroom:
+// nothing is ever deleted, and embeddings are ~6 KB per message before indexes, so the
+// database only grows and grows faster the better the product does.
+const FREE_TIER_DB_BYTES = 500 * 1024 * 1024;
 
 async function handleTenants(msg: any, _user: any): Promise<void> {
   if (await denyUnlessSuperadmin(msg)) return;
@@ -1350,7 +1360,52 @@ async function handleTenants(msg: any, _user: any): Promise<void> {
     // number that goes stale. This is the side Stripe cannot tell you.
     `• ~$${(totalUsed * EST_COST_PER_MESSAGE_USD).toFixed(2)} estimated API spend`);
 
+  // Storage headroom. On the free tier this is the limit that actually bites: there is no
+  // bill to warn you, nothing is ever deleted, and the database grows FASTER the better
+  // the product does. Reported last but flagged into "needs attention" when it matters,
+  // because a number you have to remember to read is a number you find out about at 100%.
+  const storage = await instanceStorageLine();
+  if (storage) lines.push("", ...storage);
+
   await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
+}
+
+// The storage section of /tenants. Returns null rather than throwing or explaining itself:
+// this is a footnote on an operations report that has already been assembled, and a
+// missing RPC (an instance where 20260727000100 has not been applied) must not take the
+// whole command down.
+function formatBytes(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
+  if (n >= 1024 ** 2) return `${Math.round(n / 1024 ** 2)} MB`;
+  return `${Math.round(n / 1024)} kB`;
+}
+
+async function instanceStorageLine(): Promise<string[] | null> {
+  try {
+    const { data, error } = await dbAdmin.rpc("instance_storage");
+    if (error) { console.error("instance_storage failed:", error); return null; }
+    const row = Array.isArray(data) ? data[0] : data;
+    const bytes = Number(row?.db_bytes ?? 0);
+    if (!bytes) return null;
+    const pct = (bytes / FREE_TIER_DB_BYTES) * 100;
+    // 60% is early enough to act on: moving to Pro means a plan change and a backup, not
+    // a click, and the growth curve steepens with every new couple.
+    const flag = pct >= 80 ? " ⚠️" : pct >= 60 ? " — plan the move to Pro" : "";
+    const out = [
+      `*Storage*`,
+      `• ${formatBytes(bytes)} of ${formatBytes(FREE_TIER_DB_BYTES)} (${pct.toFixed(1)}%)${flag}`,
+    ];
+    if (row?.largest_table) {
+      out.push(`• largest: ${row.largest_table} (${formatBytes(Number(row.largest_bytes ?? 0))})`);
+    }
+    // The free tier has no backups and no point-in-time recovery. On a product whose value
+    // is a private history, that is a worse exposure than the size cap, and it is silent.
+    if (pct >= 60) out.push(`• _free tier has no backups — pg_dump before you grow further_`);
+    return out;
+  } catch (e) {
+    console.error("instance_storage threw:", e);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------- /delete_account
