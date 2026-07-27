@@ -1,5 +1,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.39.0";
+// Customer-facing copy in eight languages. A separate module because it is ~1,000
+// strings of prose: inline it would triple this file and bury the logic. Supabase
+// deploys the whole function directory, so an import ships identically.
+import { t, viewerLang, type Lang } from "./strings.ts";
 
 const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
@@ -8,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v18";
+const BUILD_VERSION = "saas-v19";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -457,10 +461,14 @@ async function handleUpdate(update: any) {
     // miss is not harmless -- the text falls through to the trial path and "/start@thebot"
     // gets translated. Any /start still here has already failed parseStartPayload above,
     // so a malformed setup code lands on the intro rather than being translated too.
-    const t = (msg.text ?? "").trim();
-    if (isCmd(t, "start", "plans", "subscribe", "pricing")) {
-      const intro = isCmd(t, "start") ? await introMessage() : await plansMessage();
-      await sendMessage(msg.chat.id, intro.text, "Markdown", intro.keyboard);
+    const cmd = (msg.text ?? "").trim();
+    if (isCmd(cmd, "start", "plans", "subscribe", "pricing")) {
+      // Nothing is known about this person yet, so the language comes from Telegram's own
+      // UI setting. That is the whole point: a Ukrainian speaker's very first screen is in
+      // Ukrainian, before they have told the bot anything.
+      const lang = viewerLang(msg.from);
+      const intro = isCmd(cmd, "start") ? await introMessage(lang) : await plansMessage(lang);
+      await sendMessage(msg.chat.id, intro.text, "HTML", intro.keyboard);
       return;
     }
     // Anything else from a stranger is a trial attempt. handleTrialMessage does its own
@@ -477,7 +485,7 @@ async function handleUpdate(update: any) {
   // owner re-opening their own link; answering plainly beats treating it as a command.
   const restart = parseStartPayload(msg.text ?? "");
   if (restart) {
-    await sendMessage(msg.chat.id, "You're already set up — no need for the setup link. Type /help to see what I can do.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "ob_already_setup"));
     return;
   }
 
@@ -667,10 +675,19 @@ function quotaRefusalText(v: QuotaVerdict): string {
 // callback payload. callback_data is client-supplied: without that check, anyone could
 // hand-craft a tap carrying a tenant id and add themselves to a stranger's subscription.
 
-const ONBOARD_GENDERS: { code: string; label: string }[] = [
-  { code: "female", label: "She/her" },
-  { code: "male", label: "He/him" },
-];
+// The two gender buttons, labelled in the reader's language. Built rather than declared
+// because the LABEL is localized while the CODE stored in the database must not be --
+// tenants.gender is 'female'/'male' regardless of what the button said.
+// The codes written to users.gender. Deliberately separate from the button labels: the
+// label is copy and changes per language, the code is data and must never.
+const GENDER_CODES = ["female", "male"] as const;
+
+function genderKeyboardRow(lang: Lang, data: (code: string) => string) {
+  return [
+    { text: t(lang, "ob_gender_she"), callback_data: data("female") },
+    { text: t(lang, "ob_gender_he"), callback_data: data("male") },
+  ];
+}
 
 // --- The front door: intro, live prices, free trial ---------------------------------
 //
@@ -725,30 +742,15 @@ async function stripePriceText(): Promise<Record<PlanKey, string>> {
   return text;
 }
 
-// [Try it free] + one URL button per plan. A plan whose Payment Link is unset is omitted
-// rather than rendered as a dead button; if BOTH are unset the caller falls back to copy
-// that tells the reader to get in touch, so the bot never advertises a way to pay that
-// does not work.
-function planKeyboard(prices: Record<PlanKey, string>, includeTrial: boolean) {
-  const rows: any[] = [];
-  if (includeTrial) rows.push([{ text: "✨ Try it free", callback_data: "tr|begin" }]);
-  if (PAYMENT_LINK_STANDARD) rows.push([{ text: `Standard — ${prices.standard}`, url: PAYMENT_LINK_STANDARD }]);
-  if (PAYMENT_LINK_ULTIMATE) rows.push([{ text: `Pro — ${prices.ultimate}`, url: PAYMENT_LINK_ULTIMATE }]);
-  return rows.length ? { inline_keyboard: rows } : undefined;
-}
-
 // The plans differ by more than a number, so the copy has to say what. Quota alone reads
 // as "same thing, bigger" and gives nobody a reason to upgrade beyond running out; the
 // deck depth is the real difference and it is the one that tracks what each plan costs to
 // run. Stated in terms of what the customer gets, never "one annotation pass".
-function planComparison(prices: Record<PlanKey, string>): string {
+function planComparison(lang: Lang, prices: Record<PlanKey, string>): string {
   return (
-    `*Standard* — ${prices.standard}\n` +
-    `${PLAN_QUOTA.standard.toLocaleString()} messages/month. Flashcards from what *you* write.\n\n` +
-    `*Pro* — ${prices.ultimate}\n` +
-    `${PLAN_QUOTA.ultimate.toLocaleString()} messages/month. Flashcards from *both* sides — ` +
-    `what you write and what you read. Roughly double the deck.\n\n` +
-    `One subscription covers you and a language partner.`
+    t(lang, "plan_standard", { price: prices.standard, quota: PLAN_QUOTA.standard.toLocaleString() }) + "\n\n" +
+    t(lang, "plan_pro", { price: prices.ultimate, quota: PLAN_QUOTA.ultimate.toLocaleString() }) + "\n\n" +
+    t(lang, "plan_covers_both")
   );
 }
 
@@ -756,39 +758,42 @@ function plansConfigured(): boolean {
   return Boolean(PAYMENT_LINK_STANDARD || PAYMENT_LINK_ULTIMATE);
 }
 
+// [Try it free] + one URL button per plan. A plan whose Payment Link is unset is omitted
+// rather than rendered as a dead button; if BOTH are unset the caller falls back to copy
+// that tells the reader to get in touch, so the bot never advertises a way to pay that
+// does not work.
+//
+// The plan NAMES stay untranslated: "Standard" and "Pro" are product names and must match
+// the Stripe product the customer's receipt will show. Only the button verb is localized.
+function planKeyboard(lang: Lang, prices: Record<PlanKey, string>, includeTrial: boolean) {
+  const rows: any[] = [];
+  if (includeTrial) rows.push([{ text: t(lang, "btn_try_free"), callback_data: "tr|begin" }]);
+  if (PAYMENT_LINK_STANDARD) rows.push([{ text: `Standard — ${prices.standard}`, url: PAYMENT_LINK_STANDARD }]);
+  if (PAYMENT_LINK_ULTIMATE) rows.push([{ text: `Pro — ${prices.ultimate}`, url: PAYMENT_LINK_ULTIMATE }]);
+  return rows.length ? { inline_keyboard: rows } : undefined;
+}
+
 // The message a stranger gets for saying anything at all. One screen: what it is, what
 // makes it different from a translation app, both plans, and a way in.
-async function introMessage(): Promise<{ text: string; keyboard: any }> {
+async function introMessage(lang: Lang): Promise<{ text: string; keyboard: any }> {
   const prices = await stripePriceText();
-  const plans = plansConfigured() ? planComparison(prices)
-    : `Subscriptions aren't open through the bot just yet — message the person who sent you here and they'll get you set up.`;
+  const plans = plansConfigured() ? planComparison(lang, prices) : t(lang, "plans_not_open");
   return {
-    text:
-      `*Capybara* turns real conversations into a language you actually learn.\n\n` +
-      `It lives in Telegram and translates between your two languages, so you can write in ` +
-      `yours and be read in theirs from day one — then builds a study deck out of what was ` +
-      `genuinely said.\n\n` +
-      `Two things a translation app doesn't do:\n\n` +
-      `• *Flashcards from your own sentences* — every word in the sense it was actually ` +
-      `used, not the dictionary's first guess. Exports to Anki.\n` +
-      `• *A searchable record* — ask "when did we book the flights?" and it finds it.\n\n` +
-      `*Use it with a language partner*, and you each read the other in your own language ` +
-      `while both decks fill up. *Or use it solo* — write in the language you're learning, ` +
-      `see it corrected and translated, and study what you got wrong.\n\n` +
-      `${plans}\n\n` +
-      `_Try it free below — five messages, no card. Trial messages are translated and not stored._`,
-    keyboard: planKeyboard(prices, true),
+    text: `${t(lang, "intro_body")}\n\n${plans}\n\n${t(lang, "intro_trial_note")}`,
+    keyboard: planKeyboard(lang, prices, true),
   };
 }
 
 // Shown when the allowance runs out, and by /plans.
-async function plansMessage(prefix?: string): Promise<{ text: string; keyboard: any }> {
+async function plansMessage(lang: Lang, prefix?: string): Promise<{ text: string; keyboard: any }> {
   const prices = await stripePriceText();
   const body = plansConfigured()
-    ? `${planComparison(prices)}\n\nAfter paying you'll get a link that sets everything up in ` +
-      `three taps — plus one to invite a language partner, whenever you want it.`
-    : `Subscriptions aren't open through the bot just yet — message the person who sent you here.`;
-  return { text: `${prefix ? prefix + "\n\n" : ""}${body}`, keyboard: planKeyboard(prices, false) };
+    ? `${planComparison(lang, prices)}\n\n${t(lang, "plans_after_paying")}`
+    : t(lang, "plans_not_open");
+  return {
+    text: `${prefix ? prefix + "\n\n" : ""}${body}`,
+    keyboard: planKeyboard(lang, prices, false),
+  };
 }
 
 // Trial callbacks. Shape mirrors the ob|... wizard next door:
@@ -807,35 +812,40 @@ async function handleTrialCallback(cq: any): Promise<void> {
   const telegramId = cq.from?.id;
   if (!chatId || !telegramId) { await answerCallbackQuery(cq.id); return; }
 
+  // Telegram's UI language until they pick one, then their own choice -- so the second
+  // question already arrives in the language they just selected.
+  let lang = viewerLang(cq.from);
+
   if (step === "begin") {
     await answerCallbackQuery(cq.id);
-    await sendMessage(chatId, "Which language do you speak natively?", undefined, langPickerKeyboard("tr|n"));
+    await sendMessage(chatId, t(lang, "trial_pick_native"), undefined, langPickerKeyboard("tr|n"));
     return;
   }
   if (step === "n") {
     const native = parts[2];
     if (!LANGUAGES[native]) { await answerCallbackQuery(cq.id); return; }
+    lang = viewerLang(cq.from, { native_language: native });
     await answerCallbackQuery(cq.id);
-    await sendMessage(chatId, `And which are you learning?`, undefined, langPickerKeyboard(`tr|l|${native}`, native));
+    await sendMessage(chatId, t(lang, "trial_pick_learning"), undefined, langPickerKeyboard(`tr|l|${native}`, native));
     return;
   }
   if (step === "l") {
     const native = parts[2], learning = parts[3];
     if (!LANGUAGES[native] || !LANGUAGES[learning] || native === learning) { await answerCallbackQuery(cq.id); return; }
+    lang = viewerLang(cq.from, { native_language: native });
     const { error } = await dbAdmin.from("trial_users").upsert(
       { telegram_id: telegramId, native_language: native, learning_language: learning },
       { onConflict: "telegram_id" });
     if (error) {
       console.error("trial pair save failed:", error);
-      await answerCallbackQuery(cq.id, "Something went wrong.");
+      await answerCallbackQuery(cq.id, t(lang, "generic_error"));
       return;
     }
     await answerCallbackQuery(cq.id);
     await sendMessage(chatId,
-      `Set: ${langLabel(native)} ↔ ${langLabel(learning)}.\n\n` +
-      `Send me a message in either language and I'll translate it. ` +
-      `You've got ${TRIAL_MESSAGE_LIMIT} free — the first one comes with the flashcards it would add to your deck.`,
-      "Markdown");
+      t(lang, "trial_pair_set", {
+        native: langLabel(native), learning: langLabel(learning), limit: TRIAL_MESSAGE_LIMIT,
+      }), "HTML");
     return;
   }
   await answerCallbackQuery(cq.id);
@@ -852,15 +862,22 @@ async function handleTrialMessage(msg: any): Promise<void> {
   // A group chat is the expensive one: the bot sitting in a group would be a free
   // translator for everyone in it, charged to a single stranger's five-message quota.
   if (msg.chat?.type !== "private") return;
+
+  // Read once, up front: it carries both the language pair AND the language to speak to
+  // this person in. Fetching it here rather than after the gate also removes the second
+  // read further down, so this is one query, not two.
+  const { data: trial } = await dbAdmin.from("trial_users")
+    .select("native_language, learning_language").eq("telegram_id", telegramId).maybeSingle();
+  const lang = viewerLang(msg.from, null, trial);
+
   const text = (msg.text ?? "").trim();
   if (!text) {
-    const { text: t, keyboard } = await plansMessage(
-      "Voice, photos and files are part of the subscription — the free trial is text only.");
-    await sendMessage(chatId, t, "Markdown", keyboard);
+    const { text: body, keyboard } = await plansMessage(lang, t(lang, "trial_text_only"));
+    await sendMessage(chatId, body, "HTML", keyboard);
     return;
   }
   if (text.length > TRIAL_MAX_CHARS) {
-    await sendMessage(chatId, `That's a bit long for the free trial — try something under ${TRIAL_MAX_CHARS} characters.`);
+    await sendMessage(chatId, t(lang, "trial_too_long", { max: TRIAL_MAX_CHARS }));
     return;
   }
 
@@ -874,7 +891,7 @@ async function handleTrialMessage(msg: any): Promise<void> {
   // errs the other way on purpose, because a blip must not look like a billing problem.
   if (error) {
     console.error("consume_trial_message failed; refusing:", error);
-    await sendMessage(chatId, "Something went wrong on my end. Try again in a moment.");
+    await sendMessage(chatId, t(lang, "generic_error"));
     return;
   }
   const row = Array.isArray(data) ? data[0] : data;
@@ -882,28 +899,25 @@ async function handleTrialMessage(msg: any): Promise<void> {
 
   if (!row?.allowed) {
     if (reason === "no_pair") {
-      const { text: t, keyboard } = await introMessage();
-      await sendMessage(chatId, t, "Markdown", keyboard);
+      const { text: body, keyboard } = await introMessage(lang);
+      await sendMessage(chatId, body, "HTML", keyboard);
       return;
     }
     if (reason === "daily_cap") {
-      const { text: t, keyboard } = await plansMessage(
-        "The free trial has hit its limit for today — try again tomorrow, or skip the queue below.");
-      await sendMessage(chatId, t, "Markdown", keyboard);
+      const { text: body, keyboard } = await plansMessage(lang, t(lang, "trial_daily_cap"));
+      await sendMessage(chatId, body, "HTML", keyboard);
       return;
     }
-    const { text: t, keyboard } = await plansMessage(
-      `That's your ${TRIAL_MESSAGE_LIMIT} free messages used. Hope it gave you a feel for it.`);
-    await sendMessage(chatId, t, "Markdown", keyboard);
+    const { text: body, keyboard } = await plansMessage(
+      lang, t(lang, "trial_exhausted", { limit: TRIAL_MESSAGE_LIMIT }));
+    await sendMessage(chatId, body, "HTML", keyboard);
     return;
   }
 
-  const { data: trial } = await dbAdmin.from("trial_users")
-    .select("native_language, learning_language").eq("telegram_id", telegramId).maybeSingle();
   const native = trial?.native_language, learning = trial?.learning_language;
   if (!native || !learning) {
-    const { text: t, keyboard } = await introMessage();
-    await sendMessage(chatId, t, "Markdown", keyboard);
+    const { text: body, keyboard } = await introMessage(lang);
+    await sendMessage(chatId, body, "HTML", keyboard);
     return;
   }
 
@@ -911,7 +925,7 @@ async function handleTrialMessage(msg: any): Promise<void> {
   const to = from === native ? learning : native;
   const translated = await translate(text, from, to);
   if (!translated) {
-    await sendMessage(chatId, "I couldn't translate that one — try again in a moment.");
+    await sendMessage(chatId, t(lang, "trial_translate_failed"));
     return;
   }
 
@@ -923,17 +937,17 @@ async function handleTrialMessage(msg: any): Promise<void> {
   // the first message shows it. Only the first: annotation is ~83% of per-message cost,
   // and one worked example demonstrates it as well as five.
   if (used === 1) {
-    const sample = await trialFlashcards(text, from, to, translated);
+    const sample = await trialFlashcards(lang, text, from, to, translated);
     if (sample) body += `\n\n${sample}`;
   }
-  body += `\n\n<i>${left} free ${left === 1 ? "message" : "messages"} left.</i>`;
+  body += `\n\n<i>${escapeHtml(t(lang, "trial_left", { n: left }))}</i>`;
   await sendMessage(chatId, body, "HTML");
 }
 
 // A few flashcards from the trial message, formatted for chat. Returns null rather than
 // throwing or explaining itself: this is a flourish on top of a translation that already
 // succeeded, and a failed demo should cost the reader nothing.
-async function trialFlashcards(text: string, from: LangCode, to: LangCode, translated: string): Promise<string | null> {
+async function trialFlashcards(lang: Lang, text: string, from: LangCode, to: LangCode, translated: string): Promise<string | null> {
   if (!hasAnnotatableWord(text)) return null;
   try {
     const { parsed } = await runAnnotation(ANNOTATION_MODEL, text, from, to, translated, "trial");
@@ -942,7 +956,7 @@ async function trialFlashcards(text: string, from: LangCode, to: LangCode, trans
       .slice(0, 4);
     if (rows.length === 0) return null;
     const lines = rows.map((v: any) => `• <b>${escapeHtml(String(v.lemma))}</b> — ${escapeHtml(String(v.lemma_translation))}`).join("\n");
-    return `Flashcards this would add to your deck:\n${lines}`;
+    return `${escapeHtml(t(lang, "trial_flashcards_header"))}\n${lines}`;
   } catch (e) {
     console.error("trial flashcards failed:", e);
     return null;
@@ -977,21 +991,20 @@ async function beginOnboarding(msg: any, code: string): Promise<void> {
   const { data, error } = await dbAdmin.rpc("claim_tenant_seat", { p_pairing_code: code });
   if (error) {
     console.error("claim_tenant_seat failed:", error);
-    await sendMessage(msg.chat.id, "Something went wrong checking that link. Please try again in a moment.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from), "ob_link_check_failed"));
     return;
   }
   const row = Array.isArray(data) ? data[0] : data;
   const outcome: string = row?.outcome ?? "unknown_code";
   if (outcome !== "ok") {
-    await sendMessage(msg.chat.id, onboardingRefusal(outcome));
+    await sendMessage(msg.chat.id, onboardingRefusal(viewerLang(msg.from), outcome));
     return;
   }
 
   if ((row.seats_taken ?? 0) === 0) {
     // First seat: the person who paid. They choose the language pair for the couple.
     await sendMessage(msg.chat.id,
-      `Welcome to Capybara! Let's get you set up — three taps and you're done.\n\n` +
-      `First: which language do you speak natively?`,
+      t(viewerLang(msg.from), "ob_welcome_first"),
       undefined, langPickerKeyboard(`ob|l|${code}`));
     return;
   }
@@ -1001,26 +1014,26 @@ async function beginOnboarding(msg: any, code: string): Promise<void> {
   // that is genuinely theirs.
   const partnerLangs = await tenantLanguagePair(row.tenant_id);
   if (!partnerLangs) {
-    await sendMessage(msg.chat.id, "Your partner hasn't finished setting up yet. Ask them to complete their setup, then open this link again.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from), "ob_partner_not_ready"));
     return;
   }
+  // The second seat's own native language is already known from the pair, so this person
+  // is greeted in their language on their very first screen -- no guessing needed.
+  const pLang = viewerLang(msg.from, { native_language: partnerLangs.native });
   await sendMessage(msg.chat.id,
-    `Welcome to Capybara! Your partner has set this up for ${langLabel(partnerLangs.native)} ↔ ${langLabel(partnerLangs.learning)}.\n\n` +
-    `You'll be writing in ${langLabel(partnerLangs.learning)}. How should I refer to you?`,
+    t(pLang, "ob_partner_welcome", {
+      native: langLabel(partnerLangs.native), learning: langLabel(partnerLangs.learning),
+    }),
     undefined,
-    { inline_keyboard: [ONBOARD_GENDERS.map((g) => ({ text: g.label, callback_data: `ob|p|${code}|${g.code}` }))] });
+    { inline_keyboard: [genderKeyboardRow(pLang, (code2) => `ob|p|${code}|${code2}`)] });
 }
 
-function onboardingRefusal(outcome: string): string {
+function onboardingRefusal(lang: Lang, outcome: string): string {
   switch (outcome) {
-    case "expired_code":
-      return "That setup link has expired. Open the billing portal from your receipt email, or contact support and we'll issue a new one.";
-    case "full":
-      return "Both seats on that subscription are already taken. If you think that's wrong, contact support.";
-    case "inactive_subscription":
-      return "That subscription isn't active. If you've just paid, give it a minute and try again; otherwise check your billing details.";
-    default:
-      return "I don't recognise that setup link. Check you've opened the most recent one from your receipt.";
+    case "expired_code":         return t(lang, "refusal_expired");
+    case "full":                 return t(lang, "refusal_full");
+    case "inactive_subscription": return t(lang, "refusal_inactive");
+    default:                     return t(lang, "refusal_unknown");
   }
 }
 
@@ -1052,13 +1065,13 @@ async function handleOnboardingCallback(cq: any): Promise<void> {
   const { data, error } = await dbAdmin.rpc("claim_tenant_seat", { p_pairing_code: code });
   if (error) {
     console.error("claim_tenant_seat failed mid-wizard:", error);
-    await answerCallbackQuery(cq.id, "Something went wrong.");
+    await answerCallbackQuery(cq.id, t(viewerLang(cq.from), "generic_error"));
     return;
   }
   const row = Array.isArray(data) ? data[0] : data;
   if (row?.outcome !== "ok") {
     await answerCallbackQuery(cq.id);
-    await sendMessage(chatId, onboardingRefusal(row?.outcome ?? "unknown_code"));
+    await sendMessage(chatId, onboardingRefusal(viewerLang(cq.from), row?.outcome ?? "unknown_code"));
     return;
   }
   const tenantId: string = row.tenant_id;
@@ -1098,7 +1111,7 @@ async function handleOnboardingCallback(cq: any): Promise<void> {
       await answerCallbackQuery(cq.id);
       await editMessageReplyMarkup(chatId, cq.message.message_id);
       await sendMessage(chatId,
-        `${langLabel(native)} it is. And which language are you learning — the one your partner speaks?`,
+        t(viewerLang(cq.from, { native_language: native }), "ob_ask_learning", { native: langLabel(native) }),
         undefined, langPickerKeyboard(`ob|g|${code}|${native}`, native));
       return;
     }
@@ -1107,11 +1120,11 @@ async function handleOnboardingCallback(cq: any): Promise<void> {
       if (!LANGUAGES[native] || !LANGUAGES[learning] || native === learning) { await answerCallbackQuery(cq.id); return; }
       await answerCallbackQuery(cq.id);
       await editMessageReplyMarkup(chatId, cq.message.message_id);
+      const gLang = viewerLang(cq.from, { native_language: native });
       await sendMessage(chatId,
-        `Last one. How should I refer to you? This isn't cosmetic — ${langLabel(learning)} and several other ` +
-        `languages change verb and adjective endings depending on who's speaking, so translations come out wrong without it.`,
+        t(gLang, "ob_ask_gender"),
         undefined,
-        { inline_keyboard: [ONBOARD_GENDERS.map((gg) => ({ text: gg.label, callback_data: `ob|d|${code}|${native}|${learning}|${gg.code}` }))] });
+        { inline_keyboard: [genderKeyboardRow(gLang, (c) => `ob|d|${code}|${native}|${learning}|${c}`)] });
       return;
     }
     case "d": {
@@ -1125,7 +1138,7 @@ async function handleOnboardingCallback(cq: any): Promise<void> {
     case "p": {
       const gender = parts[3];
       const pair = await tenantLanguagePair(tenantId);
-      if (!pair) { await answerCallbackQuery(cq.id, "Your partner hasn't finished setting up."); return; }
+      if (!pair) { await answerCallbackQuery(cq.id, t(viewerLang(cq.from), "ob_partner_not_ready")); return; }
       await answerCallbackQuery(cq.id);
       await editMessageReplyMarkup(chatId, cq.message.message_id);
       await finishOnboarding(cq, tenantId, code, pair.native, pair.learning, gender, /* isOwner */ false);
@@ -1150,7 +1163,7 @@ async function finishOnboarding(
     display_name: displayName,
     native_language: native,
     learning_language: learning,
-    gender: ONBOARD_GENDERS.some((g) => g.code === gender) ? gender : null,
+    gender: (GENDER_CODES as readonly string[]).includes(gender) ? gender : null,
   }).select("id").single();
 
   if (error) {
@@ -1184,18 +1197,19 @@ async function finishOnboarding(
     if (ownErr || !owned || owned.length === 0) {
       console.error(`owner_user_id not set for tenant ${tenantId}:`, ownErr ?? "no row updated");
       await sendMessage(chatId,
-        "You're set up and I can start translating — but I couldn't record you as the " +
-        "account holder, so /billing won't work yet. Contact support and we'll fix it.");
+        t(viewerLang(cq.from, { native_language: native }), "ob_owner_error"));
     }
 
     const invite = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+    // By now the person has chosen a native language, so this is definitive rather than a
+    // guess from Telegram's UI setting.
+    const lang = viewerLang(cq.from, { native_language: native });
     await sendMessage(chatId,
-      `You're all set, ${escapeHtml(displayName)}! I'll translate between ${langLabel(native)} and ${langLabel(learning)}.\n\n` +
-      `<b>Start now, on your own</b> — write in either language and I'll translate it, and every ` +
-      `message builds your study deck. Nothing else is needed.\n\n` +
-      `<b>Or add a language partner</b>, whenever you like. They read you in their language and ` +
-      `you read them in yours, and you both get a deck out of it — forward them the link below.\n\n` +
-      `Type /help to see everything.`,
+      t(lang, "ob_all_set", {
+        name: escapeHtml(displayName),
+        native: langLabel(native),
+        learning: langLabel(learning),
+      }),
       "HTML");
 
     // The invite goes out as its OWN message, with no parse_mode at all.
@@ -1213,7 +1227,7 @@ async function finishOnboarding(
     if (invite) {
       await sendMessage(chatId, invite);
     } else {
-      await sendMessage(chatId, `Their setup code: ${code}`);
+      await sendMessage(chatId, t(lang, "ob_invite_code_fallback", { code }));
     }
     return;
   }
