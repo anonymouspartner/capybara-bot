@@ -282,6 +282,18 @@ it. Trial messages are never written to `messages` — a trial is not a corpus, 
 who never subscribes leaves nothing behind. The gate **fails closed**: if the database
 cannot be reached the message is refused rather than served free.
 
+**Leaving is possible for both seats.** The partner can `/leave` under their own steam;
+the owner can remove and replace them from `/management`. Both run the same SQL function,
+because the data work is identical and two copies would drift — silently, since one path
+forgetting to clear private notes leaves them readable by whoever inherits the account.
+
+It is a *soft* leave. `messages.sender_id` is `ON DELETE RESTRICT`, which is the schema
+saying a shared conversation is not one participant's to erase: the other person paid for
+that corpus and `/recap` is grounded in it. So access is revoked and what is genuinely
+personal goes — decks, notes, corrections — while the history stays with the account that
+owns it. `users.telegram_id` is unique only among *active* members, so leaving does not
+lock someone out of ever using the product again with somebody else.
+
 **Plans differ in annotation depth**, which is the thing a customer actually feels:
 Standard annotates the side *you wrote*, Pro annotates **both** — so on Pro you also study
 your partner's language from their own words, not only from your attempts at it. It is a
@@ -338,7 +350,7 @@ and the payer is told their partner arrived.
 
 The paid build talks to each person **in their own language** — all eight in the registry,
 across every customer-facing surface: the intro a stranger sees, the trial, onboarding,
-`/start`, `/help`, `/billing`, quota warnings, the study commands, the grammar assistant,
+`/start`, `/help`, `/management`, quota warnings, the study commands, the grammar assistant,
 media and voice errors, and the account-deletion goodbyes. **155 keys x 8 languages**, in
 `supabase/functions/telegram-bot-saas/strings.ts`.
 

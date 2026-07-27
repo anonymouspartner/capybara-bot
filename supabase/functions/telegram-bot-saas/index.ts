@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v24";
+const BUILD_VERSION = "saas-v25";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -508,7 +508,7 @@ async function handleUpdate(update: any) {
   // ones. /recap and /note are NOT here: /recap synthesises and /note classifies then
   // embeds, so both genuinely spend.
   if (!isSuperadmin(msg.from?.id) &&
-      !isCmd(msg.text ?? "", "billing", "plans", "subscribe", "pricing", "delete_account", "export",
+      !isCmd(msg.text ?? "", "management", "billing", "plans", "subscribe", "pricing", "delete_account", "export",
              "leave", "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
@@ -557,7 +557,7 @@ async function handleUpdate(update: any) {
     // Without an entry here it would fall through to the media handlers below and get
     // TRANSLATED and forwarded to their partner, costing them a quota message. For
     // someone who already subscribes, "plans and pricing" is what /billing answers.
-    { match: t => isCmd(t, "billing", "plans", "subscribe", "pricing"),                 handle: handleBilling },
+    { match: t => isCmd(t, "management", "billing", "plans", "subscribe", "pricing"),   handle: handleManagement },
     { match: t => isCmd(t, "delete_account"),                                           handle: handleDeleteAccount },
     { match: t => isCmd(t, "leave"),                                                    handle: handleLeave },
     { match: t => t === "/help",                                                        handle: handleHelp },
@@ -1312,7 +1312,14 @@ function planLabel(plan: string | null | undefined): string {
 // ever sent to the OWNER: the partner is a member of the couple, not the account holder,
 // and giving them a cancel button for someone else's card would be a support incident
 // waiting to happen.
-async function handleBilling(msg: any, user: any): Promise<void> {
+// ---------------------------------------------------------------------------- /management
+//
+// Renamed from /billing, because it stopped being only about billing: it is where you see
+// the subscription AND who is on the account, and where the owner adds or removes a
+// partner. /billing still works as an alias -- customers learned that name, and silently
+// breaking a command someone reaches for when their card has failed is the worst possible
+// moment to be pedantic about naming.
+async function handleManagement(msg: any, user: any): Promise<void> {
   const lang = viewerLang(msg.from, user);
   const { data: tenant, error } = await dbAdmin.from("tenants")
     .select("stripe_customer_id, owner_user_id, plan, status, message_quota, messages_used, current_period_end")
@@ -1353,13 +1360,114 @@ async function handleBilling(msg: any, user: any): Promise<void> {
     await sendMessage(msg.chat.id, `${summary}\n\n${t(lang, "billing_portal_failed")}`, "HTML");
     return;
   }
+  // Who is on the account. The owner is the only one who can change it, and this is the
+  // one screen where they would think to look.
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
+  const rows: any[] = [[{ text: t(lang, "billing_btn_manage"), url: portalUrl }]];
+  let seatLine: string;
+  if (partner) {
+    seatLine = t(lang, "mgmt_partner_line", { name: escapeHtml(partner.display_name) });
+    rows.push([{ text: t(lang, "mgmt_btn_remove"), callback_data: `mg|rm|${partner.id}` }]);
+  } else {
+    seatLine = t(lang, "mgmt_seat_free");
+  }
+
   // /delete_account is surfaced here rather than in the "/" menu: this is where someone
   // who wants out actually looks, and a destructive command does not belong one tap away
   // in a menu used every day.
   await sendMessage(msg.chat.id,
-    `${summary}\n\n${t(lang, "billing_manage")}`,
+    `${summary}${seatLine}\n\n${t(lang, "billing_manage")}`,
     "HTML",
-    { inline_keyboard: [[{ text: t(lang, "billing_btn_manage"), url: portalUrl }]] });
+    { inline_keyboard: rows });
+
+  // The invite goes as its own message with no parse_mode: a bot username contains
+  // underscores, which Markdown renders as italics and turns into a handle that does not
+  // exist. Only when the seat is actually free -- an unsolicited invite link on a full
+  // account is just confusing.
+  if (!partner) {
+    const { data: tRow } = await dbAdmin.from("tenants")
+      .select("pairing_code").eq("id", user.tenant_id).maybeSingle();
+    const code = tRow?.pairing_code;
+    if (code) {
+      const invite = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+      if (invite) await sendMessage(msg.chat.id, invite);
+      else await sendMessage(msg.chat.id, t(lang, "ob_invite_code_fallback", { code }));
+    }
+  }
+}
+
+// Owner-initiated removal. Same data path as leaving -- release_seat covers both -- but a
+// different consent story: the person being removed did not ask, so they are told, and the
+// confirmation spells out what survives rather than implying everything goes.
+async function handleRemovePartnerConfirm(cq: any, targetId: string): Promise<void> {
+  const chatId = cq.message?.chat?.id;
+  const user = await lookupUser(cq.from);
+  if (!user) { await answerCallbackQuery(cq.id, "Not authorized."); return; }
+  const lang = viewerLang(cq.from, user);
+
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
+  // Re-read rather than trusting the id in callback_data: it is client-supplied, and the
+  // partner could have left of their own accord between the screen and the tap.
+  if (!partner || partner.id !== targetId) {
+    await answerCallbackQuery(cq.id, "…");
+    await sendMessage(chatId, t(lang, "mgmt_remove_failed"));
+    return;
+  }
+
+  const { count } = await dbAdmin.from("messages")
+    .select("id", { count: "exact", head: true }).eq("tenant_id", user.tenant_id);
+
+  await answerCallbackQuery(cq.id, "…");
+  if (chatId) await editMessageReplyMarkup(chatId, cq.message.message_id);
+  await sendMessage(chatId,
+    t(lang, "mgmt_remove_confirm", { name: escapeHtml(partner.display_name), n: count ?? 0 }),
+    "HTML",
+    { inline_keyboard: [[{ text: t(lang, "mgmt_btn_remove"), callback_data: `mg|rmy|${partner.id}` }]] });
+}
+
+async function handleRemovePartnerDo(cq: any, targetId: string): Promise<void> {
+  const chatId = cq.message?.chat?.id;
+  const user = await lookupUser(cq.from);
+  if (!user) { await answerCallbackQuery(cq.id, "Not authorized."); return; }
+  const lang = viewerLang(cq.from, user);
+
+  await answerCallbackQuery(cq.id, "…");
+  if (chatId) await editMessageReplyMarkup(chatId, cq.message.message_id);
+
+  // Authorisation lives in SQL, not here: release_seat verifies the actor owns the tenant
+  // and that both rows belong to it. A check in TypeScript alone would be one refactor
+  // away from being bypassed by a second call site.
+  const { data, error } = await dbAdmin.rpc("release_seat", {
+    p_actor_user_id: user.id,
+    p_target_user_id: targetId,
+  });
+  const row = Array.isArray(data) ? data[0] : data;
+  const outcome: string = row?.outcome ?? "error";
+  if (error || outcome !== "ok") {
+    console.error(`release_seat (remove) failed for ${targetId}:`, error ?? outcome);
+    await sendMessage(chatId, t(lang, "mgmt_remove_failed"));
+    return;
+  }
+  console.log(`user ${user.id} removed ${targetId} from tenant ${user.tenant_id}`);
+
+  const code: string | null = row?.pairing_code ?? null;
+  const removedName: string = row?.target_display_name ?? "";
+
+  await sendMessage(chatId, t(lang, "mgmt_removed_owner", { name: escapeHtml(removedName) }), "HTML");
+  const invite = BOT_USERNAME && code ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+  if (invite) await sendMessage(chatId, invite);
+  else if (code) await sendMessage(chatId, t(lang, "ob_invite_code_fallback", { code }));
+
+  // Tell the person who was removed, in THEIR language. release_seat returns their id and
+  // language with the result, so this needs no second read against the row it just wrote.
+  const tgId = row?.target_telegram_id;
+  if (tgId) {
+    const rLang = viewerLang(undefined, { native_language: row?.target_native_language });
+    await sendMessage(Number(tgId),
+      t(rLang, "mgmt_removed_partner", { name: escapeHtml(user.display_name) }), "HTML");
+  }
 }
 
 // ---------------------------------------------------------------------------- /tenants (operator)
@@ -1636,7 +1744,10 @@ async function handleLeaveConfirm(cq: any): Promise<void> {
 
   // One RPC so a failure rolls back whole. A half-applied leave -- personal data gone but
   // the seat still held -- would strand someone with no access and no way to be replaced.
-  const { data, error } = await dbAdmin.rpc("leave_tenant", { p_user_id: user.id });
+  const { data, error } = await dbAdmin.rpc("release_seat", {
+    p_actor_user_id: user.id,
+    p_target_user_id: user.id,
+  });
   const row = Array.isArray(data) ? data[0] : data;
   const outcome: string = row?.outcome ?? "error";
   const code: string | null = row?.pairing_code ?? null;
@@ -1646,7 +1757,7 @@ async function handleLeaveConfirm(cq: any): Promise<void> {
       await sendMessage(chatId, t(lang, "leave_owner_cannot"));
       return;
     }
-    console.error(`leave_tenant failed for ${user.id}:`, error ?? outcome);
+    console.error(`release_seat (leave) failed for ${user.id}:`, error ?? outcome);
     await sendMessage(chatId, t(lang, "leave_failed"));
     return;
   }
@@ -2917,7 +3028,7 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   // Last in the list but the one a customer needs findable without asking: a lapsed card
   // or an exhausted allowance both dead-end here, so it must not be a command you have to
   // already know about.
-  { command: "billing", description: "Subscription, usage and payment details" },
+  { command: "management", description: "Subscription, your partner, and account settings" },
   { command: "leave", description: "Leave this account (for the partner, not the owner)" },
   // The default menu scope is what a stranger sees before they have ever spoken to the
   // bot, so this is the one command in the list aimed at someone who is not a customer
@@ -4509,6 +4620,8 @@ async function handleCallbackQuery(cq: any) {
   // trusting the button.
   if ((cq.data ?? "") === "del|confirm") { await handleDeleteAccountConfirm(cq); return; }
   if ((cq.data ?? "") === "lv|confirm") { await handleLeaveConfirm(cq); return; }
+  if ((cq.data ?? "").startsWith("mg|rm|")) { await handleRemovePartnerConfirm(cq, (cq.data ?? "").slice(6)); return; }
+  if ((cq.data ?? "").startsWith("mg|rmy|")) { await handleRemovePartnerDo(cq, (cq.data ?? "").slice(7)); return; }
 
   // Nothing else issues buttons. Acknowledge so Telegram stops showing a spinner on a
   // stale keyboard from an older build, and do nothing.

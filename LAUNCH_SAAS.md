@@ -125,7 +125,7 @@ their own.
    handoff — get it wrong and paying customers land nowhere.
 
 4. **Enable the customer portal** (*Settings → Billing → Customer portal*), allowing plan
-   switching and cancellation. `/billing` mints links into it; without it that command
+   switching and cancellation. `/management` mints links into it; without it that command
    degrades to a read-only summary.
 
 ## Step 3 — Function secrets *(Supabase → commercial project → Edge Functions → Secrets)*
@@ -226,9 +226,9 @@ curl -sS "https://api.telegram.org/bot<TOKEN>/setWebhook" \
 3. Send a message — it should translate.
 4. Open the invite link from a **second Telegram account**, complete the one tap, and
    confirm both accounts now see each other's messages.
-5. `/billing` → confirm plan, usage, and that the portal link opens.
+5. `/management` → confirm plan, usage, who is on the account, and that the portal link opens.
 6. Cancel in the portal → confirm **both** partners get the "subscription has ended"
-   message, and that the bot then refuses and points at `/billing`.
+   message, and that the bot then refuses and points at `/management`.
 7. Reactivate → confirm the "active again" message arrives.
 8. `/delete_account` from the **partner** → must be refused (owner-only). Then from the
    owner → confirm the warning lists the right message count, and that confirming
@@ -297,7 +297,7 @@ share nothing, so none of what you built in test carries over.
 8. **Run step 7 once with a real card**, then deal with the test tenants below.
 
 > **The test tenants do not survive the swap, and they fail quietly.** Any tenant
-> provisioned in test mode carries a test-mode `stripe_customer_id`. `/billing` mints a
+> provisioned in test mode carries a test-mode `stripe_customer_id`. `/management` mints a
 > customer-portal session from that id, so the moment the key becomes `sk_live_…` the
 > lookup 404s and those customers get "I couldn't open the billing portal" forever — not
 > as a transient error. Translation keeps working, because plan and quota live on the
@@ -443,7 +443,7 @@ deliberate — if anything fails partway, the customer has stopped being charged
 
 ## Language coverage
 
-Everything a customer reads — the intro, the trial, onboarding, `/help`, `/billing`, quota
+Everything a customer reads — the intro, the trial, onboarding, `/help`, `/management`, quota
 messages, the study commands, errors — is translated into all eight registry languages
 (`supabase/functions/telegram-bot-saas/strings.ts`). The reader's language is resolved from
 their registered pair, else their trial row, else Telegram's own `language_code`, so a

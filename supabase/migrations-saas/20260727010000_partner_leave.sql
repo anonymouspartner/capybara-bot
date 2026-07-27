@@ -1,4 +1,4 @@
--- Let the second seat leave a tenant.
+-- Releasing a seat: a partner leaving, or an owner removing and replacing them.
 --
 -- Until now the only exit was /delete_account, which is owner-only and destroys the whole
 -- couple. The partner had no lever at all: if a relationship ended, their messages stayed
@@ -97,87 +97,131 @@ REVOKE EXECUTE ON FUNCTION public.claim_tenant_seat(text) FROM anon;
 REVOKE EXECUTE ON FUNCTION public.claim_tenant_seat(text) FROM authenticated;
 GRANT EXECUTE ON FUNCTION public.claim_tenant_seat(text) TO service_role;
 
--- Leaving is several writes that must not half-apply: personal data removed, seat
--- released, pairing code reissued so the owner can invite someone else. In one function
--- so a failure rolls the whole thing back rather than stranding a member who is partly
--- gone -- no access, but still holding the seat.
+-- Releasing a seat is several writes that must not half-apply: personal data removed,
+-- seat released, pairing code reissued so the owner can invite someone else. One function
+-- so a failure rolls back whole rather than stranding a member who is partly gone -- no
+-- access, but still holding the seat.
 --
--- The new pairing code is MINTED HERE rather than passed in. stripe-billing already owns
--- a generator with a deliberately look-alike-free alphabet (no 0/O, no 1/l/I, because the
+-- ONE FUNCTION FOR BOTH EXITS. A partner leaving and an owner removing them differ only
+-- in who is allowed to do it; the data work is identical. Splitting them would be two
+-- copies of the delete-and-release logic, free to drift, and the drift would be silent --
+-- one path forgetting to clear notes, say, leaves private notes readable by whoever
+-- inherits the account.
+--
+--   actor = target  -> leaving. Refused for the owner: the subscription is theirs, and a
+--                      tenant whose owner walked out keeps billing with nobody able to
+--                      reach the portal to stop it. They use /delete_account.
+--   actor ≠ target  -> removal. The actor must own the tenant. Nobody else can eject a
+--                      member, and the owner cannot be ejected.
+--
+-- The new pairing code is MINTED HERE rather than passed in. stripe-billing already owns a
+-- generator with a deliberately look-alike-free alphabet (no 0/O, no 1/l/I, because the
 -- code gets read off a screen and sometimes typed by hand); duplicating that into the bot
 -- would be a second copy free to drift from the first. Generating it inside the same
--- transaction that frees the seat also means there is no window where the seat is open
--- but no code exists, and the code never travels as an input the caller could get wrong.
-CREATE OR REPLACE FUNCTION public.leave_tenant(p_user_id uuid)
-RETURNS TABLE(outcome text, tenant_id uuid, pairing_code text)
+-- transaction that frees the seat also means there is no window where the seat is open but
+-- no code exists.
+--
+-- The departed member's telegram_id and language come back with the result so the caller
+-- can tell them, in their own language, without a second read against a row it has just
+-- changed.
+CREATE OR REPLACE FUNCTION public.release_seat(p_actor_user_id uuid, p_target_user_id uuid)
+RETURNS TABLE(outcome text, tenant_id uuid, pairing_code text,
+              target_telegram_id bigint, target_native_language text, target_display_name text)
     LANGUAGE plpgsql
     SET search_path TO 'public'
     AS $$
 DECLARE
+  a public.users%ROWTYPE;
   u public.users%ROWTYPE;
   t public.tenants%ROWTYPE;
   alphabet constant text := 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
   new_code text := '';
   i integer;
 BEGIN
-  SELECT * INTO u FROM public.users WHERE id = p_user_id FOR UPDATE;
+  SELECT * INTO a FROM public.users WHERE id = p_actor_user_id FOR UPDATE;
+  IF NOT FOUND OR a.left_at IS NOT NULL THEN
+    RETURN QUERY SELECT 'unknown_actor', NULL::uuid, NULL::text, NULL::bigint, NULL::text, NULL::text;
+    RETURN;
+  END IF;
+
+  SELECT * INTO u FROM public.users WHERE id = p_target_user_id FOR UPDATE;
   IF NOT FOUND THEN
-    RETURN QUERY SELECT 'unknown_user', NULL::uuid, NULL::text;
+    RETURN QUERY SELECT 'unknown_user', NULL::uuid, NULL::text, NULL::bigint, NULL::text, NULL::text;
     RETURN;
   END IF;
   IF u.left_at IS NOT NULL THEN
-    RETURN QUERY SELECT 'already_left', u.tenant_id, NULL::text;
+    RETURN QUERY SELECT 'already_left', u.tenant_id, NULL::text, NULL::bigint, NULL::text, NULL::text;
+    RETURN;
+  END IF;
+
+  -- Cross-tenant guard. Both ids arrive from the caller, and an actor from one tenant
+  -- ejecting a member of another would be the worst bug this function could have.
+  IF a.tenant_id <> u.tenant_id THEN
+    RETURN QUERY SELECT 'different_tenant', u.tenant_id, NULL::text, NULL::bigint, NULL::text, NULL::text;
     RETURN;
   END IF;
 
   SELECT * INTO t FROM public.tenants WHERE id = u.tenant_id FOR UPDATE;
   IF NOT FOUND THEN
-    RETURN QUERY SELECT 'unknown_tenant', u.tenant_id, NULL::text;
+    RETURN QUERY SELECT 'unknown_tenant', u.tenant_id, NULL::text, NULL::bigint, NULL::text, NULL::text;
     RETURN;
   END IF;
 
-  -- The owner cannot leave: they hold the subscription, and a tenant whose owner walked
-  -- away would still be billed with nobody able to reach /billing to stop it. They use
-  -- /delete_account, which cancels first.
-  IF t.owner_user_id = p_user_id THEN
-    RETURN QUERY SELECT 'is_owner', u.tenant_id, NULL::text;
-    RETURN;
+  IF p_actor_user_id = p_target_user_id THEN
+    -- Leaving.
+    IF t.owner_user_id = p_target_user_id THEN
+      RETURN QUERY SELECT 'is_owner', u.tenant_id, NULL::text, NULL::bigint, NULL::text, NULL::text;
+      RETURN;
+    END IF;
+  ELSE
+    -- Removal: only the owner, and never of the owner.
+    IF t.owner_user_id <> p_actor_user_id THEN
+      RETURN QUERY SELECT 'not_owner', u.tenant_id, NULL::text, NULL::bigint, NULL::text, NULL::text;
+      RETURN;
+    END IF;
+    IF t.owner_user_id = p_target_user_id THEN
+      RETURN QUERY SELECT 'is_owner', u.tenant_id, NULL::text, NULL::bigint, NULL::text, NULL::text;
+      RETURN;
+    END IF;
   END IF;
 
   -- Personal study data goes with the person. These are individually owned, unlike the
   -- messages: a deck is what YOU chose to learn, a note is private to its author by
-  -- construction, and a grammar correction is a record of your own mistakes.
-  DELETE FROM public.flashcards WHERE user_id = p_user_id;
-  DELETE FROM public.notes WHERE author_id = p_user_id;
-  DELETE FROM public.grammar_corrections WHERE user_id = p_user_id;
+  -- construction, and a grammar correction is a record of your own mistakes. Clearing
+  -- notes matters most on the removal path -- they were written on the promise that only
+  -- their author could retrieve them, and the account is about to change hands.
+  DELETE FROM public.flashcards WHERE user_id = p_target_user_id;
+  DELETE FROM public.notes WHERE author_id = p_target_user_id;
+  DELETE FROM public.grammar_corrections WHERE user_id = p_target_user_id;
 
   -- Pins and reconciles are deliberately KEPT. They are curation of the shared corpus --
   -- "this message mattered", "ignore this one" -- and they shape the remaining person's
   -- /recap. Removing them would silently change results for someone who did not act.
   -- (Both are ON DELETE NO ACTION anyway, which is why the user row is retained.)
 
-  UPDATE public.users SET left_at = now() WHERE id = p_user_id;
+  UPDATE public.users SET left_at = now() WHERE id = p_target_user_id;
 
   FOR i IN 1..12 LOOP
     new_code := new_code || substr(alphabet, 1 + floor(random() * length(alphabet))::int, 1);
   END LOOP;
 
   -- Release the seat: a FRESH code, so the owner can invite someone else. Reusing the old
-  -- one would let anyone still holding the original link walk into the vacated seat.
+  -- one would let anyone still holding the original link walk into the vacated seat --
+  -- including the person who was just removed.
   UPDATE public.tenants
      SET pairing_code = new_code,
          pairing_code_expires_at = now() + interval '14 days'
    WHERE id = u.tenant_id;
 
-  RETURN QUERY SELECT 'ok', u.tenant_id, new_code;
+  RETURN QUERY SELECT 'ok', u.tenant_id, new_code, u.telegram_id, u.native_language, u.display_name;
 END;
 $$;
 
-ALTER FUNCTION public.leave_tenant(uuid) OWNER TO postgres;
-REVOKE EXECUTE ON FUNCTION public.leave_tenant(uuid) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.leave_tenant(uuid) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.leave_tenant(uuid) FROM authenticated;
-GRANT EXECUTE ON FUNCTION public.leave_tenant(uuid) TO service_role;
+ALTER FUNCTION public.release_seat(uuid, uuid) OWNER TO postgres;
+REVOKE EXECUTE ON FUNCTION public.release_seat(uuid, uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.release_seat(uuid, uuid) FROM anon;
+REVOKE EXECUTE ON FUNCTION public.release_seat(uuid, uuid) FROM authenticated;
+GRANT EXECUTE ON FUNCTION public.release_seat(uuid, uuid) TO service_role;
 
 DO $$
 BEGIN
@@ -187,7 +231,7 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'partial unique index on users.telegram_id was not created';
   END IF;
-  IF to_regprocedure('public.leave_tenant(uuid)') IS NULL THEN
-    RAISE EXCEPTION 'leave_tenant was not created';
+  IF to_regprocedure('public.release_seat(uuid, uuid)') IS NULL THEN
+    RAISE EXCEPTION 'release_seat was not created';
   END IF;
 END $$;

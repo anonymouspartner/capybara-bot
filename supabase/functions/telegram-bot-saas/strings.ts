@@ -1726,6 +1726,81 @@ export const STRINGS: Record<string, Row> = {
     pl: "Nie udało się tego dokończyć — nic nie zostało zmienione. Spróbuj za chwilę.",
   },
 
+
+  // ---- /management: the account surface (subscription + who is on it) --------
+
+  mgmt_partner_line: {
+    en: (v: any) => `\n\n<b>Partner:</b> ${v.name}`,
+    uk: (v: any) => `\n\n<b>Партнер:</b> ${v.name}`,
+    es: (v: any) => `\n\n<b>Pareja:</b> ${v.name}`,
+    fr: (v: any) => `\n\n<b>Partenaire :</b> ${v.name}`,
+    de: (v: any) => `\n\n<b>Partner:</b> ${v.name}`,
+    it: (v: any) => `\n\n<b>Partner:</b> ${v.name}`,
+    pt: (v: any) => `\n\n<b>Parceiro:</b> ${v.name}`,
+    pl: (v: any) => `\n\n<b>Partner:</b> ${v.name}`,
+  },
+
+  mgmt_seat_free: {
+    en: "\n\n<b>Partner:</b> nobody yet — the second seat is free. Send them the invite link below.",
+    uk: "\n\n<b>Партнер:</b> поки нікого — друге місце вільне. Надішли їм посилання нижче.",
+    es: "\n\n<b>Pareja:</b> nadie aún — la segunda plaza está libre. Envíale el enlace de abajo.",
+    fr: "\n\n<b>Partenaire :</b> personne pour l'instant — la deuxième place est libre. Envoie-lui le lien ci-dessous.",
+    de: "\n\n<b>Partner:</b> noch niemand — der zweite Platz ist frei. Schick ihnen den Link unten.",
+    it: "\n\n<b>Partner:</b> ancora nessuno — il secondo posto è libero. Mandagli il link qui sotto.",
+    pt: "\n\n<b>Parceiro:</b> ainda ninguém — o segundo lugar está livre. Envia-lhe o link abaixo.",
+    pl: "\n\n<b>Partner:</b> jeszcze nikt — drugie miejsce jest wolne. Wyślij im link poniżej.",
+  },
+
+  mgmt_btn_remove: {
+    en: "Remove partner", uk: "Прибрати партнера", es: "Quitar a la pareja",
+    fr: "Retirer le partenaire", de: "Partner entfernen", it: "Rimuovi il partner",
+    pt: "Remover parceiro", pl: "Usuń partnera",
+  },
+
+  mgmt_remove_confirm: {
+    en: (v: any) => `<b>Remove ${v.name} from this account?</b>\n\nThey lose access immediately, and their flashcards, private notes and grammar corrections are deleted.\n\nThe ${v.n} messages you have exchanged stay — they are your conversation too, and your /ask history is built on them.\n\nThe seat is freed and you get a new invite link, so you can add someone else. ${v.name} will be told.`,
+    uk: (v: any) => `<b>Прибрати ${v.name} з цього акаунту?</b>\n\nВони одразу втратять доступ, а їхні картки, приватні нотатки й виправлення граматики буде видалено.\n\nВаші ${v.n} повідомлень залишаться — це і твоя розмова теж, і на ній побудована історія /ask.\n\nМісце звільниться, і ти отримаєш нове посилання-запрошення, щоб додати когось іншого. ${v.name} отримає сповіщення.`,
+    es: (v: any) => `<b>¿Quitar a ${v.name} de esta cuenta?</b>\n\nPierde el acceso de inmediato, y sus tarjetas, notas privadas y correcciones se eliminan.\n\nLos ${v.n} mensajes que habéis intercambiado se quedan: también son tu conversación, y tu historial de /ask se basa en ellos.\n\nLa plaza queda libre y recibes un enlace nuevo para añadir a otra persona. Se avisará a ${v.name}.`,
+    fr: (v: any) => `<b>Retirer ${v.name} de ce compte ?</b>\n\nIl ou elle perd l'accès immédiatement, et ses cartes, notes privées et corrections sont supprimées.\n\nLes ${v.n} messages échangés restent — c'est ta conversation aussi, et ton historique /ask repose dessus.\n\nLa place se libère et tu reçois un nouveau lien d'invitation pour ajouter quelqu'un d'autre. ${v.name} sera prévenu·e.`,
+    de: (v: any) => `<b>${v.name} aus diesem Konto entfernen?</b>\n\nDer Zugang endet sofort, und die Karteikarten, privaten Notizen und Korrekturen werden gelöscht.\n\nDie ${v.n} ausgetauschten Nachrichten bleiben — es ist auch dein Gespräch, und dein /ask baut darauf auf.\n\nDer Platz wird frei und du bekommst einen neuen Einladungslink für jemand anderen. ${v.name} wird benachrichtigt.`,
+    it: (v: any) => `<b>Rimuovere ${v.name} da questo account?</b>\n\nPerde l'accesso subito, e le sue flashcard, note private e correzioni vengono eliminate.\n\nI ${v.n} messaggi scambiati restano: è anche la tua conversazione, e la tua cronologia /ask si basa su quelli.\n\nIl posto si libera e ricevi un nuovo link di invito per aggiungere qualcun altro. ${v.name} verrà avvisato/a.`,
+    pt: (v: any) => `<b>Remover ${v.name} desta conta?</b>\n\nPerde o acesso imediatamente, e os cartões, notas privadas e correções são apagados.\n\nAs ${v.n} mensagens trocadas ficam — a conversa também é tua, e o teu histórico /ask assenta nelas.\n\nO lugar fica livre e recebes um novo link de convite para juntares outra pessoa. ${v.name} será avisado/a.`,
+    pl: (v: any) => `<b>Usunąć ${v.name} z tego konta?</b>\n\nNatychmiast traci dostęp, a jego fiszki, prywatne notatki i poprawki zostaną usunięte.\n\nWymienione wiadomości (${v.n}) zostaną — to także twoja rozmowa, i na niej opiera się twoja historia /ask.\n\nMiejsce się zwolni i dostaniesz nowy link z zaproszeniem, żeby dodać kogoś innego. ${v.name} zostanie powiadomiony(a).`,
+  },
+
+  mgmt_removed_owner: {
+    en: (v: any) => `${v.name} has been removed. The seat is free — here's a new invite link for whoever comes next:`,
+    uk: (v: any) => `${v.name} прибрано. Місце вільне — ось нове посилання-запрошення для наступної людини:`,
+    es: (v: any) => `${v.name} ha sido eliminado/a. La plaza está libre — aquí tienes un enlace nuevo para quien venga después:`,
+    fr: (v: any) => `${v.name} a été retiré·e. La place est libre — voici un nouveau lien d'invitation pour la prochaine personne :`,
+    de: (v: any) => `${v.name} wurde entfernt. Der Platz ist frei — hier ist ein neuer Einladungslink für die nächste Person:`,
+    it: (v: any) => `${v.name} è stato/a rimosso/a. Il posto è libero — ecco un nuovo link di invito per la prossima persona:`,
+    pt: (v: any) => `${v.name} foi removido/a. O lugar está livre — aqui tens um novo link de convite para a próxima pessoa:`,
+    pl: (v: any) => `${v.name} został(a) usunięty(a). Miejsce jest wolne — oto nowy link z zaproszeniem dla następnej osoby:`,
+  },
+
+  mgmt_removed_partner: {
+    en: (v: any) => `${v.name} has removed you from their Capybara account. You no longer have access, and your flashcards, notes and corrections have been deleted.\n\nIf you'd like Capybara of your own — with anyone — just message me.`,
+    uk: (v: any) => `${v.name} прибрав(ла) тебе зі свого акаунту Capybara. Доступу більше немає, а твої картки, нотатки й виправлення видалено.\n\nЯкщо захочеш власну Capybara — з ким завгодно — просто напиши мені.`,
+    es: (v: any) => `${v.name} te ha quitado de su cuenta de Capybara. Ya no tienes acceso, y tus tarjetas, notas y correcciones se han eliminado.\n\nSi quieres tu propia Capybara —con quien sea— solo escríbeme.`,
+    fr: (v: any) => `${v.name} t'a retiré·e de son compte Capybara. Tu n'as plus accès, et tes cartes, notes et corrections ont été supprimées.\n\nSi tu veux ton propre Capybara — avec qui que ce soit — écris-moi.`,
+    de: (v: any) => `${v.name} hat dich aus dem Capybara-Konto entfernt. Du hast keinen Zugang mehr, und deine Karteikarten, Notizen und Korrekturen wurden gelöscht.\n\nWenn du dein eigenes Capybara willst — mit wem auch immer — schreib mir einfach.`,
+    it: (v: any) => `${v.name} ti ha rimosso/a dal suo account Capybara. Non hai più accesso, e le tue flashcard, note e correzioni sono state eliminate.\n\nSe vuoi un Capybara tutto tuo — con chiunque — scrivimi.`,
+    pt: (v: any) => `${v.name} removeu-te da conta Capybara. Já não tens acesso, e os teus cartões, notas e correções foram apagados.\n\nSe quiseres o teu próprio Capybara — com quem for — é só escreveres.`,
+    pl: (v: any) => `${v.name} usunął(-ęła) cię ze swojego konta Capybara. Nie masz już dostępu, a twoje fiszki, notatki i poprawki zostały usunięte.\n\nJeśli chcesz własną Capybarę — z kimkolwiek — po prostu napisz.`,
+  },
+
+  mgmt_remove_failed: {
+    en: "I couldn't complete that just now — nothing has been changed. Try again in a moment.",
+    uk: "Не вдалося це завершити — нічого не змінено. Спробуй за хвилину.",
+    es: "No he podido completarlo ahora — no se ha cambiado nada. Inténtalo en un momento.",
+    fr: "Je n'ai pas pu aller au bout — rien n'a été modifié. Réessaie dans un instant.",
+    de: "Das hat gerade nicht geklappt — es wurde nichts geändert. Versuch es gleich noch mal.",
+    it: "Non sono riuscito a completare — non è stato cambiato nulla. Riprova tra un momento.",
+    pt: "Não consegui concluir agora — nada foi alterado. Tenta daqui a pouco.",
+    pl: "Nie udało się tego dokończyć — nic nie zostało zmienione. Spróbuj za chwilę.",
+  },
+
 };
 
 // Looks up a string. Falls back to English on a missing translation and warns, so a gap
