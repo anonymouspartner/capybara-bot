@@ -742,7 +742,7 @@ function planComparison(prices: Record<PlanKey, string>): string {
     `*Ultimate* — ${prices.ultimate}\n` +
     `${PLAN_QUOTA.ultimate.toLocaleString()} messages/month. Flashcards from *both* sides — ` +
     `what you write and what you read. Roughly double the deck.\n\n` +
-    `One subscription covers both of you.`
+    `One subscription covers you and a language partner.`
   );
 }
 
@@ -758,13 +758,17 @@ async function introMessage(): Promise<{ text: string; keyboard: any }> {
     : `Subscriptions aren't open through the bot just yet — message the person who sent you here and they'll get you set up.`;
   return {
     text:
-      `*Capybara* is a private translation bot for couples who don't share a first language.\n\n` +
-      `Write in yours, your partner reads theirs. Nobody switches to English out of politeness, ` +
-      `and nobody spends the evening in a translation app.\n\n` +
-      `It also quietly does two things a translator can't:\n\n` +
-      `• *Builds a study deck from your own conversations* — the real words your partner ` +
-      `actually uses, with the sense they meant, exportable to Anki.\n` +
-      `• *Remembers* — ask "when did we book the flights?" and it finds it.\n\n` +
+      `*Capybara* turns real conversations into a language you actually learn.\n\n` +
+      `It lives in Telegram and translates between your two languages, so you can write in ` +
+      `yours and be read in theirs from day one — then builds a study deck out of what was ` +
+      `genuinely said.\n\n` +
+      `Two things a translation app doesn't do:\n\n` +
+      `• *Flashcards from your own sentences* — every word in the sense it was actually ` +
+      `used, not the dictionary's first guess. Exports to Anki.\n` +
+      `• *A searchable record* — ask "when did we book the flights?" and it finds it.\n\n` +
+      `*Use it with a language partner*, and you each read the other in your own language ` +
+      `while both decks fill up. *Or use it solo* — write in the language you're learning, ` +
+      `see it corrected and translated, and study what you got wrong.\n\n` +
       `${plans}\n\n` +
       `_Try it free below — five messages, no card. Trial messages are translated and not stored._`,
     keyboard: planKeyboard(prices, true),
@@ -776,7 +780,7 @@ async function plansMessage(prefix?: string): Promise<{ text: string; keyboard: 
   const prices = await stripePriceText();
   const body = plansConfigured()
     ? `${planComparison(prices)}\n\nAfter paying you'll get a link that sets everything up in ` +
-      `a couple of taps, plus one to send your partner.`
+      `a couple of taps — plus one to invite a language partner, whenever you want it.`
     : `Subscriptions aren't open through the bot just yet — message the person who sent you here.`;
   return { text: `${prefix ? prefix + "\n\n" : ""}${body}`, keyboard: planKeyboard(prices, false) };
 }
@@ -1181,10 +1185,13 @@ async function finishOnboarding(
     const invite = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
     await sendMessage(chatId,
       `You're all set, ${displayName}! I'll translate between ${langLabel(native)} and ${langLabel(learning)}.\n\n` +
-      `*Now invite your partner* — this link sets them up in one tap:\n` +
+      `*Start now, on your own* — write in either language and I'll translate it, and every ` +
+      `message builds your study deck. Nothing else is needed.\n\n` +
+      `*Or add a language partner*, whenever you like. They read you in their language and ` +
+      `you read them in yours, and you both get a deck out of it. This link sets them up in ` +
+      `one tap:\n` +
       (invite ? `${invite}\n\n` : `send them your setup code: \`${code}\`\n\n`) +
-      `Until they join, you can still use me solo: write in either language and I'll translate, ` +
-      `and everything you send builds your study deck.\n\nType /help to see everything.`,
+      `Type /help to see everything.`,
       "Markdown");
     return;
   }
