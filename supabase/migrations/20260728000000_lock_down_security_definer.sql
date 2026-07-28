@@ -35,28 +35,58 @@
 -- function. Nothing here was a mistake anyone made; it is what happens by default, which
 -- is exactly why it is worth checking rather than assuming.
 
-REVOKE EXECUTE ON FUNCTION public.vocab_top_unlearned(text, uuid, integer) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.vocab_top_unlearned(text, uuid, integer) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.vocab_top_unlearned(text, uuid, integer) FROM authenticated;
-GRANT  EXECUTE ON FUNCTION public.vocab_top_unlearned(text, uuid, integer) TO service_role;
-
-REVOKE EXECUTE ON FUNCTION public.backfill_pending_sides(integer) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.backfill_pending_sides(integer) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.backfill_pending_sides(integer) FROM authenticated;
-GRANT  EXECUTE ON FUNCTION public.backfill_pending_sides(integer) TO service_role;
-
-REVOKE EXECUTE ON FUNCTION public.refresh_vocabulary_counts() FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.refresh_vocabulary_counts() FROM anon;
-REVOKE EXECUTE ON FUNCTION public.refresh_vocabulary_counts() FROM authenticated;
-GRANT  EXECUTE ON FUNCTION public.refresh_vocabulary_counts() TO service_role;
+-- SIGNATURE-SAFE, because this directory applies to BOTH projects.
+--
+-- The commercial project's vocab_top_unlearned takes a tenant argument, so it has a
+-- different signature -- and a bare REVOKE naming the single-tenant one would abort the
+-- whole migration there with "function does not exist". Each grant change is therefore
+-- guarded on the function actually existing, so this file is a no-op wherever a given
+-- signature is absent rather than a failure.
+DO $$
+DECLARE
+  fn text;
+  sigs text[] := ARRAY[
+    'public.vocab_top_unlearned(text, uuid, integer)',
+    'public.vocab_top_unlearned(uuid, text, uuid, integer)',
+    'public.backfill_pending_sides(integer)',
+    'public.backfill_pending_sides(uuid, integer)',
+    'public.refresh_vocabulary_counts()',
+    'public.refresh_vocabulary_counts(uuid)'
+  ];
+BEGIN
+  FOREACH fn IN ARRAY sigs LOOP
+    IF to_regprocedure(fn) IS NOT NULL THEN
+      EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', fn);
+      EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM anon', fn);
+      EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM authenticated', fn);
+      EXECUTE format('GRANT  EXECUTE ON FUNCTION %s TO service_role', fn);
+      RAISE NOTICE 'locked down %', fn;
+    END IF;
+  END LOOP;
+END $$;
 
 -- The bot connects as service_role, so nothing above changes what it can do. If any of
 -- these revokes broke the bot, the deploy smoke test would still pass and the failure
--- would appear only when a customer ran /vocab -- hence the assertion, which fails the
+-- would appear only when someone ran /vocab -- hence the assertion, which fails the
 -- migration rather than the feature.
+--
+-- The oid goes through a VARIABLE rather than a '...'::regprocedure literal. A literal
+-- cast is constant-folded at plan time, so it raises "function does not exist" for the
+-- signature this project does not have, before the IF that was supposed to guard it ever
+-- runs -- which is exactly how the first attempt at this migration failed.
 DO $$
 DECLARE
+  fn text;
+  r oid;
   bad text;
+  sigs text[] := ARRAY[
+    'public.vocab_top_unlearned(text, uuid, integer)',
+    'public.vocab_top_unlearned(uuid, text, uuid, integer)',
+    'public.backfill_pending_sides(integer)',
+    'public.backfill_pending_sides(uuid, integer)',
+    'public.refresh_vocabulary_counts()',
+    'public.refresh_vocabulary_counts(uuid)'
+  ];
 BEGIN
   SELECT string_agg(p.proname, ', ') INTO bad
   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -68,8 +98,10 @@ BEGIN
     RAISE EXCEPTION 'still executable by anon/authenticated: %', bad;
   END IF;
 
-  IF NOT has_function_privilege('service_role',
-        'public.vocab_top_unlearned(text, uuid, integer)'::regprocedure, 'EXECUTE') THEN
-    RAISE EXCEPTION 'service_role lost EXECUTE on vocab_top_unlearned -- the bot would break';
-  END IF;
+  FOREACH fn IN ARRAY sigs LOOP
+    r := to_regprocedure(fn);
+    IF r IS NOT NULL AND NOT has_function_privilege('service_role', r, 'EXECUTE') THEN
+      RAISE EXCEPTION 'service_role lost EXECUTE on % -- the bot would break', fn;
+    END IF;
+  END LOOP;
 END $$;
