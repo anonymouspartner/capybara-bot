@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v85";
+const BUILD_VERSION = "v86";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -264,6 +264,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
     { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
+    { match: t => isCmd(t, "mistakes"),                                                 handle: handleMistakes },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
     { match: t => isCmd(t, "backfill_grammar"),                                          handle: handleBackfillGrammar },
     { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
@@ -1391,6 +1392,7 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "learn", description: "Add a word to study (or: top N)" },
   { command: "forget", description: "Remove a word from a deck" },
   { command: "export", description: "Download both decks as CSV for Anki" },
+  { command: "mistakes", description: "Review your recent grammar mistakes" },
   { command: "capybara", description: "Toggle grammar help for your learning language" },
   { command: "ask", description: "Ask your shared conversation memory" },
   { command: "note", description: "Save a private note to memory" },
@@ -1772,6 +1774,85 @@ function csvEscape(value: string | null | undefined): string {
 // grows. Run it in the background so it can never approach the window Telegram waits
 // before retrying an update: a retry would re-run the whole build and deliver the file
 // twice. The user gets an immediate acknowledgement instead of a silent pause.
+// Replaces `word` in `sentence` with a blank, matching it as a WHOLE word. JavaScript's
+// \b is ASCII-only, so it cannot be used here: a Cyrillic "довго" would otherwise match
+// inside "довгого" and blank only the stem, leaking "го" onto the card front. The
+// lookarounds below use \p{L} (any letter) instead. Returns null when the word is not
+// present as a standalone token, so the caller can fall back rather than emit a
+// half-blanked sentence.
+//
+// At module scope because /export and /mistakes build the same fill-in-the-blank card.
+// Two copies would drift, and the drift would be invisible: a card that blanks the stem
+// still looks like a card.
+function blankWord(sentence: string, word: string): string | null {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let re: RegExp;
+  try {
+    re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "u");
+  } catch {
+    return null; // Malformed pattern from unexpected model output -- fall back.
+  }
+  return re.test(sentence) ? sentence.replace(re, "_____") : null;
+}
+
+// The parenthetical that makes a blanked sentence answerable. "Я дуже _____ тобою." could
+// take any of several verbs, so the front names the word by dictionary form and meaning,
+// leaving only the inflection to produce -- which is the skill being tested.
+function clozeClue(g: any): string {
+  const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
+  return word ? `  (${[word, g.category].filter(Boolean).join(" · ")})` : "";
+}
+
+// Your own recent mistakes, as fill-in-the-blank, in the chat.
+//
+// Ported from telegram-bot-saas (saas-v27). The corrections have been collected since the
+// grammar assistant shipped and, until now, only ever left through /export -- so they were
+// useful if you set up Anki and invisible otherwise. One indexed read, no model call.
+//
+// Answers hide behind Telegram's spoiler formatting rather than a button: the whole set
+// arrives in one message, with no callback round-trip, no state to keep, and no way to be
+// left half-way through a review the bot has forgotten about.
+async function handleMistakes(msg: any, user: any) {
+  const { data, error } = await supabase
+    .from("grammar_corrections")
+    .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: false })
+    .limit(5);
+  if (error) {
+    console.error("mistakes read failed:", error);
+    await sendMessage(msg.chat.id, "Couldn't fetch your corrections. Check function logs.");
+    return;
+  }
+  const rows = data ?? [];
+  if (rows.length === 0) {
+    await sendMessage(msg.chat.id, user.grammar_assist
+      ? "Nothing to review — I haven't caught any mistakes yet. Keep writing in the language you're learning and they'll turn up here."
+      : "Grammar help is off, so I'm not noting your mistakes. Turn it on with /capybara and they'll collect here as you write.");
+    return;
+  }
+
+  const blocks = rows.map((g: any, i: number) => {
+    // Blank the corrected word out of the CORRECTED sentence, so you never re-read your
+    // own error before recalling. The wrong form appears afterwards, as contrast.
+    const cloze = g.correction_focus ? blankWord(g.corrected_text ?? "", g.correction_focus) : null;
+    const n = `${i + 1}.`;
+    if (cloze) {
+      const answer = escapeHtml(String(g.correction_focus));
+      const wrote = g.error_focus ? ` (you wrote: ${escapeHtml(String(g.error_focus))})` : "";
+      const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
+      return `${n} ${escapeHtml(cloze)}${escapeHtml(clozeClue(g))}\n   <tg-spoiler><b>${answer}</b>${why}${wrote}</tg-spoiler>`;
+    }
+    const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
+    return `${n} ${escapeHtml(String(g.original_text ?? ""))}\n   <tg-spoiler><b>${escapeHtml(String(g.corrected_text ?? ""))}</b>${why}</tg-spoiler>`;
+  });
+
+  await sendMessage(msg.chat.id,
+    `\ud83d\udcdd <b>Your recent mistakes</b>\nTap the blur to check yourself.\n\n${blocks.join("\n\n")}` +
+    `\n\n<i>These are also in /export, tagged by mistake type.</i>`,
+    "HTML");
+}
+
 async function handleExport(msg: any, user: any) {
   await sendMessage(msg.chat.id, "\u23f3 Building your export\u2026");
   scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user));
@@ -1845,23 +1926,6 @@ async function exportRun(chatId: number, user: any) {
     ].join(","));
   }
 
-  // Replaces `word` in `sentence` with a blank, matching it as a WHOLE word. JavaScript's
-  // \b is ASCII-only, so it cannot be used here: a Cyrillic "довго" would otherwise match
-  // inside "довгого" and blank only the stem, leaking "го" onto the card front. The
-  // lookarounds below use \p{L} (any letter) instead. Returns null when the word is not
-  // present as a standalone token, so the caller can fall back rather than emit a
-  // half-blanked sentence.
-  const blankWord = (sentence: string, word: string): string | null => {
-    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    let re: RegExp;
-    try {
-      re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "u");
-    } catch {
-      return null; // Malformed pattern from unexpected model output -- fall back.
-    }
-    return re.test(sentence) ? sentence.replace(re, "_____") : null;
-  };
-
   // Grammar cards reuse the Capybara notetype so the whole export stays one file with
   // one import: the sentence the learner actually wrote goes in the first field (the
   // card front, and Anki's match key, so repeating a mistake updates its card instead
@@ -1885,11 +1949,7 @@ async function exportRun(chatId: number, user: any) {
       // because that field IS the card front; the notetype's template is not ours to
       // change. Each part is optional and the clue is omitted entirely when none is
       // present, so an older row still yields a usable card.
-      const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
-      // The category is only shown alongside the word. On its own it names the KIND of
-      // mistake, not the missing word -- "(agreement)" reads as a hint but leads nowhere,
-      // which is worse than no parenthetical at all.
-      const front = word ? `${cloze}  (${[word, g.category].filter(Boolean).join(" · ")})` : cloze;
+      const front = `${cloze}${clozeClue(g)}`;
       rows.push([
         csvEscape(front),
         csvEscape(g.category ?? ""),
