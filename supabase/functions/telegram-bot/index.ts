@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.39.0";
+import { t, viewerLang, type Lang } from "./strings.ts";
 
 const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
@@ -8,7 +9,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v86";
+const BUILD_VERSION = "v87";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -271,6 +272,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
+    { match: t => isCmd(t, "management"),                                               handle: handleManagement },
     { match: t => t === "/diag",                                                         handle: handleDiag },
     { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
     { match: t => t === "/reconcile" || t.startsWith("/reconcile@"),                    handle: handleReconcile },
@@ -1405,10 +1407,13 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
 // /recap_backfill) and the reply-based /reconcile & /restore are intentionally omitted
 // to keep the menu clean -- they remain fully functional when typed, and /help still
 // lists them.
+// /diag and /update are deliberately NOT here any more: they live behind /management,
+// which is one menu entry instead of two and puts them next to the usage they are usually
+// checked alongside. Both still work when typed -- removing a command from the menu is a
+// change to discoverability, not to capability, and muscle memory should not be punished.
 const ADMIN_COMMANDS: { command: string; description: string }[] = [
   ...PUBLIC_COMMANDS,
-  { command: "diag", description: "Admin: ping upstream APIs + DB" },
-  { command: "update", description: "Admin: check/deploy a new build" },
+  { command: "management", description: "Admin: usage, storage, diagnostics, deploys" },
 ];
 
 async function setMyCommands(commands: { command: string; description: string }[], scope?: unknown): Promise<boolean> {
@@ -3090,6 +3095,20 @@ async function handleCallbackQuery(cq: any) {
     return;
   }
   const data: string = cq.data ?? "";
+
+  // /management's two buttons. They call the same handlers the commands do, with a
+  // synthesised message shape -- the alternative is a second copy of each, and a second
+  // copy of /diag would drift from the one that gets used when something is actually
+  // broken.
+  if (data === "mg:diag" || data === "mg:update") {
+    await answerCallbackQuery(cq.id, "…");
+    const shim = { chat: { id: cq.message?.chat?.id }, from: cq.from, text: "" };
+    const actor = await lookupUser(cq.from);
+    if (data === "mg:diag") await handleDiag(shim, actor);
+    else await handleUpdateCommand(shim, actor);
+    return;
+  }
+
   if (!data.startsWith("deploy:")) { await answerCallbackQuery(cq.id); return; }
   const target = data.slice("deploy:".length);
 
@@ -3115,6 +3134,81 @@ async function handleCallbackQuery(cq: any) {
       await sendMessage(chatId, `Deploy dispatch failed (HTTP ${res.status}). Check the GITHUB_DEPLOY_TOKEN scope (needs Actions: write) and try again, or deploy manually.`);
     }
   }
+}
+
+// ---------------------------------------------------------------------------- /management
+//
+// The operator view, and the reason /diag and /update left the command menu. Three admin
+// entries for two rarely-used tools is most of the menu's clutter for the one person who
+// has an admin menu at all; one entry that opens onto both is the same capability with a
+// quieter surface. Both still work when typed, so muscle memory is not punished.
+//
+// Admin-only. On this build "admin" is one half of a couple rather than an operator role,
+// which is exactly why the copy is localized: which half it is depends on the instance.
+const FREE_TIER_BYTES = 500 * 1024 * 1024 + 1024 * 1024 * 1024; // 500 MB database + 1 GB storage
+
+// Measured, not modelled: derived from real spend divided by real message count after the
+// annotation work, and it is the number the /export and quota economics were sized on.
+// A constant here rather than a token ledger because per-call accounting would need a
+// table, a write on every model call, and reconciliation -- for a figure whose only job is
+// to answer "roughly what is this costing me this month".
+const EST_USD_PER_MESSAGE = 0.007;
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0 MB";
+  const mb = n / (1024 * 1024);
+  return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.round(mb)} MB`;
+}
+
+async function handleManagement(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) {
+    await sendMessage(msg.chat.id, t(lang, "mgmt_not_admin"));
+    return;
+  }
+
+  const { data, error } = await supabase.rpc("instance_usage");
+  const u = Array.isArray(data) ? data[0] : data;
+  if (error || !u) {
+    console.error("instance_usage failed:", error);
+    await sendMessage(msg.chat.id, t(lang, "mgmt_usage_failed"));
+    return;
+  }
+
+  const msgs = Number(u.messages_period ?? 0);
+  const voiceBytes = Number(u.voice_bytes ?? 0);
+  const dbBytes = Number(u.db_bytes ?? 0);
+  const since = new Date(u.period_start).toLocaleDateString(lang, { day: "numeric", month: "long" });
+
+  const body = [
+    t(lang, "mgmt_header"),
+    "",
+    t(lang, "mgmt_usage", {
+      since,
+      msgs,
+      annos: Number(u.annotations_period ?? 0),
+      spend: `$${(msgs * EST_USD_PER_MESSAGE).toFixed(2)}`,
+    }),
+    "",
+    t(lang, "mgmt_storage", {
+      files: Number(u.voice_files ?? 0),
+      voice: formatBytes(voiceBytes),
+      db: formatBytes(dbBytes),
+      total: formatBytes(voiceBytes + dbBytes),
+      limit: formatBytes(FREE_TIER_BYTES),
+    }),
+    "",
+    t(lang, "mgmt_corpus", { total: Number(u.messages_total ?? 0) }),
+    "",
+    t(lang, "mgmt_spend_note"),
+  ].join("\n");
+
+  await sendMessage(msg.chat.id, body, "HTML", {
+    inline_keyboard: [[
+      { text: t(lang, "mgmt_btn_diag"), callback_data: "mg:diag" },
+      { text: t(lang, "mgmt_btn_update"), callback_data: "mg:update" },
+    ]],
+  });
 }
 
 async function handleDiag(msg: any, user: any) {
