@@ -9,7 +9,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v87";
+const BUILD_VERSION = "v88";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -239,27 +239,28 @@ async function handleUpdate(update: any) {
   if (!msg) return;
   const user = await lookupUser(msg.from);
   if (!user) {
-    await sendMessage(msg.chat.id,
-      "Hi! This bot is private. Your Telegram ID hasn't been registered yet.\n\n" +
-      `Your Telegram user ID is: ${msg.from.id}\n` +
-      "Send this ID to the bot's owner so they can add you."
-    );
+    // No user row yet, so Telegram's own language_code is the only signal there is --
+    // which is exactly the case viewerLang's second rung exists for.
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from), "not_registered", { id: msg.from.id }));
     return;
   }
   // Command dispatch table — to add a command, append one entry here.
   type Cmd = { match: (t: string) => boolean; handle: (m: any, u: any) => Promise<void> };
   const COMMANDS: Cmd[] = [
     { match: t => t === "/start", handle: async (m, u) => {
+        const lang = viewerLang(m.from, u);
         const solo = !(await lookupPartner(u.id));
-        const media = solo
-          ? `Send a photo, file, GIF, or audio with a caption and I'll translate the caption into your study corpus too.\n\n`
-          : `You can also send photos, videos, files, stickers, GIFs, audio, locations, and contacts — I'll forward them to the other person, and translate any caption.\n\n`;
-        const tail = solo
-          ? `Everything is saved as your personal study corpus, searchable with /recap.\n\nType /help to see what I can do.`
-          : `Everything is saved as a study corpus.\n\nType /help to see what I can do.`;
-        await sendMessage(m.chat.id,
-          `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
-          media + tail); } },
+        await sendMessage(m.chat.id, [
+          t(lang, "start_greeting", {
+            name: escapeHtml(u.display_name),
+            a: langLabel(u.native_language),
+            b: langLabel(u.learning_language),
+          }),
+          "",
+          t(lang, solo ? "start_media_solo" : "start_media_pair"),
+          "",
+          t(lang, solo ? "start_tail_solo" : "start_tail_pair"),
+        ].join("\n"), "HTML"); } },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
@@ -272,6 +273,8 @@ async function handleUpdate(update: any) {
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
+    { match: t => isCmd(t, "education", "study"),                                       handle: handleEducation },
+    { match: t => isCmd(t, "memory"),                                                    handle: handleMemory },
     { match: t => isCmd(t, "management"),                                               handle: handleManagement },
     { match: t => t === "/diag",                                                         handle: handleDiag },
     { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
@@ -305,7 +308,7 @@ async function handleUpdate(update: any) {
   else if (msg.venue || msg.location) { await handleLocationMessage(msg, user); }
   else if (msg.contact) { await handleContactMessage(msg, user); }
   else if (msg.text) { await handleTextMessage(msg, user); }
-  else { await sendMessage(msg.chat.id, "I can handle text, voice, photos, videos, files, stickers, GIFs, audio, locations, and contacts. Other types aren't supported yet."); }
+  else { await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unsupported_media")); }
 }
 
 async function lookupUser(tgUser: any) {
@@ -568,10 +571,10 @@ async function handleTextMessage(msg: any, user: any) {
   if (insertErr) console.error("messages insert (text) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(msg.chat.id, `\ud83d\udd24 Translation (${translationTargetLang}):\n${escapeHtml(translated)}`, "HTML");
+    await sendMessage(msg.chat.id, `${t(viewerLang(msg.from, user), "translation_header", { lang: translationTargetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, originalText, translated!, originalLang, translationTargetLang);
   } else {
-    await sendMessage(msg.chat.id, `\u26a0\ufe0f Translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} Your message was saved.`);
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "translation_failed_saved", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) }));
   }
 
   if (inserted) {
@@ -599,10 +602,10 @@ async function handleVoiceMessage(msg: any, user: any) {
     fileInfo = await fetch(`${TELEGRAM_API}/getFile?file_id=${voice.file_id}`).then(r => r.json());
   } catch (e) {
     console.error("getFile fetch failed:", e);
-    await sendMessage(msg.chat.id, "Couldn't reach Telegram to fetch the voice file. Try again in a moment.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_reach_failed"));
     return;
   }
-  if (!fileInfo?.ok) { await sendMessage(msg.chat.id, "Couldn't fetch voice file from Telegram."); return; }
+  if (!fileInfo?.ok) { await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_fetch_failed")); return; }
   const filePath = fileInfo.result.file_path;
   let audioBlob: Blob;
   try {
@@ -610,7 +613,7 @@ async function handleVoiceMessage(msg: any, user: any) {
     audioBlob = await audioResp.blob();
   } catch (e) {
     console.error("audio fetch failed:", e);
-    await sendMessage(msg.chat.id, "Couldn't download the voice file from Telegram. Try again in a moment.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_download_failed"));
     return;
   }
   const storagePath = `${user.id}/${Date.now()}_${voice.file_id}.ogg`;
@@ -619,7 +622,7 @@ async function handleVoiceMessage(msg: any, user: any) {
 
   const transcribeResult = await transcribeWithWhisper(audioBlob, user);
   if (!transcribeResult.ok) {
-    await sendMessage(msg.chat.id, `\u26a0\ufe0f Transcription failed: ${transcribeResult.error}\n\nThe audio was saved; try sending again in a moment.`);
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_transcribe_failed", { err: transcribeResult.error }));
     return;
   }
   const transcript = transcribeResult.text;
@@ -654,10 +657,12 @@ async function handleVoiceMessage(msg: any, user: any) {
   if (insertErr) console.error("messages insert (voice) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${escapeHtml(transcript)}\n\n\ud83d\udd24 Translation (${targetLang}):\n${escapeHtml(translated)}`, "HTML");
+    const vl = viewerLang(msg.from, user);
+    await sendMessage(msg.chat.id, `${t(vl, "voice_heard", { lang: originalLang })}\n${escapeHtml(transcript)}\n\n${t(vl, "translation_header", { lang: targetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardVoiceToPartner(user, voice.file_id, transcript, translated!, originalLang, targetLang);
   } else {
-    await sendMessage(msg.chat.id, `\ud83c\udf99\ufe0f Heard (${originalLang}):\n${transcript}\n\n\u26a0\ufe0f Translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The transcript was saved.`);
+    const vl = viewerLang(msg.from, user);
+    await sendMessage(msg.chat.id, `${t(vl, "voice_heard", { lang: originalLang })}\n${transcript}\n\n${t(vl, "translation_failed_transcript", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) })}`);
   }
 
   if (inserted) {
@@ -739,38 +744,9 @@ async function translate(
   return null;
 }
 
-// Chrome around the grammar note, in the reader's own language -- the correction text
-// itself already comes back in their native language from checkGrammar. A language with
-// no entry falls back to English, the same English-fallback convention the rest of the
-// bot's UI text uses.
-type GrammarUi = {
-  correct: string;
-  noteHeader: string;
-  saveFailed: string;
-  on: (learnName: string) => string;
-  off: (learnName: string) => string;
-};
-const GRAMMAR_UI: Record<string, GrammarUi> = {
-  en: {
-    correct: "✅ Looks correct.",
-    noteHeader: "📝 Grammar note:",
-    saveFailed: "⚠️ Couldn't save that setting — please try again.",
-    on: (l) => `✅ Grammar assistant ON. When you write in ${l}, I'll check it and privately explain any mistakes (just to you — your partner never sees the note). Turn it off with /capybara off.`,
-    off: (l) => `Grammar assistant OFF. I'll stop checking your ${l}. Turn it back on with /capybara on.`,
-  },
-  uk: {
-    correct: "✅ Виглядає правильно.",
-    noteHeader: "📝 Граматична нотатка:",
-    saveFailed: "⚠️ Не вдалося зберегти налаштування — спробуй ще раз.",
-    // Language names in the registry are English and don't decline in Ukrainian, so
-    // these refer to the studied language indirectly rather than naming it inline.
-    on: () => "✅ Помічник з граматики УВІМКНЕНО. Коли ти пишеш мовою, яку вивчаєш, я перевірю текст і приватно поясню помилки (тільки тобі — партнер їх не бачить). Вимкнути: /capybara off.",
-    off: () => "Помічник з граматики ВИМКНЕНО. Більше не перевірятиму. Увімкнути: /capybara on.",
-  },
-};
-function grammarUi(nativeLang: LangCode): GrammarUi {
-  return GRAMMAR_UI[nativeLang] ?? GRAMMAR_UI.en;
-}
+// The grammar assistant's chrome used to live here, in its own two-language table --
+// the only localization this build had. It is now five keys in strings.ts (grammar_*),
+// so there is one catalog rather than two systems that drift apart.
 
 // A grammar verdict. `correct: true` means nothing to fix (and nothing to store --
 // there is no card in a sentence that was already right). Otherwise the pieces are kept
@@ -866,9 +842,11 @@ async function checkGrammar(text: string, learnLang: LangCode, nativeLang: LangC
 async function grammarAssist(chatId: number, text: string, user: any, messageId?: string) {
   const verdict = await checkGrammar(text, user.learning_language, user.native_language);
   if (verdict === null) return; // API/parse failed -- stay silent rather than nag.
-  const ui = grammarUi(user.native_language);
+  // grammarAssist runs in the background off the sender's own message, so there is no
+  // `msg` in scope -- the user row is the authority here anyway.
+  const lang = viewerLang(undefined, user);
   if (verdict.correct) {
-    await sendMessage(chatId, ui.correct);
+    await sendMessage(chatId, t(lang, "grammar_correct"));
     return;
   }
   const { error } = await supabase.from("grammar_corrections").insert({
@@ -887,7 +865,7 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
   if (error) console.error("grammar correction insert failed:", error);
 
   const explanation = verdict.explanation ? `\n${verdict.explanation}` : "";
-  await sendMessage(chatId, `${ui.noteHeader}\n${verdict.corrected}${explanation}`);
+  await sendMessage(chatId, `${t(lang, "grammar_note_header")}\n${verdict.corrected}${explanation}`);
 }
 
 // /capybara [on|off] -- per-user toggle for the grammar assistant. Bare /capybara
@@ -895,15 +873,14 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
 async function handleCapybara(msg: any, user: any) {
   const arg = msg.text.replace(/^\/capybara(@\S+)?/i, "").trim().toLowerCase();
   const enabled = arg === "on" ? true : arg === "off" ? false : !user.grammar_assist;
-  const ui = grammarUi(user.native_language);
+  const lang = viewerLang(msg.from, user);
   const { error } = await supabase.from("users").update({ grammar_assist: enabled }).eq("id", user.id);
   if (error) {
     console.error("grammar toggle failed:", error);
-    await sendMessage(msg.chat.id, ui.saveFailed);
+    await sendMessage(msg.chat.id, t(lang, "grammar_save_failed"));
     return;
   }
-  const learnName = langLabel(user.learning_language);
-  await sendMessage(msg.chat.id, enabled ? ui.on(learnName) : ui.off(learnName));
+  await sendMessage(msg.chat.id, t(lang, enabled ? "grammar_on" : "grammar_off", { lang: langLabel(user.learning_language) }));
 }
 
 type WhisperResult =
@@ -1387,20 +1364,17 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
 // Populates Telegram's "/" menu so the bot's commands are discoverable. Scoped:
 // both partners see PUBLIC_COMMANDS (default scope); the admin ALSO sees the admin
 // commands, in their own chat only.
+// Five entries, not thirteen. The study and memory commands moved behind /education
+// and /memory, which print them with their arguments -- a menu entry can only send the
+// bare command, so /learn and /note appeared in the menu as things you tap and then get
+// a usage error from. /ask keeps its own entry because it is the one people reach for
+// most. Every command still works typed out; only the menu shrank.
 const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "start", description: "What the bot does" },
   { command: "help", description: "Show all commands" },
-  { command: "vocab", description: "Top unlearned words in each deck" },
-  { command: "learn", description: "Add a word to study (or: top N)" },
-  { command: "forget", description: "Remove a word from a deck" },
-  { command: "export", description: "Download both decks as CSV for Anki" },
-  { command: "mistakes", description: "Review your recent grammar mistakes" },
-  { command: "capybara", description: "Toggle grammar help for your learning language" },
+  { command: "education", description: "Study: words, decks, mistakes, Anki export" },
+  { command: "memory", description: "Memory: ask, notes, pins" },
   { command: "ask", description: "Ask your shared conversation memory" },
-  { command: "note", description: "Save a private note to memory" },
-  { command: "pin", description: "Pin a message to memory" },
-  { command: "unpin", description: "Unpin a message" },
-  { command: "pinned", description: "List pinned messages" },
 ];
 // Only the two commands an admin uses on a live instance appear in the menu. The
 // one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
@@ -1460,7 +1434,11 @@ async function forwardToPartner(sender: any, original: string, translated: strin
   const partner = await lookupPartner(sender.id);
   if (!partner) return;
   const senderName = sender.display_name;
-  await sendMessage(partner.telegram_id, `\ud83d\udcac ${escapeHtml(senderName)} says (${transLang}):\n${escapeHtml(translated)}\n\n<i>Original (${origLang}):</i>\n${escapeHtml(original)}`, "HTML");
+  // The partner is the one reading this, so the furniture is in THEIR language.
+  const pLang = viewerLang(undefined, partner);
+  await sendMessage(partner.telegram_id,
+    `${t(pLang, "fwd_says", { name: escapeHtml(senderName), lang: transLang })}\n${escapeHtml(translated)}\n\n${t(pLang, "original_label", { lang: origLang })}\n${escapeHtml(original)}`,
+    "HTML");
 }
 
 async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcript: string, translated: string, origLang: string, transLang: string) {
@@ -1468,7 +1446,10 @@ async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcrip
   if (!partner) return;
   const senderName = sender.display_name;
   await sendVoice(partner.telegram_id, voiceFileId);
-  await sendMessage(partner.telegram_id, `\ud83d\udcac ${escapeHtml(senderName)} said (${transLang}):\n${escapeHtml(translated)}\n\n<i>Original (${origLang}):</i>\n${escapeHtml(transcript)}`, "HTML");
+  const pLang = viewerLang(undefined, partner);
+  await sendMessage(partner.telegram_id,
+    `${t(pLang, "fwd_said", { name: escapeHtml(senderName), lang: transLang })}\n${escapeHtml(translated)}\n\n${t(pLang, "original_label", { lang: origLang })}\n${escapeHtml(transcript)}`,
+    "HTML");
 }
 
 // Videos are forwarded as-is by Telegram file_id (no transcription/translation).
@@ -1481,24 +1462,24 @@ async function handleVideoMessage(msg: any, user: any) {
 
   if (msg.video_note) {
     if (!partner) {
-      await sendMessage(msg.chat.id, "\ud83c\udfa5 Got your video message, but there's no partner to forward it to yet.");
+      await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "\ud83c\udfa5" }));
       return;
     }
     await sendVideoNote(partner.telegram_id, msg.video_note.file_id);
-    await sendMessage(partner.telegram_id, `\ud83c\udfa5 ${senderName} sent a video message.`);
-    await sendMessage(msg.chat.id, "\ud83c\udfa5 Video message forwarded to your partner.");
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "\ud83c\udfa5", name: senderName }));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "\ud83c\udfa5" }));
     return;
   }
 
   // Regular video (e.g. shared from the gallery), optionally with a caption.
   const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
   if (!partner) {
-    await sendMessage(msg.chat.id, "\ud83c\udfa5 Got your video, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "\ud83c\udfa5" }));
     return;
   }
   const partnerCaption = caption ? `\ud83c\udfa5 ${senderName}: ${caption}` : `\ud83c\udfa5 ${senderName} sent a video.`;
   await sendVideo(partner.telegram_id, msg.video.file_id, partnerCaption);
-  await sendMessage(msg.chat.id, "\ud83c\udfa5 Video forwarded to your partner.");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "\ud83c\udfa5" }));
 }
 
 // Photos are forwarded as-is by Telegram file_id (no download/translation step),
@@ -1507,7 +1488,7 @@ async function handleVideoMessage(msg: any, user: any) {
 async function handlePhotoMessage(msg: any, user: any) {
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "🖼️ Got your photo, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🖼️" }));
     return;
   }
   const largest = msg.photo[msg.photo.length - 1];
@@ -1521,7 +1502,7 @@ async function handlePhotoMessage(msg: any, user: any) {
 async function handleDocumentMessage(msg: any, user: any) {
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "📎 Got your file, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "📎" }));
     return;
   }
   const doc = msg.document;
@@ -1564,10 +1545,10 @@ async function translateCaptionToPartner(user: any, senderChatId: number, captio
   if (insertErr) console.error("messages insert (caption) failed:", insertErr);
 
   if (translationOk) {
-    await sendMessage(senderChatId, `🔤 Caption translation (${translationTargetLang}):\n${escapeHtml(translated)}`, "HTML");
+    await sendMessage(senderChatId, `${t(viewerLang(undefined, user), "caption_translation_header", { lang: translationTargetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, caption, translated!, originalLang, translationTargetLang);
   } else {
-    await sendMessage(senderChatId, `⚠️ Caption translation failed: ${friendlyTranslateError(LAST_TRANSLATE_ERROR)} The media was still forwarded.`);
+    await sendMessage(senderChatId, t(viewerLang(undefined, user), "caption_translation_failed", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) }));
   }
 
   if (inserted) {
@@ -1596,7 +1577,7 @@ async function finishMediaForward(msg: any, user: any, partner: any, noCaptionAt
 async function handleAudioMessage(msg: any, user: any) {
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "🎵 Got your audio, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎵" }));
     return;
   }
   await sendAudio(partner.telegram_id, msg.audio.file_id);
@@ -1608,7 +1589,7 @@ async function handleAudioMessage(msg: any, user: any) {
 async function handleAnimationMessage(msg: any, user: any) {
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "🎞️ Got your GIF, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎞️" }));
     return;
   }
   await sendAnimation(partner.telegram_id, msg.animation.file_id);
@@ -1619,12 +1600,12 @@ async function handleAnimationMessage(msg: any, user: any) {
 async function handleStickerMessage(msg: any, user: any) {
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "🎭 Got your sticker, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎭" }));
     return;
   }
   await sendSticker(partner.telegram_id, msg.sticker.file_id);
-  await sendMessage(partner.telegram_id, `🎭 ${user.display_name} sent a sticker.`);
-  await sendMessage(msg.chat.id, "🎭 Sticker forwarded to your partner.");
+  await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "🎭", name: user.display_name }));
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "🎭" }));
 }
 
 // Location or venue. A venue message ALSO carries msg.location, so the dispatch and
@@ -1632,32 +1613,32 @@ async function handleStickerMessage(msg: any, user: any) {
 async function handleLocationMessage(msg: any, user: any) {
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "📍 Got your location, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "📍" }));
     return;
   }
   const senderName = user.display_name;
   if (msg.venue) {
     const v = msg.venue;
     await sendVenue(partner.telegram_id, v.location.latitude, v.location.longitude, v.title ?? "", v.address ?? "");
-    await sendMessage(partner.telegram_id, `📍 ${senderName} shared a place.`);
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "📍", name: senderName }));
   } else {
     await sendLocation(partner.telegram_id, msg.location.latitude, msg.location.longitude);
-    await sendMessage(partner.telegram_id, `📍 ${senderName} shared a location.`);
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "📍", name: senderName }));
   }
-  await sendMessage(msg.chat.id, "📍 Location forwarded to your partner.");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "📍" }));
 }
 
 // Shared contact card. No translation.
 async function handleContactMessage(msg: any, user: any) {
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    await sendMessage(msg.chat.id, "👤 Got your contact, but there's no partner to forward it to yet.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "👤" }));
     return;
   }
   const c = msg.contact;
   await sendContact(partner.telegram_id, c.phone_number, c.first_name ?? "", c.last_name, c.vcard);
-  await sendMessage(partner.telegram_id, `👤 ${user.display_name} shared a contact.`);
-  await sendMessage(msg.chat.id, "👤 Contact forwarded to your partner.");
+  await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "👤", name: user.display_name }));
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_done", { icon: "👤" }));
 }
 
 // --- Album (media group) forwarding -----------------------------------------
@@ -1739,7 +1720,7 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   const senderChatId = groupRows[0].chat_id;
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    await sendMessage(senderChatId, "🖼️ Got your album, but there's no partner to forward it to yet.");
+    await sendMessage(senderChatId, t(viewerLang(undefined, user), "fwd_no_partner", { icon: "🖼️" }));
     return;
   }
 
@@ -1747,13 +1728,13 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   if (items.length === 1) {
     // A lone late orphan — sendMediaGroup needs >= 2, so send it as a single item.
     await sendSingleMediaItem(partner.telegram_id, items[0].item);
-    await sendMessage(partner.telegram_id, `🖼️ ${user.display_name} sent an item.`);
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_sent", { icon: "🖼️", name: user.display_name }));
   } else {
     const media = items.map((r: any) => ({ type: r.item.type, media: r.item.file_id }));
     await sendMediaGroup(partner.telegram_id, media);
-    await sendMessage(partner.telegram_id, `🖼️ ${user.display_name} sent an album of ${items.length}.`);
+    await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_album", { icon: "🖼️", name: user.display_name, n: items.length }));
   }
-  await sendMessage(senderChatId, `🖼️ Album forwarded to your partner (${items.length} item${items.length === 1 ? "" : "s"}).`);
+  await sendMessage(senderChatId, t(viewerLang(undefined, user), "fwd_album_done", { icon: "🖼️", n: items.length }));
 
   // The album caption (Telegram attaches it to one item) — translate + corpus, unless the
   // album is entirely videos (no video-caption translation, per requirement).
@@ -1761,7 +1742,7 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   if (caption) {
     const allVideo = groupRows.every((r: any) => r.item.type === "video");
     if (allVideo) {
-      await sendMessage(partner.telegram_id, `🎥 ${user.display_name}: ${caption}`);
+      await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_caption", { icon: "🎥", name: user.display_name, text: caption }));
     } else {
       await translateCaptionToPartner(user, senderChatId, caption, null);
     }
@@ -1818,6 +1799,7 @@ function clozeClue(g: any): string {
 // arrives in one message, with no callback round-trip, no state to keep, and no way to be
 // left half-way through a review the bot has forgotten about.
 async function handleMistakes(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
   const { data, error } = await supabase
     .from("grammar_corrections")
     .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
@@ -1826,14 +1808,12 @@ async function handleMistakes(msg: any, user: any) {
     .limit(5);
   if (error) {
     console.error("mistakes read failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't fetch your corrections. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "mistakes_failed"));
     return;
   }
   const rows = data ?? [];
   if (rows.length === 0) {
-    await sendMessage(msg.chat.id, user.grammar_assist
-      ? "Nothing to review — I haven't caught any mistakes yet. Keep writing in the language you're learning and they'll turn up here."
-      : "Grammar help is off, so I'm not noting your mistakes. Turn it on with /capybara and they'll collect here as you write.");
+    await sendMessage(msg.chat.id, t(lang, user.grammar_assist ? "mistakes_none" : "mistakes_off"));
     return;
   }
 
@@ -1844,7 +1824,7 @@ async function handleMistakes(msg: any, user: any) {
     const n = `${i + 1}.`;
     if (cloze) {
       const answer = escapeHtml(String(g.correction_focus));
-      const wrote = g.error_focus ? ` (you wrote: ${escapeHtml(String(g.error_focus))})` : "";
+      const wrote = g.error_focus ? ` ${t(lang, "mistakes_you_wrote", { wrote: escapeHtml(String(g.error_focus)) })}` : "";
       const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
       return `${n} ${escapeHtml(cloze)}${escapeHtml(clozeClue(g))}\n   <tg-spoiler><b>${answer}</b>${why}${wrote}</tg-spoiler>`;
     }
@@ -1853,17 +1833,19 @@ async function handleMistakes(msg: any, user: any) {
   });
 
   await sendMessage(msg.chat.id,
-    `\ud83d\udcdd <b>Your recent mistakes</b>\nTap the blur to check yourself.\n\n${blocks.join("\n\n")}` +
-    `\n\n<i>These are also in /export, tagged by mistake type.</i>`,
+    `${t(lang, "mistakes_header")}\n\n${blocks.join("\n\n")}\n\n${t(lang, "mistakes_footer")}`,
     "HTML");
 }
 
 async function handleExport(msg: any, user: any) {
-  await sendMessage(msg.chat.id, "\u23f3 Building your export\u2026");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "export_building"));
   scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user));
 }
 
 async function exportRun(chatId: number, user: any) {
+  // exportRun is scheduled as background work, so there is no `msg` here -- the user
+  // row is the authority for their language anyway.
+  const lang = viewerLang(undefined, user);
   const { data: cards, error } = await supabase
     .from("flashcards")
     .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
@@ -1871,7 +1853,7 @@ async function exportRun(chatId: number, user: any) {
 
   if (error) {
     console.error("export query failed:", error);
-    await sendMessage(chatId, "Couldn't build the export. Check function logs.");
+    await sendMessage(chatId, t(lang, "export_failed"));
     return;
   }
 
@@ -1887,7 +1869,7 @@ async function exportRun(chatId: number, user: any) {
   const grammarRows = corrections ?? [];
 
   if ((!cards || cards.length === 0) && grammarRows.length === 0) {
-    await sendMessage(chatId, "Nothing to export yet.\n\nUse /vocab and /learn to add words, or turn on /capybara so your corrections build a grammar deck.");
+    await sendMessage(chatId, t(lang, "export_empty"));
     return;
   }
 
@@ -1985,7 +1967,7 @@ async function exportRun(chatId: number, user: any) {
   const grammarCount = rows.length - Object.values(deckCounts).reduce((a, b) => a + b, 0);
 
   if (rows.length === 0) {
-    await sendMessage(chatId, "Nothing has exportable rows yet (vocabulary records may be missing).");
+    await sendMessage(chatId, t(lang, "export_no_rows"));
     return;
   }
 
@@ -2039,82 +2021,40 @@ async function refreshVocabularyCounts() {
 
 async function handleHelp(msg: any, user: any) {
   const isAdmin = msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID;
-  const viewerLang = user.native_language === "uk" ? "uk" : "en";
-  const solo = !(await lookupPartner(user.id));
-  const lines: string[] = [];
-  if (viewerLang === "uk") {
-    lines.push(
-      "*\u041a\u043e\u043c\u0430\u043d\u0434\u0438 Capybara*",
-      "",
-      "\u0414\u0432\u0456 \u043a\u043e\u043b\u043e\u0434\u0438: \ud83c\uddfa\ud83c\udde6 \u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0456 \ud83c\uddec\ud83c\udde7 \u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430.",
-      "",
-      solo
-        ? "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u043c\u0456\u0436 \u0442\u0432\u043e\u0457\u043c\u0438 \u0434\u0432\u043e\u043c\u0430 \u043c\u043e\u0432\u0430\u043c\u0438"
-        : "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0456 \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
-      solo
-        ? "\u2022 \u0414\u043e\u0434\u0430\u0439 \u043f\u0456\u0434\u043f\u0438\u0441 \u0434\u043e \u0444\u043e\u0442\u043e/\u0444\u0430\u0439\u043b\u0443 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0439\u043e\u0433\u043e \u0443 \u0442\u0432\u0456\u0439 \u043a\u043e\u0440\u043f\u0443\u0441"
-        : "\u2022 \u041d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0444\u043e\u0442\u043e \u0430\u0431\u043e \u0432\u0456\u0434\u0435\u043e \u2014 \u044f \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u0439\u043e\u0433\u043e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
-      "\u2022 /vocab \u2014 \u041d\u0430\u0439\u0447\u0430\u0441\u0442\u0456\u0448\u0456 \u0441\u043b\u043e\u0432\u0430, \u0449\u0435 \u043d\u0435 \u0432\u0438\u0432\u0447\u0435\u043d\u0456",
-      "\u2022 /learn <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0414\u043e\u0434\u0430\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0434\u043e \u043a\u043e\u043b\u043e\u0434\u0438",
-      "\u2022 /learn top N \u2014 \u041e\u043f\u0442\u043e\u043c \u0434\u043e\u0434\u0430\u0442\u0438 N \u0441\u043b\u0456\u0432",
-      "\u2022 /forget <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0412\u0438\u0434\u0430\u043b\u0438\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0437 \u043a\u043e\u043b\u043e\u0434\u0438",
-      "\u2022 /export \u2014 \u0417\u0430\u0432\u0430\u043d\u0442\u0430\u0436\u0438\u0442\u0438 CSV \u0434\u043b\u044f Anki",
-      "\u2022 /capybara \u2014 \u041f\u0435\u0440\u0435\u0432\u0456\u0440\u043a\u0430 \u0433\u0440\u0430\u043c\u0430\u0442\u0438\u043a\u0438 \u043c\u043e\u0432\u0438, \u044f\u043a\u0443 \u0432\u0438\u0432\u0447\u0430\u0454\u0448 (\u0443\u0432\u0456\u043c\u043a/\u0432\u0438\u043c\u043a)",
-      "",
-      "*\u041f\u0430\u043c'\u044f\u0442\u044c \u0440\u043e\u0437\u043c\u043e\u0432*",
-      "",
-      "\u2022 /ask <\u0437\u0430\u043f\u0438\u0442> \u2014 \u0417\u0430\u043f\u0438\u0442\u0430\u0439 \u043f\u0440\u043e \u0432\u0430\u0448\u0456 \u0440\u043e\u0437\u043c\u043e\u0432\u0438 (\u043f\u0440\u0438\u0432\u0430\u0442\u043d\u043e)",
-      "\u2022 /note <\u043d\u043e\u0442\u0430\u0442\u043a\u0430> \u2014 \u041f\u0440\u0438\u0432\u0430\u0442\u043d\u0430 \u043d\u043e\u0442\u0430\u0442\u043a\u0430",
-      "\u2022 /reconcile \u2014 \u0412\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c \u043d\u0430 \u043f\u043e\u0432\u0456\u0434\u043e\u043c\u043b\u0435\u043d\u043d\u044f, \u0449\u043e\u0431 \u0432\u0438\u043a\u043b\u044e\u0447\u0438\u0442\u0438 \u0437 /ask",
-      "\u2022 /restore \u2014 \u041f\u043e\u0432\u0435\u0440\u043d\u0443\u0442\u0438 \u0432 /ask",
-      "\u2022 /pin \u2014 \u041f\u043e\u0437\u043d\u0430\u0447\u0438\u0442\u0438 \u044f\u043a \u0432\u0430\u0436\u043b\u0438\u0432\u0435",
-      "\u2022 /unpin \u2014 \u0417\u043d\u044f\u0442\u0438 \u043f\u043e\u0437\u043d\u0430\u0447\u043a\u0443",
-      "\u2022 /pinned \u2014 \u0421\u043f\u0438\u0441\u043e\u043a \u0437\u0430\u043a\u0440\u0456\u043f\u043b\u0435\u043d\u0438\u0445",
-    );
-  } else {
-    lines.push(
-      "*Capybara commands*",
-      "",
-      "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
-      "",
-      solo
-        ? "\u2022 Just type or send a voice message \u2014 I translate it between your two languages"
-        : "\u2022 Just type or send a voice message \u2014 I translate it and forward to the other person",
-      solo
-        ? "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it into your study corpus"
-        : "\u2022 Send a photo, video, file, sticker, GIF, audio, location, or contact \u2014 I forward it to the other person",
-      "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it and add it to your study corpus",
-      "\u2022 /vocab \u2014 Top words still unlearned in each deck",
-      "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
-      "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",
-      "\u2022 /forget <word> \u2014 Remove a word from the matching deck",
-      "\u2022 /export \u2014 Download both decks as a single CSV for Anki",
-      "\u2022 /capybara \u2014 Toggle grammar checks on the language you're learning",
-      "",
-      "*Conversation memory*",
-      "",
-      "\u2022 /ask <question> \u2014 Ask about your conversations (private to you)",
-      "\u2022 /note <note> \u2014 Add a private note only your /ask finds",
-      "\u2022 /reconcile \u2014 Reply to a message to exclude it from /ask",
-      "\u2022 /restore \u2014 Reply to a message to bring it back into /ask",
-      "\u2022 /pin \u2014 Reply to a message to mark it meaningful (small /ask boost)",
-      "\u2022 /unpin \u2014 Reply to a pinned message to remove the pin",
-      "\u2022 /pinned \u2014 List all pinned messages chronologically",
-    );
-  }
+  const lang = viewerLang(msg.from, user);
+  const partner = await lookupPartner(user.id);
+  const a = langLabel(user.native_language);
+  const b = langLabel(user.learning_language);
+
+  const lines: string[] = [
+    t(lang, "help_header"),
+    "",
+    partner
+      ? t(lang, "help_translate_pair", { a, b, name: escapeHtml(partner.display_name) })
+      : t(lang, "help_translate_solo", { a, b }),
+    partner ? t(lang, "help_media_pair") : t(lang, "help_media_solo"),
+    "",
+    t(lang, "help_hubs"),
+    "",
+    partner ? t(lang, "help_corpus_pair") : t(lang, "help_corpus_solo"),
+  ];
+
+  // The admin block stays English on purpose: it is an operator surface, and on this
+  // build the operator is whoever set the instance up -- one person, who reads English.
   if (isAdmin) {
-    lines.push("");
-    lines.push("_Admin:_");
-    lines.push("\u2022 /backfill \u2014 Annotate one batch of unprocessed messages");
-    lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
-    lines.push("\u2022 /backfill\\_senses \u2014 Re-fix flashcard translations to match their example sentence");
-    lines.push("\u2022 /backfill\\_grammar \u2014 Fill in card fields for older grammar corrections");
-    lines.push("\u2022 /annotate\\_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)");
-    lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
-    lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
-    lines.push("\u2022 /update \u2014 Check GitHub for a newer build; deploy with one tap");
+    lines.push(
+      "",
+      "<i>Admin:</i>",
+      "\u2022 /management \u2014 Usage, storage, diagnostics, deploys",
+      "\u2022 /backfill \u2014 Annotate one batch of unprocessed messages",
+      "\u2022 /backfill_translations \u2014 Fill lemma_translation for one batch",
+      "\u2022 /backfill_senses \u2014 Re-fix flashcard translations to match their example sentence",
+      "\u2022 /backfill_grammar \u2014 Fill in card fields for older grammar corrections",
+      "\u2022 /annotate_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)",
+      "\u2022 /recap_backfill \u2014 Embed one batch of messages for /recap",
+    );
   }
-  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
+  await sendMessage(msg.chat.id, lines.join("\n"), "HTML");
 }
 
 async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
@@ -2216,20 +2156,24 @@ async function lookupVocabByLemma(lemma: string, language: LangCode): Promise<an
 }
 
 async function handleLearnTop(msg: any, user: any, arg: string) {
+  const lang = viewerLang(msg.from, user);
+  // The accepted language tokens come from the instance's own pair, not a hardcoded
+  // "uk|en" -- this file ships unchanged to couples with a different pair.
+  const codes = `${user.learning_language}|${user.native_language}`;
   const match = arg.match(/^top\s*(\d+)?(?:\s+(\S+))?$/i);
   if (!match) {
-    await sendMessage(msg.chat.id, "Usage: `/learn top <N> [uk|en]`", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_top_usage", { codes }), "HTML");
     return;
   }
   const nRaw = match[1];
   const langTokenRaw = match[2];
   if (!nRaw) {
-    await sendMessage(msg.chat.id, "How many words?\n\nUsage: `/learn top <N> [uk|en]`", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_top_how_many", { codes }), "HTML");
     return;
   }
   const n = parseInt(nRaw, 10);
   if (!Number.isFinite(n) || n <= 0) {
-    await sendMessage(msg.chat.id, "N must be a positive number.", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_top_n_positive"));
     return;
   }
   const N = Math.min(n, 50);
@@ -2238,7 +2182,7 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   if (langTokenRaw) {
     const parsed = parseLangArg(langTokenRaw);
     if (!parsed) {
-      await sendMessage(msg.chat.id, `Didn't recognize "${langTokenRaw}" as a language. Use \`uk\` or \`en\`.`, "Markdown");
+      await sendMessage(msg.chat.id, t(lang, "learn_lang_unrecognized", { token: escapeHtml(langTokenRaw), codes }), "HTML");
       return;
     }
     targetLang = parsed;
@@ -2256,19 +2200,19 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   } else {
     const learner = await lookupLearnerOfLanguage(targetLang);
     if (!learner) {
-      await sendMessage(msg.chat.id, `Couldn't find anyone learning ${targetLangLabel}. No deck to add to.`);
+      await sendMessage(msg.chat.id, t(lang, "learn_no_learner", { lang: targetLangLabel }));
       return;
     }
     targetUser = learner;
     isOwnDeck = false;
   }
-  const deckOwnerLabel = isOwnDeck ? "your" : `${targetUser.display_name}'s`;
-
   try { await refreshVocabularyCounts(); }
   catch (e) { console.error("refreshVocabularyCounts (learn top) failed:", e); }
   const unlearned = await fetchTopUnlearned(targetLang, targetUser.id, N);
   if (unlearned.length === 0) {
-    await sendMessage(msg.chat.id, `No unlearned ${targetLangLabel} words available for ${deckOwnerLabel} deck.\n\nRun /vocab to see the current top words.`);
+    await sendMessage(msg.chat.id, isOwnDeck
+      ? t(lang, "learn_none_unlearned_own", { lang: targetLangLabel })
+      : t(lang, "learn_none_unlearned_partner", { lang: targetLangLabel, name: targetUser.display_name }));
     return;
   }
   const newCards = unlearned.map((v: any) => ({
@@ -2280,26 +2224,34 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true });
   if (insertErr) {
     console.error("learn top flashcard insert failed:", insertErr);
-    await sendMessage(msg.chat.id, "Couldn't add to the deck. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "deck_add_failed"));
     return;
   }
+  // HTML, not Markdown. A lemma or gloss containing _ or * silently mangles a legacy
+  // Markdown message and there is no escape for it; HTML has one, and escapeHtml is
+  // applied to every value that came out of the corpus.
   const lines = unlearned.map((v: any, i: number) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
-    const gloss = v.gloss ?? "?";
-    return `${i + 1}. *${v.lemma}*${pos} \u2014 ${gloss}`;
+    const pos = v.part_of_speech ? ` <i>(${escapeHtml(String(v.part_of_speech))})</i>` : "";
+    const gloss = escapeHtml(String(v.gloss ?? "?"));
+    return `${i + 1}. <b>${escapeHtml(String(v.lemma))}</b>${pos} \u2014 ${gloss}`;
   });
-  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel} deck`;
-  const header = `\u2705 Added ${unlearned.length} ${targetLangLabel} word${unlearned.length === 1 ? "" : "s"} to ${deckOwnerLabel} ${deckLabel}:`;
-  const truncatedNote = n > N ? `\n\n_(Capped at ${N}; requested ${n}.)_` : "";
+  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel}`;
+  const header = isOwnDeck
+    ? t(lang, "learn_added_top_own", { n: unlearned.length, lang: targetLangLabel, deck: deckLabel })
+    : t(lang, "learn_added_top_partner", { n: unlearned.length, lang: targetLangLabel, deck: deckLabel, name: escapeHtml(targetUser.display_name) });
+  const truncatedNote = n > N ? t(lang, "learn_capped", { max: N, requested: n }) : "";
   const exportHint = isOwnDeck
-    ? `\n\n_Run \`/export\` when you want to import into Anki._`
-    : `\n\n_${targetUser.display_name} can run \`/export\` to import into Anki._`;
-  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${truncatedNote}${exportHint}`, "Markdown");
+    ? t(lang, "learn_export_hint_own")
+    : t(lang, "learn_export_hint_partner", { name: escapeHtml(targetUser.display_name) });
+  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${truncatedNote}${exportHint}`, "HTML");
 }
 
+// Returns the pieces of the failure rather than a rendered sentence, so the caller --
+// which knows the reader's language -- does the wording. Returning English text from
+// here was the one site that could not be localized without changing this signature.
 async function resolveLearnTarget(user: any, word: string): Promise<
   | { targetUser: any; targetLang: LangCode; isPartnerDeck: boolean }
-  | { error: string }
+  | { error: { word: string; lang: string } }
 > {
   // A bare word is the hardest case for a same-script pair, so bias toward the asker's
   // learning language (the usual intent of /learn) by passing it as the default.
@@ -2309,7 +2261,7 @@ async function resolveLearnTarget(user: any, word: string): Promise<
   }
   const partner = await lookupPartner(user.id);
   if (!partner) {
-    return { error: `Detected "${word}" as ${langLabel(detected)}, but couldn't find a partner to add the card for.` };
+    return { error: { word, lang: langLabel(detected) } };
   }
   return { targetUser: partner, targetLang: detected, isPartnerDeck: true };
 }
@@ -2318,8 +2270,10 @@ async function handleLearn(msg: any, user: any) {
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const arg = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
+  const lang = viewerLang(msg.from, user);
+  const codes = `${user.learning_language}|${user.native_language}`;
   if (!arg) {
-    await sendMessage(msg.chat.id, "Usage: `/learn <word>` or `/learn top <N> [uk|en]`\n\nRun /vocab to see suggested words.", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_usage", { codes }), "HTML");
     return;
   }
   if (arg.toLowerCase().startsWith("top")) {
@@ -2327,12 +2281,12 @@ async function handleLearn(msg: any, user: any) {
     return;
   }
   if (arg.includes(" ")) {
-    await sendMessage(msg.chat.id, "Please add one word at a time.\n\n(Or use `/learn top N [uk|en]` to bulk-add.)", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "learn_one_at_a_time", { codes }), "HTML");
     return;
   }
   const resolved = await resolveLearnTarget(user, arg);
   if ("error" in resolved) {
-    await sendMessage(msg.chat.id, resolved.error);
+    await sendMessage(msg.chat.id, t(lang, "learn_no_partner_for_lang", resolved.error));
     return;
   }
   const { targetUser, targetLang, isPartnerDeck } = resolved;
@@ -2347,7 +2301,7 @@ async function handleLearn(msg: any, user: any) {
     }
   }
   if (vocabRows.length === 0) {
-    await sendMessage(msg.chat.id, `Couldn't find "${arg}" in the ${targetLangLabel} vocabulary.\n\nRun /vocab to see words that have appeared in your conversations.`);
+    await sendMessage(msg.chat.id, t(lang, "vocab_word_not_found", { word: arg, lang: targetLangLabel }));
     return;
   }
   const newCards = vocabRows.map((v: any) => ({
@@ -2360,46 +2314,50 @@ async function handleLearn(msg: any, user: any) {
     .select("vocabulary_id");
   if (insertErr) {
     console.error("learn flashcard insert failed:", insertErr);
-    await sendMessage(msg.chat.id, "Couldn't add to the deck. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "deck_add_failed"));
     return;
   }
   const insertedIds = new Set((inserted ?? []).map((r: any) => r.vocabulary_id));
   const toAdd = vocabRows.filter((v: any) => insertedIds.has(v.id));
-  const deckOwnerLabel = isPartnerDeck ? `${targetUser.display_name}'s` : "your";
-  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel} deck`;
+  const ownerName = escapeHtml(targetUser.display_name);
+  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel}`;
   if (toAdd.length === 0) {
-    await sendMessage(msg.chat.id, `"${lemmaUsed}" is already in ${deckOwnerLabel} ${deckLabel}.`, "Markdown");
+    await sendMessage(msg.chat.id, isPartnerDeck
+      ? t(lang, "learn_already_partner", { word: escapeHtml(lemmaUsed), deck: deckLabel, name: ownerName })
+      : t(lang, "learn_already_own", { word: escapeHtml(lemmaUsed), deck: deckLabel }), "HTML");
     return;
   }
   const lines = toAdd.map((v: any) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
-    const gloss = v.gloss ?? "?";
-    return `\u2022 *${v.lemma}*${pos} \u2014 ${gloss}`;
+    const pos = v.part_of_speech ? ` <i>(${escapeHtml(String(v.part_of_speech))})</i>` : "";
+    const gloss = escapeHtml(String(v.gloss ?? "?"));
+    return `\u2022 <b>${escapeHtml(String(v.lemma))}</b>${pos} \u2014 ${gloss}`;
   });
   const skipped = vocabRows.length - toAdd.length;
-  const header = toAdd.length === 1
-    ? `\u2705 Added to ${deckOwnerLabel} ${deckLabel}:`
-    : `\u2705 Added ${toAdd.length} entries to ${deckOwnerLabel} ${deckLabel}:`;
-  const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase() ? `\n\nMatched as "${lemmaUsed}" (dictionary form of "${arg}").` : "";
-  const footer = skipped > 0 ? `\n\n_(${skipped} already in deck, skipped)_` : "";
-  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${footer}`, "Markdown");
+  const header = isPartnerDeck
+    ? t(lang, "learn_added_partner", { n: toAdd.length, deck: deckLabel, name: ownerName })
+    : t(lang, "learn_added_own", { n: toAdd.length, deck: deckLabel });
+  const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase()
+    ? t(lang, "learn_matched_as", { lemma: escapeHtml(lemmaUsed), arg: escapeHtml(arg) }) : "";
+  const footer = skipped > 0 ? t(lang, "learn_skipped", { n: skipped }) : "";
+  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${footer}`, "HTML");
 }
 
 async function handleForget(msg: any, user: any) {
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const arg = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
+  const lang = viewerLang(msg.from, user);
   if (!arg) {
-    await sendMessage(msg.chat.id, "Usage: `/forget <word>`\n\nRemoves a word from the matching deck.", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "forget_usage"), "HTML");
     return;
   }
   if (arg.includes(" ")) {
-    await sendMessage(msg.chat.id, "Please remove one word at a time.", "Markdown");
+    await sendMessage(msg.chat.id, t(lang, "forget_one_at_a_time"));
     return;
   }
   const resolved = await resolveLearnTarget(user, arg);
   if ("error" in resolved) {
-    await sendMessage(msg.chat.id, resolved.error);
+    await sendMessage(msg.chat.id, t(lang, "learn_no_partner_for_lang", resolved.error));
     return;
   }
   const { targetUser, targetLang, isPartnerDeck } = resolved;
@@ -2414,7 +2372,7 @@ async function handleForget(msg: any, user: any) {
     }
   }
   if (vocabRows.length === 0) {
-    await sendMessage(msg.chat.id, `Couldn't find "${arg}" in the ${targetLangLabel} vocabulary.`);
+    await sendMessage(msg.chat.id, t(lang, "vocab_word_not_found_short", { word: arg, lang: targetLangLabel }));
     return;
   }
   const vocabIds = vocabRows.map((v: any) => v.id);
@@ -2425,28 +2383,30 @@ async function handleForget(msg: any, user: any) {
     .select("vocabulary_id");
   if (error) {
     console.error("forget delete failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't update the deck. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "deck_update_failed"));
     return;
   }
-  const deckOwnerLabel = isPartnerDeck ? `${targetUser.display_name}'s` : "your";
-  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel} deck`;
+  const ownerName = escapeHtml(targetUser.display_name);
+  const deckLabel = `${langFlag(targetLang)} ${targetLangLabel}`;
   if (!deleted || deleted.length === 0) {
-    await sendMessage(msg.chat.id, `"${lemmaUsed}" wasn't in ${deckOwnerLabel} ${deckLabel}.`, "Markdown");
+    await sendMessage(msg.chat.id, isPartnerDeck
+      ? t(lang, "forget_not_in_partner", { word: escapeHtml(lemmaUsed), deck: deckLabel, name: ownerName })
+      : t(lang, "forget_not_in_own", { word: escapeHtml(lemmaUsed), deck: deckLabel }), "HTML");
     return;
   }
   const deletedIds = new Set(deleted.map((r: any) => r.vocabulary_id));
   const removed = vocabRows.filter((v: any) => deletedIds.has(v.id));
   const lines = removed.map((v: any) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
-    const gloss = v.gloss ?? "?";
-    return `\u2022 *${v.lemma}*${pos} \u2014 ${gloss}`;
+    const pos = v.part_of_speech ? ` <i>(${escapeHtml(String(v.part_of_speech))})</i>` : "";
+    const gloss = escapeHtml(String(v.gloss ?? "?"));
+    return `\u2022 <b>${escapeHtml(String(v.lemma))}</b>${pos} \u2014 ${gloss}`;
   });
-  const header = removed.length === 1
-    ? `\u2796 Removed from ${deckOwnerLabel} ${deckLabel}:`
-    : `\u2796 Removed ${removed.length} entries from ${deckOwnerLabel} ${deckLabel}:`;
-  const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase() ? `\n\nMatched as "${lemmaUsed}" (dictionary form of "${arg}").` : "";
-  const note = `\n\n_If this card was already imported into Anki, delete it there too._`;
-  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${note}`, "Markdown");
+  const header = isPartnerDeck
+    ? t(lang, "forget_removed_partner", { n: removed.length, deck: deckLabel, name: ownerName })
+    : t(lang, "forget_removed_own", { n: removed.length, deck: deckLabel });
+  const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase()
+    ? t(lang, "learn_matched_as", { lemma: escapeHtml(lemmaUsed), arg: escapeHtml(arg) }) : "";
+  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${t(lang, "forget_anki_note")}`, "HTML");
 }
 
 async function handleBackfill(msg: any, user: any) {
@@ -3088,13 +3048,33 @@ async function handleUpdateCommand(msg: any, user: any) {
 }
 
 async function handleCallbackQuery(cq: any) {
-  // Auth by Telegram sender id, independent of the users table. The button is only
-  // ever shown in the admin's own chat, but we re-check here for defense in depth.
+  const data: string = cq.data ?? "";
+
+  // The /education and /memory buttons belong to BOTH partners, so they are gated on
+  // being a registered user rather than on being the admin. Everything below this block
+  // is still admin-only -- the blanket admin check that used to sit at the top of this
+  // function now sits just past it, so adding a non-admin button cannot accidentally
+  // open a deploy button to the same audience.
+  if (data.startsWith("ed:") || data.startsWith("mem:")) {
+    const actor = await lookupUser(cq.from);
+    if (!actor) { await answerCallbackQuery(cq.id, "Not registered."); return; }
+    await answerCallbackQuery(cq.id);
+    // Same shim as the /management buttons: call the real handler rather than keeping a
+    // second copy of it that can drift.
+    const shim = { chat: { id: cq.message?.chat?.id }, from: cq.from, text: "" };
+    if (data === "ed:vocab") await handleVocab(shim, actor);
+    else if (data === "ed:export") await handleExport(shim, actor);
+    else if (data === "ed:mistakes") await handleMistakes(shim, actor);
+    else if (data === "mem:pinned") await handlePinned(shim, actor);
+    return;
+  }
+
+  // Auth by Telegram sender id, independent of the users table. The buttons below are
+  // only ever shown in the admin's own chat, but we re-check here for defense in depth.
   if (cq.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) {
     await answerCallbackQuery(cq.id, "Not authorized.");
     return;
   }
-  const data: string = cq.data ?? "";
 
   // /management's two buttons. They call the same handlers the commands do, with a
   // synthesised message shape -- the alternative is a second copy of each, and a second
@@ -3158,6 +3138,28 @@ function formatBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "0 MB";
   const mb = n / (1024 * 1024);
   return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.round(mb)} MB`;
+}
+
+// The /education and /memory hubs. Both are printed indexes with buttons only for the
+// commands that take no argument -- see the note above edu_header in strings.ts.
+async function handleEducation(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
+  await sendMessage(msg.chat.id, `${t(lang, "edu_header")}\n\n${t(lang, "edu_body")}`, "HTML", {
+    inline_keyboard: [[
+      { text: t(lang, "edu_btn_vocab"), callback_data: "ed:vocab" },
+      { text: t(lang, "edu_btn_export"), callback_data: "ed:export" },
+      { text: t(lang, "edu_btn_mistakes"), callback_data: "ed:mistakes" },
+    ]],
+  });
+}
+
+async function handleMemory(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
+  await sendMessage(msg.chat.id, `${t(lang, "mem_header")}\n\n${t(lang, "mem_body")}`, "HTML", {
+    inline_keyboard: [[
+      { text: t(lang, "mem_btn_pinned"), callback_data: "mem:pinned" },
+    ]],
+  });
 }
 
 async function handleManagement(msg: any, user: any) {
@@ -3395,14 +3397,15 @@ async function findMessageByTelegramId(telegramMessageId: number): Promise<Corpu
 }
 
 async function handleReconcile(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, "Reply to a message with /reconcile to exclude it from /recap results.");
+    await sendMessage(msg.chat.id, t(lang, "reconcile_usage"));
     return;
   }
   const target = await findMessageByTelegramId(replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, "Couldn't find that message in the corpus. /reconcile works on replies to messages I've stored in this conversation.");
+    await sendMessage(msg.chat.id, t(lang, "reconcile_not_found"));
     return;
   }
   const { data: inserted, error } = await supabase
@@ -3411,24 +3414,23 @@ async function handleReconcile(msg: any, user: any) {
     .select("message_id");
   if (error) {
     console.error("reconcile upsert failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't reconcile that message. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "reconcile_failed"));
     return;
   }
   const wasNew = (inserted ?? []).length > 0;
-  await sendMessage(msg.chat.id, wasNew
-    ? "\u2705 Reconciled. This message won't appear in /recap results."
-    : "Already reconciled.");
+  await sendMessage(msg.chat.id, t(lang, wasNew ? "reconcile_ok" : "reconcile_already"));
 }
 
 async function handleRestore(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, "Reply to a message with /restore to bring it back into /recap results.");
+    await sendMessage(msg.chat.id, t(lang, "restore_usage"));
     return;
   }
   const target = await findMessageByTelegramId(replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
+    await sendMessage(msg.chat.id, t(lang, "msg_not_in_corpus"));
     return;
   }
   const { data: deleted, error } = await supabase
@@ -3438,25 +3440,26 @@ async function handleRestore(msg: any, user: any) {
     .select("message_id");
   if (error) {
     console.error("restore delete failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't restore that message. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "restore_failed"));
     return;
   }
   if (!deleted || deleted.length === 0) {
-    await sendMessage(msg.chat.id, "That message wasn't reconciled.");
+    await sendMessage(msg.chat.id, t(lang, "restore_not_reconciled"));
     return;
   }
-  await sendMessage(msg.chat.id, "\u2705 Restored. This message is back in /recap.");
+  await sendMessage(msg.chat.id, t(lang, "restore_ok"));
 }
 
 async function handlePin(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, "Reply to a message with /pin to mark it as meaningful.");
+    await sendMessage(msg.chat.id, t(lang, "pin_usage"));
     return;
   }
   const target = await findMessageByTelegramId(replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
+    await sendMessage(msg.chat.id, t(lang, "msg_not_in_corpus"));
     return;
   }
   const { data: inserted, error } = await supabase
@@ -3465,22 +3468,23 @@ async function handlePin(msg: any, user: any) {
     .select("message_id");
   if (error) {
     console.error("pin upsert failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't pin that message. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "pin_failed"));
     return;
   }
   const wasNew = (inserted ?? []).length > 0;
-  await sendMessage(msg.chat.id, wasNew ? "\ud83d\udccc Pinned." : "Already pinned.");
+  await sendMessage(msg.chat.id, t(lang, wasNew ? "pin_ok" : "pin_already"));
 }
 
 async function handleUnpin(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, "Reply to a pinned message with /unpin to remove the pin.");
+    await sendMessage(msg.chat.id, t(lang, "unpin_usage"));
     return;
   }
   const target = await findMessageByTelegramId(replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, "Couldn't find that message in the corpus.");
+    await sendMessage(msg.chat.id, t(lang, "msg_not_in_corpus"));
     return;
   }
   const { data: deleted, error } = await supabase
@@ -3490,17 +3494,18 @@ async function handleUnpin(msg: any, user: any) {
     .select("message_id");
   if (error) {
     console.error("unpin delete failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't unpin that message. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "unpin_failed"));
     return;
   }
   if (!deleted || deleted.length === 0) {
-    await sendMessage(msg.chat.id, "That message wasn't pinned.");
+    await sendMessage(msg.chat.id, t(lang, "unpin_not_pinned"));
     return;
   }
-  await sendMessage(msg.chat.id, "\u2705 Unpinned.");
+  await sendMessage(msg.chat.id, t(lang, "unpin_ok"));
 }
 
 async function handlePinned(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
   const { data, error } = await supabase
     .from("message_pins")
     .select("pinned_at, message:message_id (id, original_text, original_language, created_at)")
@@ -3508,11 +3513,11 @@ async function handlePinned(msg: any, user: any) {
     .limit(50);
   if (error) {
     console.error("pinned query failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't fetch pinned messages. Check function logs.");
+    await sendMessage(msg.chat.id, t(lang, "pinned_fetch_failed"));
     return;
   }
   if (!data || data.length === 0) {
-    await sendMessage(msg.chat.id, "No pinned messages yet. Reply to any message with /pin to mark it.");
+    await sendMessage(msg.chat.id, t(lang, "pinned_empty"));
     return;
   }
   const persons = buildPersonMap(user, await lookupPartner(user.id));
@@ -3526,7 +3531,7 @@ async function handlePinned(msg: any, user: any) {
     const snippet = raw.length > 160 ? raw.slice(0, 157) + "\u2026" : raw;
     rows.push(`\u2022 ${date} \u2014 ${sender}: \u00ab${snippet}\u00bb`);
   }
-  const header = `\ud83d\udccc Pinned messages (${rows.length}):`;
+  const header = t(lang, "pinned_header", { n: rows.length });
   await sendMessage(msg.chat.id, [header, "", ...rows].join("\n"));
 }
 
@@ -3535,7 +3540,7 @@ async function handleRemember(msg: any, user: any) {
   const firstSpace = text.indexOf(" ");
   const note = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
   if (!note) {
-    await sendMessage(msg.chat.id, "Usage: `/note <note>` (or `/remember`)\n\nAdds a private note that only your own /ask will find.", "Markdown");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "note_usage"), "HTML");
     return;
   }
   const language = await classifyLanguage(note, user.native_language, user.learning_language);
@@ -3546,11 +3551,11 @@ async function handleRemember(msg: any, user: any) {
     .single();
   if (error || !inserted) {
     console.error("remember insert failed:", error);
-    await sendMessage(msg.chat.id, "Couldn't save that note. Check function logs.");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "note_save_failed"));
     return;
   }
   scheduleBackgroundWork(`embedNote (${inserted.id})`, embedNoteBackground(inserted.id, note, language));
-  await sendMessage(msg.chat.id, "\ud83d\udcdd Noted.");
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "note_saved"));
 }
 
 type ParseOutput = {
