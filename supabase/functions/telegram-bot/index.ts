@@ -9,7 +9,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v88";
+const BUILD_VERSION = "v89";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1402,14 +1402,29 @@ async function setMyCommands(commands: { command: string; description: string }[
   return true;
 }
 
-// Pin the compose-box menu button to the "commands" mode so it renders as the "/"
-// command shortcut (which autofills a slash command on tap) rather than the default
-// "Menu" label. Set globally (no chat scope) — applies to every chat.
-async function setChatMenuButtonToCommands(): Promise<boolean> {
+// Release the compose-box menu button back to "default".
+//
+// This used to set type "commands", with a comment claiming that produced the "/"
+// shortcut. It does the opposite, which a screenshot of the live chat settled: type
+// "commands" is what puts the blue hamburger in the LEFT slot, displacing the GIF and
+// emoji buttons, and a tap opens the command list as a sheet.
+//
+// Type "default" is the shape we actually want. The left slot goes back to GIF and
+// emoji, and Telegram renders "/" inside the input field instead -- which autofills a
+// slash command rather than opening a sheet, so it composes with typing an argument.
+// That matters more since the commands worth tapping now live behind /education and
+// /memory, and the ones that need an argument are typed.
+//
+// Set globally (no chat scope), so it applies to both partners. A per-chat value set
+// previously would still win over this default; none is set here.
+//
+// telegram-bot-saas never calls setChatMenuButton at all, so it has always been on
+// default -- this makes the two builds agree rather than diverge for no reason.
+async function setChatMenuButtonToDefault(): Promise<boolean> {
   const resp = await fetch(`${TELEGRAM_API}/setChatMenuButton`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ menu_button: { type: "commands" } }),
+    body: JSON.stringify({ menu_button: { type: "default" } }),
   });
   if (!resp.ok) { console.error("setChatMenuButton failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
   return true;
@@ -1426,7 +1441,7 @@ async function ensureCommandsRegistered(): Promise<void> {
   if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
     okAdmin = await setMyCommands(ADMIN_COMMANDS, { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
   }
-  const okMenuButton = await setChatMenuButtonToCommands();
+  const okMenuButton = await setChatMenuButtonToDefault();
   if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
 }
 
