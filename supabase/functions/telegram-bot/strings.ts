@@ -102,17 +102,27 @@ export const STRINGS: Record<string, Row> = {
     uk: "Не вдалося зчитати статистику. Перевір логи функції.",
   },
 
-  // ---- /education and /memory hubs --------------------------------------------
+  // ---- The "/" command menu -------------------------------------------------
   //
-  // The "/" menu had thirteen entries and no shape: /vocab, /learn, /forget, /export
-  // and /mistakes are one activity, /ask, /note, /pin, /unpin, /pinned, /reconcile and
-  // /restore are another, and the menu listed them flat, alphabetised by nothing.
+  // These are the DESCRIPTIONS Telegram shows beside each command in the "/" list.
+  // They were hardcoded English, which meant the one surface a Ukrainian speaker sees
+  // before reading anything else was in the wrong language -- the exact complaint this
+  // whole localization exists to answer, left in the most visible place.
   //
-  // Each hub is a printed index, not a launcher. Only the commands that take no
-  // argument get a button (/vocab, /export, /mistakes, /pinned) -- a button cannot
-  // supply a word to /learn or the reply /pin needs, so offering one would produce a
-  // usage error on tap. The rest are listed as text you type, which is what they are.
-  // The commands themselves all still work typed out; nothing was removed.
+  // Telegram picks which set to serve from setMyCommands' language_code, matched
+  // against the reader's TELEGRAM APP language -- not our stored native_language. That
+  // is the same signal viewerLang's second rung uses, and it is the only one available:
+  // the menu is rendered by the client before any handler runs, so there is no request
+  // to resolve a user row from.
+  //
+  // Keep these SHORT. Telegram truncates in the menu, and Ukrainian runs longer than
+  // English for the same content.
+  cmd_start:      { en: "What the bot does",                        uk: "Що вміє бот" },
+  cmd_help:       { en: "Show all commands",                        uk: "Показати всі команди" },
+  cmd_education:  { en: "Study: words, decks, mistakes, Anki export", uk: "Навчання: слова, колоди, помилки, Anki" },
+  cmd_memory:     { en: "Memory: ask, notes, pins",                 uk: "Пам'ять: запити, нотатки, закріплення" },
+  cmd_ask:        { en: "Ask your shared conversation memory",      uk: "Запитати спільну пам'ять розмов" },
+  cmd_management: { en: "Admin: usage, storage, diagnostics, deploys", uk: "Адмін: використання, сховище, діагностика" },
 
   start_greeting: {
     en: (v: any) => `Hi ${v.name}! Send me text or voice in ${v.a} or ${v.b} and I'll translate between them.`,
@@ -190,6 +200,18 @@ export const STRINGS: Record<string, Row> = {
     en: "<i>Everything is saved as a shared study corpus.</i>",
     uk: "<i>Усе зберігається як спільний навчальний корпус.</i>",
   },
+
+  // ---- /education and /memory hubs --------------------------------------------
+  //
+  // The "/" menu had thirteen entries and no shape: /vocab, /learn, /forget, /export
+  // and /mistakes are one activity, /ask, /note, /pin, /unpin, /pinned, /reconcile and
+  // /restore are another, and the menu listed them flat, alphabetised by nothing.
+  //
+  // Each hub is a printed index, not a launcher. Only the commands that take no
+  // argument get a button (/vocab, /export, /mistakes, /pinned) -- a button cannot
+  // supply a word to /learn or the reply /pin needs, so offering one would produce a
+  // usage error on tap. The rest are listed as text you type, which is what they are.
+  // The commands themselves all still work typed out; nothing was removed.
 
   edu_header: {
     en: "📚 <b>Study</b>",

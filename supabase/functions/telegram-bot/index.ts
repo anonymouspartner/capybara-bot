@@ -1,6 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.39.0";
-import { t, viewerLang, type Lang } from "./strings.ts";
+import { t, viewerLang, LANGS, type Lang } from "./strings.ts";
 
 const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
@@ -9,7 +9,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v89";
+const BUILD_VERSION = "v90";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1369,12 +1369,17 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
 // bare command, so /learn and /note appeared in the menu as things you tap and then get
 // a usage error from. /ask keeps its own entry because it is the one people reach for
 // most. Every command still works typed out; only the menu shrank.
-const PUBLIC_COMMANDS: { command: string; description: string }[] = [
-  { command: "start", description: "What the bot does" },
-  { command: "help", description: "Show all commands" },
-  { command: "education", description: "Study: words, decks, mistakes, Anki export" },
-  { command: "memory", description: "Memory: ask, notes, pins" },
-  { command: "ask", description: "Ask your shared conversation memory" },
+//
+// The descriptions are catalog keys, not literals. They used to be hardcoded English,
+// so the "/" menu stayed English for a Ukrainian reader no matter what -- the first
+// surface she sees, in the wrong language, on a build whose whole point is the
+// opposite. Telegram serves a per-language set (see registerCommandMenus).
+const PUBLIC_COMMANDS: { command: string; key: string }[] = [
+  { command: "start",     key: "cmd_start" },
+  { command: "help",      key: "cmd_help" },
+  { command: "education", key: "cmd_education" },
+  { command: "memory",    key: "cmd_memory" },
+  { command: "ask",       key: "cmd_ask" },
 ];
 // Only the two commands an admin uses on a live instance appear in the menu. The
 // one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
@@ -1385,14 +1390,27 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
 // which is one menu entry instead of two and puts them next to the usage they are usually
 // checked alongside. Both still work when typed -- removing a command from the menu is a
 // change to discoverability, not to capability, and muscle memory should not be punished.
-const ADMIN_COMMANDS: { command: string; description: string }[] = [
+const ADMIN_COMMANDS: { command: string; key: string }[] = [
   ...PUBLIC_COMMANDS,
-  { command: "management", description: "Admin: usage, storage, diagnostics, deploys" },
+  { command: "management", key: "cmd_management" },
 ];
 
-async function setMyCommands(commands: { command: string; description: string }[], scope?: unknown): Promise<boolean> {
+// Resolve a command list's descriptions into one language.
+function commandsIn(list: { command: string; key: string }[], lang: Lang) {
+  return list.map(({ command, key }) => ({ command, description: t(lang, key) }));
+}
+
+async function setMyCommands(
+  commands: { command: string; description: string }[],
+  scope?: unknown,
+  languageCode?: string,
+): Promise<boolean> {
   const body: Record<string, unknown> = { commands };
   if (scope) body.scope = scope;
+  // Omitted entirely for the fallback set. Telegram treats a list with no language_code
+  // as the default for every language that has no set of its own, so sending "" here
+  // would register a set for the empty-string language and leave the fallback unset.
+  if (languageCode) body.language_code = languageCode;
   const resp = await fetch(`${TELEGRAM_API}/setMyCommands`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1436,13 +1454,33 @@ let commandsRegistered = false;
 // transient failure retries on the next request rather than waiting for a cold start.
 async function ensureCommandsRegistered(): Promise<void> {
   if (commandsRegistered) return;
-  const okPublic = await setMyCommands(PUBLIC_COMMANDS);
-  let okAdmin = true;
-  if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
-    okAdmin = await setMyCommands(ADMIN_COMMANDS, { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
+  let ok = true;
+
+  // English goes up with NO language_code -- that is Telegram's fallback set, served to
+  // every app language without one of its own. Each other language then gets its own
+  // set. Telegram matches on the reader's Telegram app language, which is the only
+  // signal available: the menu renders client-side before any handler runs, so there is
+  // no request from which to look a user row up.
+  ok = await setMyCommands(commandsIn(PUBLIC_COMMANDS, "en")) && ok;
+  for (const lang of LANGS) {
+    if (lang === "en") continue;
+    ok = await setMyCommands(commandsIn(PUBLIC_COMMANDS, lang), undefined, lang) && ok;
   }
-  const okMenuButton = await setChatMenuButtonToDefault();
-  if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
+
+  // The admin's chat-scoped list, same per-language treatment. A chat scope outranks the
+  // default one, so this list must ALSO carry the public commands (it spreads them) --
+  // otherwise setting it would hide /start and /help from the admin entirely.
+  if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
+    const scope = { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID };
+    ok = await setMyCommands(commandsIn(ADMIN_COMMANDS, "en"), scope) && ok;
+    for (const lang of LANGS) {
+      if (lang === "en") continue;
+      ok = await setMyCommands(commandsIn(ADMIN_COMMANDS, lang), scope, lang) && ok;
+    }
+  }
+
+  ok = await setChatMenuButtonToDefault() && ok;
+  if (ok) commandsRegistered = true;
 }
 
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
