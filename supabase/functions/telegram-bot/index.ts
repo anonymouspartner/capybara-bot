@@ -9,7 +9,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v90";
+const BUILD_VERSION = "v91";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -196,6 +196,36 @@ Deno.serve(async (req) => {
         body.seeded = null;
         body.seedCheckError = (e as Error)?.message ?? String(e);
       }
+    }
+    // Opt-in command-menu check (?commands). Reads the menu BACK from Telegram for each
+    // language, plus the admin's chat-scoped list, so "did the Ukrainian menu register"
+    // is a URL rather than an inference. Off the default probe for the same reason ?seed
+    // is: it calls an external API, and plain health must stay dependency-free so it
+    // reports function-up even when an upstream is down.
+    //
+    // Each entry carries a SAMPLE description, not just a count. A count proves a list
+    // exists; only reading one line proves it is in the right language -- and a list in
+    // the wrong language is exactly the failure this was added to catch.
+    if (url.searchParams.has("commands")) {
+      const menus: Record<string, unknown> = {};
+      const describe = async (label: string, scope?: unknown, languageCode?: string) => {
+        const r = await getMyCommands(scope, languageCode);
+        menus[label] = r.ok
+          ? { count: r.commands.length, sample: r.commands[0]?.description ?? null }
+          : { error: r.error };
+      };
+      // No language_code = Telegram's fallback set, served to every app language that
+      // has no set of its own. It is a distinct list from any language's, not a synonym
+      // for English, so it is checked on its own.
+      await describe("fallback");
+      for (const lang of LANGS) {
+        if (lang === "en") continue;
+        await describe(lang, undefined, lang);
+      }
+      if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
+        await describe("adminChat", { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
+      }
+      body.commandMenu = menus;
     }
     return new Response(
       JSON.stringify(body),
@@ -1398,6 +1428,30 @@ const ADMIN_COMMANDS: { command: string; key: string }[] = [
 // Resolve a command list's descriptions into one language.
 function commandsIn(list: { command: string; key: string }[], lang: Lang) {
   return list.map(({ command, key }) => ({ command, description: t(lang, key) }));
+}
+
+// Ask Telegram what it ACTUALLY holds, rather than reporting what we believe we sent.
+// setMyCommands runs as background work, so a failure leaves the webhook returning 200
+// and the request log clean -- which is precisely why "did the menu register" was not
+// answerable from the outside. This reads the other end.
+async function getMyCommands(scope?: unknown, languageCode?: string): Promise<
+  { ok: true; commands: { command: string; description: string }[] } | { ok: false; error: string }
+> {
+  try {
+    const body: Record<string, unknown> = {};
+    if (scope) body.scope = scope;
+    if (languageCode) body.language_code = languageCode;
+    const resp = await fetch(`${TELEGRAM_API}/getMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json?.ok) return { ok: false, error: `HTTP ${resp.status}${json?.description ? `: ${json.description}` : ""}` };
+    return { ok: true, commands: json.result ?? [] };
+  } catch (e) {
+    return { ok: false, error: (e as Error)?.message ?? String(e) };
+  }
 }
 
 async function setMyCommands(
