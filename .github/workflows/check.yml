@@ -53,3 +53,14 @@ jobs:
       # Type-check the setup wizard too, so a broken setup.ts is caught here.
       - name: Type-check the setup wizard
         run: deno check setup.ts
+
+      # Behavioural guards the sanity gate cannot express: the string catalog renders in
+      # both languages, the "/" menu is keyed rather than hardcoded English, the admin
+      # callback gate still precedes the deploy button, and no localized handler has gone
+      # back to a bare string literal.
+      #
+      # These ran outside the repo until a container reset deleted every one of them at
+      # once, with the code they guarded still live. A test only one machine can run is a
+      # test that does not exist.
+      - name: Run the guard tests
+        run: deno test --allow-read tests/
