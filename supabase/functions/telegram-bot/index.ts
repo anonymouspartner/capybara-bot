@@ -9,7 +9,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v92";
+const BUILD_VERSION = "v93";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -226,6 +226,29 @@ Deno.serve(async (req) => {
         await describe("adminChat", { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
       }
       body.commandMenu = menus;
+
+      // The chat-scoped lists are the ones that actually decide what each partner sees,
+      // so reporting only the default sets would answer the wrong question.
+      //
+      // Deliberately identity-free: no telegram_id, no display name. This route is
+      // UNAUTHENTICATED -- it has to be, the deploy smoke test calls it before anything
+      // is signed in -- so it must not become a way to enumerate who is on the instance.
+      // A language and a sample line prove the menu landed without naming anyone.
+      try {
+        const { data: us } = await supabase.from("users").select("telegram_id, native_language");
+        const perChat: unknown[] = [];
+        for (const u of (us ?? []) as any[]) {
+          if (!u.telegram_id) continue;
+          const r = await getMyCommands({ type: "chat", chat_id: u.telegram_id });
+          perChat.push(r.ok
+            ? { lang: viewerLang(undefined, u), count: r.commands.length, sample: r.commands[0]?.description ?? null }
+            : { lang: viewerLang(undefined, u), error: r.error });
+        }
+        body.perChatMenus = perChat;
+      } catch (e) {
+        body.perChatMenus = null;
+        body.perChatError = (e as Error)?.message ?? String(e);
+      }
     }
     return new Response(
       JSON.stringify(body),
@@ -1502,6 +1525,25 @@ async function setChatMenuButtonToDefault(): Promise<boolean> {
   return true;
 }
 
+// A chat-scoped command list for each registered user, in their own native_language.
+// The admin's list additionally carries /management -- and must still spread the public
+// commands, since a chat scope replaces the default one rather than adding to it, so a
+// chat list without them would hide /start and /help from the admin entirely.
+async function registerPerUserMenus(): Promise<boolean> {
+  const { data, error } = await supabase.from("users").select("telegram_id, native_language");
+  if (error) { console.error("per-user command menus: users read failed:", error); return false; }
+  let ok = true;
+  for (const u of (data ?? []) as any[]) {
+    if (!u.telegram_id) continue;
+    // viewerLang, not native_language directly: it normalises and falls back to English
+    // for a language this build has no copy for, rather than registering an empty menu.
+    const lang = viewerLang(undefined, u);
+    const list = Number(u.telegram_id) === BACKFILL_ADMIN_TELEGRAM_ID ? ADMIN_COMMANDS : PUBLIC_COMMANDS;
+    ok = await setMyCommands(commandsIn(list, lang), { type: "chat", chat_id: u.telegram_id }) && ok;
+  }
+  return ok;
+}
+
 let commandsRegistered = false;
 // Register the "/" menu once per warm instance (self-heals on each cold start /
 // deploy, picking up any command changes). The flag flips only after success, so a
@@ -1521,17 +1563,24 @@ async function ensureCommandsRegistered(): Promise<void> {
     ok = await setMyCommands(commandsIn(PUBLIC_COMMANDS, lang), undefined, lang) && ok;
   }
 
-  // The admin's chat-scoped list, same per-language treatment. A chat scope outranks the
-  // default one, so this list must ALSO carry the public commands (it spreads them) --
-  // otherwise setting it would hide /start and /help from the admin entirely.
-  if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
-    const scope = { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID };
-    ok = await setMyCommands(commandsIn(ADMIN_COMMANDS, "en"), scope) && ok;
-    for (const lang of LANGS) {
-      if (lang === "en") continue;
-      ok = await setMyCommands(commandsIn(ADMIN_COMMANDS, lang), scope, lang) && ok;
-    }
-  }
+  // Then one chat-scoped list per registered partner, in THAT PERSON'S native_language.
+  //
+  // This is the part the language_code sets above cannot do. Telegram matches
+  // language_code against the reader's Telegram APP language -- so a Ukrainian speaker
+  // running Telegram in English or Russian was served the English fallback no matter how
+  // correctly the Ukrainian set was registered. That is precisely what happened: /help
+  // arrived in Ukrainian (resolved from her user row) while the menu above it was in
+  // English (resolved from her phone), from one bot, in the same chat.
+  //
+  // We hold better information than Telegram does: she told us her language at setup.
+  // A chat scope outranks the default one, and within a scope a list with NO
+  // language_code applies whatever the app language is -- so putting her language's copy
+  // in that slot makes the menu follow her user row, the same signal every message body
+  // already follows.
+  //
+  // The default sets above still matter: they serve anyone with no user row, which on
+  // this build is a stranger who has messaged the bot but is not registered.
+  ok = await registerPerUserMenus() && ok;
 
   ok = await setChatMenuButtonToDefault() && ok;
   if (ok) commandsRegistered = true;

@@ -177,6 +177,35 @@ Deno.test("command menu: English is the fallback set, registered with no languag
   assert(/const ADMIN_COMMANDS[^=]*=\s*\[\s*\n?\s*\.\.\.PUBLIC_COMMANDS,/.test(SRC), "admin spreads public");
 });
 
+Deno.test("each partner gets a chat-scoped menu in their own native_language", () => {
+  // Telegram matches language_code against the reader's APP language, so a Ukrainian
+  // speaker running Telegram in English got the English fallback however correctly the
+  // Ukrainian set was registered -- /help in Ukrainian above a menu in English, same chat.
+  // A chat scope outranks the default one, and within it a list with no language_code
+  // applies regardless of app language, so this makes the menu follow the user row.
+  assert(/async function registerPerUserMenus\(/.test(SRC), "per-user registration must exist");
+  assert(/await registerPerUserMenus\(\) && ok/.test(SRC), "must be reached, and gate the retry latch");
+  assert(
+    /setMyCommands\(commandsIn\(list, lang\), \{ type: "chat", chat_id: u\.telegram_id \}\)/.test(SRC),
+    "chat-scoped, and with NO language_code -- that is the whole point",
+  );
+  // The admin's chat list replaces the default one rather than adding to it, so it must
+  // still spread the public commands or /start and /help vanish for the admin.
+  assert(/const ADMIN_COMMANDS[^=]*=\s*\[\s*\n?\s*\.\.\.PUBLIC_COMMANDS,/.test(SRC), "admin spreads public");
+  // The default sets still have a job: anyone with no user row, i.e. an unregistered
+  // stranger who has messaged the bot.
+  assert(/setMyCommands\(commandsIn\(PUBLIC_COMMANDS, "en"\)\)/.test(SRC), "fallback set retained");
+});
+
+Deno.test("the health readback reports per-chat menus without identifying anyone", () => {
+  // This route is unauthenticated -- the deploy smoke test calls it before anything is
+  // signed in -- so it must not become a way to enumerate who is on the instance.
+  const health = SRC.slice(SRC.indexOf('status: "ok",'), SRC.indexOf("const secret = req.headers"));
+  assert(/body\.perChatMenus = perChat;/.test(health), "should report per-chat menus");
+  assert(!/telegram_id: /.test(health) && !/display_name/.test(health), "must not expose identity");
+  assert(/lang: viewerLang\(undefined, u\)/.test(health), "language, not an id, identifies the row");
+});
+
 Deno.test("compose-box menu button is released to default, not pinned to commands", () => {
   // "commands" renders as a blue hamburger in the left slot and opens a sheet; "default"
   // gives the "/" shortcut inside the input field, which autofills and so composes with
