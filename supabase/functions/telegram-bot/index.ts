@@ -9,7 +9,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v91";
+const BUILD_VERSION = "v92";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -2262,6 +2262,30 @@ async function lookupVocabByLemma(lemma: string, language: LangCode): Promise<an
   return data ?? [];
 }
 
+// A card's example sentence. Cards used to be created with
+// example_message_id = first_seen_message_id -- the first message the word ever appeared
+// in -- with nothing checking that the card's own taught translation survives into it.
+// Often it does not, because good translation is idiomatic: "Enjoy work" becomes
+// "Гарної роботи", and a card teaching насолоджуватися then shows a sentence that does
+// not contain it. Measured on the live deck, ~12% of cards were in that state, and 66.5%
+// of all examples came from the corpus's first week.
+//
+// pick_example_messages checks BOTH sides and falls back to first_seen_message_id when it
+// finds nothing, so this can only improve a card or leave it as it was. One batched call,
+// because /learn top N adds up to 50 at once.
+//
+// A failure here must not block adding the card: the deck entry is what the user asked
+// for and the example is decoration on it, so an error leaves every card on the old
+// behaviour rather than refusing the command.
+async function pickExamples(vocabIds: string[]): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  if (vocabIds.length === 0) return out;
+  const { data, error } = await supabase.rpc("pick_example_messages", { p_vocabulary_ids: vocabIds });
+  if (error) { console.error("pick_example_messages failed, falling back to first_seen:", error); return out; }
+  for (const r of (data ?? []) as any[]) out.set(r.vocabulary_id, r.message_id ?? null);
+  return out;
+}
+
 async function handleLearnTop(msg: any, user: any, arg: string) {
   const lang = viewerLang(msg.from, user);
   // The accepted language tokens come from the instance's own pair, not a hardcoded
@@ -2322,10 +2346,11 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
       : t(lang, "learn_none_unlearned_partner", { lang: targetLangLabel, name: targetUser.display_name }));
     return;
   }
+  const examples = await pickExamples(unlearned.map((v: any) => v.id));
   const newCards = unlearned.map((v: any) => ({
     user_id: targetUser.id,
     vocabulary_id: v.id,
-    example_message_id: v.first_seen_message_id,
+    example_message_id: examples.get(v.id) ?? v.first_seen_message_id,
   }));
   const { error: insertErr } = await supabase.from("flashcards")
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true });
@@ -2411,10 +2436,11 @@ async function handleLearn(msg: any, user: any) {
     await sendMessage(msg.chat.id, t(lang, "vocab_word_not_found", { word: arg, lang: targetLangLabel }));
     return;
   }
+  const examples = await pickExamples(vocabRows.map((v: any) => v.id));
   const newCards = vocabRows.map((v: any) => ({
     user_id: targetUser.id,
     vocabulary_id: v.id,
-    example_message_id: v.first_seen_message_id,
+    example_message_id: examples.get(v.id) ?? v.first_seen_message_id,
   }));
   const { data: inserted, error: insertErr } = await supabase.from("flashcards")
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true })
