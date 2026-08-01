@@ -460,6 +460,62 @@ export const STRINGS: Record<string, Row> = {
     de: "Abo, Nutzung und Zahlung", it: "Abbonamento, utilizzo e pagamento",
     pt: "Subscrição, utilização e pagamento", pl: "Subskrypcja, zużycie i płatność",
   },
+  // The five menu descriptions the /help catalog did not already cover. The rest of the
+  // "/" menu reuses the cmd_* keys above: they are the same descriptive sentence in the
+  // same eight languages, and maintaining a second near-identical set would guarantee the
+  // two drift. /management reuses cmd_billing, which already says exactly that.
+  //
+  // Provenance is the file header's: en and uk reviewed, the other six machine-written.
+  cmd_start: {
+    en: "What the bot does",
+    uk: "Що вміє бот",
+    es: "Qué hace el bot",
+    fr: "Ce que fait le bot",
+    de: "Was der Bot kann",
+    it: "Cosa fa il bot",
+    pt: "O que o bot faz",
+    pl: "Co potrafi bot",
+  },
+  cmd_help: {
+    en: "Show all commands",
+    uk: "Показати всі команди",
+    es: "Ver todos los comandos",
+    fr: "Voir toutes les commandes",
+    de: "Alle Befehle anzeigen",
+    it: "Mostra tutti i comandi",
+    pt: "Ver todos os comandos",
+    pl: "Pokaż wszystkie komendy",
+  },
+  cmd_mistakes: {
+    en: "Review your recent grammar mistakes",
+    uk: "Переглянути свої останні помилки",
+    es: "Repasa tus últimos errores de gramática",
+    fr: "Revoir tes dernières fautes de grammaire",
+    de: "Deine letzten Grammatikfehler ansehen",
+    it: "Rivedi i tuoi ultimi errori di grammatica",
+    pt: "Rever os teus últimos erros de gramática",
+    pl: "Przejrzyj swoje ostatnie błędy",
+  },
+  cmd_leave: {
+    en: "Leave this account (for the partner)",
+    uk: "Вийти з цього акаунта (для партнера)",
+    es: "Salir de esta cuenta (para la pareja)",
+    fr: "Quitter ce compte (pour le partenaire)",
+    de: "Dieses Konto verlassen (für den Partner)",
+    it: "Lascia questo account (per il partner)",
+    pt: "Sair desta conta (para o parceiro)",
+    pl: "Opuść to konto (dla partnera)",
+  },
+  cmd_plans: {
+    en: "Plans and pricing",
+    uk: "Тарифи та ціни",
+    es: "Planes y precios",
+    fr: "Offres et tarifs",
+    de: "Tarife und Preise",
+    it: "Piani e prezzi",
+    pt: "Planos e preços",
+    pl: "Plany i ceny",
+  },
   cmd_delete_account: {
     en: "Delete the account and all its data (permanent)", uk: "Видалити акаунт і всі дані (назавжди)",
     es: "Borrar la cuenta y todos sus datos (permanente)", fr: "Supprimer le compte et toutes ses données (définitif)",

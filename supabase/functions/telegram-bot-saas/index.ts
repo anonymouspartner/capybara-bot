@@ -3,7 +3,7 @@ import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.39.0";
 // Customer-facing copy in eight languages. A separate module because it is ~1,000
 // strings of prose: inline it would triple this file and bury the logic. Supabase
 // deploys the whole function directory, so an import ships identically.
-import { t, viewerLang, type Lang } from "./strings.ts";
+import { t, viewerLang, LANGS, type Lang } from "./strings.ts";
 
 const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v27";
+const BUILD_VERSION = "saas-v29";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -404,6 +404,24 @@ Deno.serve(async (req) => {
         body.seedCheckError = (e as Error)?.message ?? String(e);
       }
     }
+    // Opt-in webhook check (?webhook). Whether Telegram will DELIVER a button tap at all
+    // is invisible from inside -- no error, no request, nothing to log -- so it has to be
+    // read back. On this build a delivery gap silently breaks the plan picker and the
+    // onboarding wizard, i.e. every path a paying customer takes. Off the default probe
+    // because it calls an external API and plain health must stay dependency-free.
+    // The url is not reported: it carries the function path and teaches nothing here.
+    if (url.searchParams.has("webhook")) {
+      const wh = await getWebhookInfo();
+      body.webhook = wh
+        ? {
+            allowedUpdates: wh.allowed_updates ?? [],
+            deliversCallbacks: (wh.allowed_updates ?? []).length === 0 ||
+              (wh.allowed_updates ?? []).includes("callback_query"),
+            pendingUpdateCount: wh.pending_update_count ?? 0,
+            lastErrorMessage: wh.last_error_message ?? null,
+          }
+        : null;
+    }
     return new Response(
       JSON.stringify(body),
       { status: 200, headers: { "content-type": "application/json" } },
@@ -445,6 +463,7 @@ async function handleUpdate(update: any) {
   const msg = update.message;
   if (!msg) return;
   const user = await lookupUser(msg.from);
+  if (user) scheduleBackgroundWork("setChatMenuForUser", setChatMenuForUser(user));
   if (!user) {
     // Not a member of any tenant. The single-tenant build's answer here was "ask the
     // owner to add your id", which assumed a human operator doing manual seeding. The
@@ -3068,45 +3087,56 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
 // Populates Telegram's "/" menu so the bot's commands are discoverable. Scoped:
 // both partners see PUBLIC_COMMANDS (default scope); the admin ALSO sees the admin
 // commands, in their own chat only.
-const PUBLIC_COMMANDS: { command: string; description: string }[] = [
-  { command: "start", description: "What the bot does" },
-  { command: "help", description: "Show all commands" },
-  { command: "vocab", description: "Top unlearned words in each deck" },
-  { command: "learn", description: "Add a word to study (or: top N)" },
-  { command: "forget", description: "Remove a word from a deck" },
-  { command: "export", description: "Download both decks as CSV for Anki (or: new)" },
-  { command: "mistakes", description: "Review your recent grammar mistakes" },
-  { command: "capybara", description: "Toggle grammar help for your learning language" },
-  { command: "ask", description: "Ask your shared conversation memory" },
-  { command: "note", description: "Save a private note to memory" },
-  { command: "pin", description: "Pin a message to memory" },
-  { command: "unpin", description: "Unpin a message" },
-  { command: "pinned", description: "List pinned messages" },
+// Descriptions are catalog keys, not literals. They were hardcoded English, so the "/"
+// menu -- the first thing a customer reads, and the list of what the product does -- was
+// in the wrong language whichever one they had picked. Ported from telegram-bot.
+const PUBLIC_COMMANDS: { command: string; key: string }[] = [
+  { command: "start",      key: "cmd_start" },
+  { command: "help",       key: "cmd_help" },
+  { command: "vocab",      key: "cmd_vocab" },
+  { command: "learn",      key: "cmd_learn" },
+  { command: "forget",     key: "cmd_forget" },
+  { command: "export",     key: "cmd_export" },
+  { command: "mistakes",   key: "cmd_mistakes" },
+  { command: "capybara",   key: "cmd_capybara" },
+  { command: "ask",        key: "cmd_ask" },
+  { command: "note",       key: "cmd_note" },
+  { command: "pin",        key: "cmd_pin" },
+  { command: "unpin",      key: "cmd_unpin" },
+  { command: "pinned",     key: "cmd_pinned" },
   // Last in the list but the one a customer needs findable without asking: a lapsed card
-  // or an exhausted allowance both dead-end here, so it must not be a command you have to
-  // already know about.
-  { command: "management", description: "Subscription, your partner, and account settings" },
-  { command: "leave", description: "Leave this account (for the partner, not the owner)" },
+  // or an exhausted allowance both dead-end here. Reuses cmd_billing, which already reads
+  // "Subscription, usage and payment" in all eight.
+  { command: "management", key: "cmd_billing" },
+  { command: "leave",      key: "cmd_leave" },
   // The default menu scope is what a stranger sees before they have ever spoken to the
-  // bot, so this is the one command in the list aimed at someone who is not a customer
-  // yet: it is how the "/" menu offers a way to subscribe rather than only tools that
-  // need a subscription to do anything.
-  { command: "plans", description: "Plans and pricing" },
+  // bot, so this is the one entry aimed at someone who is not a customer yet.
+  { command: "plans",      key: "cmd_plans" },
 ];
-// Only the two commands an admin uses on a live instance appear in the menu. The
-// one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
-// /recap_backfill) and the reply-based /reconcile & /restore are intentionally omitted
-// to keep the menu clean -- they remain fully functional when typed, and /help still
-// lists them.
-const ADMIN_COMMANDS: { command: string; description: string }[] = [
-  ...PUBLIC_COMMANDS,
+
+// Superadmin entries stay English literals: one operator, who reads English. They are
+// only ever registered into that operator's own chat scope.
+const SUPERADMIN_EXTRA: { command: string; description: string }[] = [
   { command: "tenants", description: "Admin: service overview \u2014 signups, quotas, spend" },
   { command: "diag", description: "Admin: ping upstream APIs + DB" },
 ];
 
-async function setMyCommands(commands: { command: string; description: string }[], scope?: unknown): Promise<boolean> {
+// Resolve a command list's descriptions into one language.
+function commandsIn(list: { command: string; key: string }[], lang: Lang) {
+  return list.map(({ command, key }) => ({ command, description: t(lang, key) }));
+}
+
+async function setMyCommands(
+  commands: { command: string; description: string }[],
+  scope?: unknown,
+  languageCode?: string,
+): Promise<boolean> {
   const body: Record<string, unknown> = { commands };
   if (scope) body.scope = scope;
+  // Omitted entirely for the fallback set. Telegram treats a list with no language_code
+  // as the default for every language that has no set of its own, so sending "" would
+  // register a set for the empty-string language and leave the fallback unset.
+  if (languageCode) body.language_code = languageCode;
   const resp = await fetch(`${TELEGRAM_API}/setMyCommands`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3116,17 +3146,132 @@ async function setMyCommands(commands: { command: string; description: string }[
   return true;
 }
 
-// Pin the compose-box menu button to the "commands" mode so it renders as the "/"
-// command shortcut (which autofills a slash command on tap) rather than the default
-// "Menu" label. Set globally (no chat scope) — applies to every chat.
-async function setChatMenuButtonToCommands(): Promise<boolean> {
+// Release the compose-box menu button to "default".
+//
+// Ported from telegram-bot. This used to set type "commands" under a comment claiming
+// that produced the "/" shortcut; it does the opposite. "commands" puts a blue hamburger
+// in the LEFT slot, displacing GIF and emoji, and a tap opens the command list as a
+// sheet. "default" renders "/" inside the input field instead, which AUTOFILLS the
+// command rather than sending it -- so it composes with typing an argument, which is what
+// /learn <word> and /note <text> need.
+async function setChatMenuButtonToDefault(): Promise<boolean> {
   const resp = await fetch(`${TELEGRAM_API}/setChatMenuButton`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ menu_button: { type: "commands" } }),
+    body: JSON.stringify({ menu_button: { type: "default" } }),
   });
   if (!resp.ok) { console.error("setChatMenuButton failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
   return true;
+}
+
+// Every update type this bot needs. Telegram's default covers all of these, but the
+// default is NOT what an existing webhook falls back to.
+//
+// setWebhook's contract: "If not specified, the previous setting will be used." So
+// allowed_updates is sticky -- once registered narrow, every later setWebhook call that
+// omits the parameter silently preserves the narrow list, and Telegram simply stops
+// delivering the other types with no error anywhere.
+//
+// On the single-tenant bot this had left the webhook on ["message"], which killed every
+// inline button. On THIS build that failure mode is far worse: the plan picker, the whole
+// onboarding wizard and the trial flow are inline keyboards, so a customer who has just
+// paid would tap and get nothing, with no error to report and nothing in the logs.
+const REQUIRED_UPDATES = ["message", "edited_message", "callback_query"];
+
+async function getWebhookInfo(): Promise<any | null> {
+  try {
+    const resp = await fetch(`${TELEGRAM_API}/getWebhookInfo`);
+    const json = await resp.json().catch(() => null);
+    return json?.ok ? json.result : null;
+  } catch (e) {
+    console.error("getWebhookInfo failed:", e);
+    return null;
+  }
+}
+
+// Reuses the URL Telegram ALREADY HAS rather than one computed from env -- a computed URL
+// differs behind a custom domain and would point the webhook away from the bot, turning a
+// broken button into a dead service. Re-sends secret_token because setWebhook DROPS the
+// secret when the parameter is omitted. Does nothing when allowed_updates is empty, since
+// that already means "all default types".
+async function ensureWebhookAllowsCallbacks(): Promise<boolean> {
+  const info = await getWebhookInfo();
+  if (!info) return false;
+  const allowed: string[] = info.allowed_updates ?? [];
+  if (allowed.length === 0) return true;
+  const missing = REQUIRED_UPDATES.filter((u) => !allowed.includes(u));
+  if (missing.length === 0) return true;
+  if (!info.url) { console.error("webhook has no url; refusing to re-register"); return false; }
+  console.error(`webhook allowed_updates is missing ${missing.join(", ")} -- widening it`);
+  const merged = [...new Set([...allowed, ...REQUIRED_UPDATES])];
+  try {
+    const resp = await fetch(`${TELEGRAM_API}/setWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: info.url, secret_token: WEBHOOK_SECRET, allowed_updates: merged }),
+    });
+    const json = await resp.json().catch(() => null);
+    if (!json?.ok) { console.error("setWebhook (widen allowed_updates) failed:", json?.description); return false; }
+    console.log(`webhook allowed_updates widened to: ${merged.join(", ")}`);
+    return true;
+  } catch (e) {
+    console.error("setWebhook (widen allowed_updates) threw:", e);
+    return false;
+  }
+}
+
+// A chat-scoped command list in the customer's OWN chosen language.
+//
+// The per-language sets above are matched by Telegram against the reader's APP language,
+// which is not necessarily the language they picked here -- a Ukrainian speaker running
+// Telegram in English gets the English fallback however correctly the Ukrainian set is
+// registered. A chat scope outranks the default scope, and within a scope a list with NO
+// language_code applies whatever the app language is, so this pins the menu to their
+// choice.
+//
+// Set LAZILY -- once per user per warm instance, on a message they send -- rather than by
+// iterating the users table on cold start. Iterating is what the single-tenant build does,
+// and it is fine for two people; here it would be one Telegram call per customer per cold
+// start, growing with the customer base and mostly for people who are not even active.
+// This way the cost falls only on people actually using the bot.
+const chatMenuSet = new Set<number>();
+async function setChatMenuForUser(user: any): Promise<void> {
+  const id = Number(user?.telegram_id);
+  if (!id || chatMenuSet.has(id)) return;
+  const lang = viewerLang(undefined, user);
+  const list = id === SUPERADMIN_TELEGRAM_ID
+    ? [...commandsIn(PUBLIC_COMMANDS, lang), ...SUPERADMIN_EXTRA]
+    : commandsIn(PUBLIC_COMMANDS, lang);
+  // Mark it done regardless of outcome: a failure retries on the next cold start, and
+  // retrying every message would turn a Telegram outage into a per-message API storm.
+  chatMenuSet.add(id);
+  await setMyCommands(list, { type: "chat", chat_id: id });
+}
+
+// A card's example sentence, chosen on evidence rather than on chronology. Ported from
+// telegram-bot; see migrations-saas/20260801060000_pick_example_message_tenant.sql.
+//
+// Cards used to take example_message_id = first_seen_message_id, with nothing checking
+// that the card's taught translation survives into that message -- it often does not,
+// because good translation is idiomatic. The RPC checks both sides and falls back to
+// first_seen_message_id, so this can only improve a card or leave it as it was.
+//
+// The tenant argument is not optional bookkeeping: unscoped, a customer's flashcard could
+// take its example from another couple's conversation, and it would look like the feature
+// working rather than a leak.
+//
+// A failure must not block adding the card -- the deck entry is what the user asked for,
+// the example is decoration on it -- so an error leaves every card on the old behaviour.
+async function pickExamples(tenantId: string, vocabIds: string[]): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  if (vocabIds.length === 0) return out;
+  const { data, error } = await dbAdmin.rpc("pick_example_messages", {
+    p_tenant_id: tenantId,
+    p_vocabulary_ids: vocabIds,
+  });
+  if (error) { console.error("pick_example_messages failed, falling back to first_seen:", error); return out; }
+  for (const r of (data ?? []) as any[]) out.set(r.vocabulary_id, r.message_id ?? null);
+  return out;
 }
 
 let commandsRegistered = false;
@@ -3135,13 +3280,25 @@ let commandsRegistered = false;
 // transient failure retries on the next request rather than waiting for a cold start.
 async function ensureCommandsRegistered(): Promise<void> {
   if (commandsRegistered) return;
-  const okPublic = await setMyCommands(PUBLIC_COMMANDS);
+  // English goes up with NO language_code -- Telegram's fallback set, served to every app
+  // language without one of its own. Each other language then gets its own set.
+  let okPublic = await setMyCommands(commandsIn(PUBLIC_COMMANDS, "en"));
+  for (const lang of LANGS) {
+    if (lang === "en") continue;
+    okPublic = await setMyCommands(commandsIn(PUBLIC_COMMANDS, lang), undefined, lang) && okPublic;
+  }
+  // The operator's own chat. A chat scope REPLACES the default rather than adding to it,
+  // so this must carry the public commands too or /start and /help vanish for them.
   let okAdmin = true;
   if (!Number.isNaN(SUPERADMIN_TELEGRAM_ID)) {
-    okAdmin = await setMyCommands(ADMIN_COMMANDS, { type: "chat", chat_id: SUPERADMIN_TELEGRAM_ID });
+    okAdmin = await setMyCommands(
+      [...commandsIn(PUBLIC_COMMANDS, "en"), ...SUPERADMIN_EXTRA],
+      { type: "chat", chat_id: SUPERADMIN_TELEGRAM_ID },
+    );
   }
-  const okMenuButton = await setChatMenuButtonToCommands();
-  if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
+  const okMenuButton = await setChatMenuButtonToDefault();
+  const okWebhook = await ensureWebhookAllowsCallbacks();
+  if (okPublic && okAdmin && okMenuButton && okWebhook) commandsRegistered = true;
 }
 
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
@@ -3993,10 +4150,11 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
       : t(viewerLang(msg.from, user), "learn_none_unlearned_partner", { lang: targetLangLabel, name: targetUser.display_name }));
     return;
   }
+  const examples = await pickExamples(user.tenant_id, unlearned.map((v: any) => v.id));
   const newCards = unlearned.map((v: any) => ({
     user_id: targetUser.id,
     vocabulary_id: v.id,
-    example_message_id: v.first_seen_message_id,
+    example_message_id: examples.get(v.id) ?? v.first_seen_message_id,
   }));
   const { error: insertErr } = await db.from("flashcards")
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true });
@@ -4081,10 +4239,11 @@ async function handleLearn(msg: any, user: any) {
       t(viewerLang(msg.from, user), "vocab_word_not_found", { word: escapeHtml(arg), lang: targetLangLabel }), "HTML");
     return;
   }
+  const examples = await pickExamples(user.tenant_id, vocabRows.map((v: any) => v.id));
   const newCards = vocabRows.map((v: any) => ({
     user_id: targetUser.id,
     vocabulary_id: v.id,
-    example_message_id: v.first_seen_message_id,
+    example_message_id: examples.get(v.id) ?? v.first_seen_message_id,
   }));
   const { data: inserted, error: insertErr } = await db.from("flashcards")
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true })

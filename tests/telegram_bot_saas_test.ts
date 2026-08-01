@@ -1,0 +1,162 @@
+// Guards for the multi-tenant build.
+//
+// Deliberately NOT a copy of telegram_bot_test.ts. The two builds are separate products
+// that share ~90% of their code, so the interesting assertions are the ones where they
+// must DIFFER -- tenant scoping above all -- plus the four defects ported across from the
+// single-tenant build, which would otherwise regress here unobserved.
+//
+// Run locally:  deno test --allow-read tests/
+
+import { STRINGS, LANGS, t, viewerLang } from "../supabase/functions/telegram-bot-saas/strings.ts";
+
+const ROOT = new URL("..", import.meta.url).pathname;
+const read = (p: string) => Deno.readTextFileSync(ROOT + p);
+const SRC = read("supabase/functions/telegram-bot-saas/index.ts");
+const RAW_STRINGS = read("supabase/functions/telegram-bot-saas/strings.ts");
+const SQL_PICK = read("supabase/migrations-saas/20260801060000_pick_example_message_tenant.sql");
+
+const assert = (cond: unknown, msg: string) => {
+  if (!cond) throw new Error(msg);
+};
+
+Deno.test("catalog: all eight languages on every key, nothing empty", () => {
+  const bad: string[] = [];
+  for (const k of Object.keys(STRINGS)) {
+    for (const l of LANGS) {
+      if ((STRINGS as any)[k][l] === undefined) bad.push(`${k}.${l} missing`);
+    }
+  }
+  assert(LANGS.length === 8, `expected 8 languages, got ${LANGS.length}`);
+  assert(bad.length === 0, bad.join(", "));
+});
+
+Deno.test("catalog: no key is defined twice", () => {
+  // Object.keys dedupes, so a duplicate passes every runtime check while the second
+  // definition silently shadows the first. This caught a real collision: the "/" menu keys
+  // were added without noticing the /help catalog already defined ten of them.
+  const body = RAW_STRINGS.slice(RAW_STRINGS.indexOf("export const STRINGS"), RAW_STRINGS.lastIndexOf("\n};"));
+  const found = [...body.matchAll(/^ {2}([a-z_0-9]+):/gm)].map((m) => m[1]);
+  const dupes = [...new Set(found.filter((k, i) => found.indexOf(k) !== i))];
+  assert(dupes.length === 0, `defined twice: ${dupes.join(", ")}`);
+});
+
+Deno.test("catalog: no CJK contamination", () => {
+  // A stray Chinese glyph reached the French copy twice. None of the eight languages here
+  // uses these ranges.
+  const bad = Object.keys(STRINGS).filter((k) =>
+    LANGS.some((l) => {
+      const e = (STRINGS as any)[k][l];
+      return typeof e === "string" && /[　-鿿가-힯]/.test(e);
+    })
+  );
+  assert(bad.length === 0, bad.join(", "));
+});
+
+Deno.test("viewerLang resolves across all eight, and falls back safely", () => {
+  assert(viewerLang({ language_code: "en" }, { native_language: "pl" }) === "pl", "row wins");
+  assert(viewerLang({ language_code: "pt-BR" }) === "pt", "pt-BR normalises");
+  assert(viewerLang({ language_code: "uk-UA" }) === "uk", "uk-UA normalises");
+  assert(viewerLang({ language_code: "ja" }) === "en", "unsupported falls back");
+  assert(viewerLang(undefined) === "en", "no from object falls back");
+});
+
+Deno.test('the "/" menu is keyed, and every key resolves in all eight languages', () => {
+  // Descriptions were hardcoded English, so the first surface a customer reads -- the list
+  // of what the product does -- was in the wrong language whichever one they picked.
+  assert(!/command: "start", description:/.test(SRC), "no literal descriptions");
+  const block = SRC.slice(SRC.indexOf("const PUBLIC_COMMANDS"), SRC.indexOf("const SUPERADMIN_EXTRA"));
+  const keys = [...block.matchAll(/key: "([a-z_]+)"/g)].map((m) => m[1]);
+  assert(keys.length === 16, `expected 16 menu entries, got ${keys.length}`);
+  for (const k of keys) {
+    assert(k in STRINGS, `${k} missing from the catalog`);
+    for (const l of LANGS) {
+      const out = t(l, k);
+      assert(out.length > 0, `${k}.${l} empty`);
+      // Telegram's hard limit is 256; this is the readability bound.
+      assert(out.length <= 80, `${k}.${l} is ${out.length} chars, too long for a menu row`);
+    }
+  }
+  // Superadmin entries stay English literals on purpose: one operator, who reads English.
+  assert(/const SUPERADMIN_EXTRA/.test(SRC), "superadmin extras kept separate");
+  assert(/command: "tenants", description:/.test(SRC), "superadmin entries stay literal");
+});
+
+Deno.test("English is the fallback set, registered with no language_code", () => {
+  // Telegram serves the language_code-less list to every app language without one of its
+  // own. Sending "" registers a set for the empty-string language and leaves the fallback
+  // unset -- English for nobody, missing for everyone.
+  assert(/setMyCommands\(commandsIn\(PUBLIC_COMMANDS, "en"\)\)/.test(SRC), "en carries no lang arg");
+  assert(/setMyCommands\(commandsIn\(PUBLIC_COMMANDS, lang\), undefined, lang\)/.test(SRC), "others pass lang");
+  assert(/if \(languageCode\) body\.language_code = languageCode;/.test(SRC), "omitted, not sent empty");
+});
+
+Deno.test("the per-chat menu is set lazily, not by iterating every customer", () => {
+  // The per-language sets are matched against the reader's APP language, which need not be
+  // the language they chose here. A chat scope outranks the default and pins it to their
+  // choice. It must NOT be done by walking the users table on cold start: that is one
+  // Telegram call per customer per cold start, growing with the customer base, mostly for
+  // people who are not even active. The single-tenant build can iterate; it has two users.
+  assert(/const chatMenuSet = new Set<number>\(\);/.test(SRC), "needs a per-instance guard");
+  assert(/if \(!id \|\| chatMenuSet\.has\(id\)\) return;/.test(SRC), "at most once per user per instance");
+  assert(/scheduleBackgroundWork\("setChatMenuForUser"/.test(SRC), "runs off the hot path");
+  // Marking done before the call: retrying every message would turn a Telegram outage into
+  // a per-message API storm.
+  assert(/chatMenuSet\.add\(id\);\s*\n\s*await setMyCommands/.test(SRC), "mark before call, not after");
+});
+
+Deno.test("the webhook is kept wide enough to deliver button taps", () => {
+  // setWebhook's contract is "If not specified, the previous setting will be used", so a
+  // narrow allowed_updates is sticky and silently survives every re-registration. On this
+  // build that breaks the plan picker, the onboarding wizard and the trial flow -- every
+  // path a paying customer takes -- with no error anywhere.
+  assert(/const REQUIRED_UPDATES = \[.*"callback_query".*\]/.test(SRC), "callback_query required");
+  assert(/await ensureWebhookAllowsCallbacks\(\)/.test(SRC), "self-heal must run");
+  // Reuse the URL Telegram already holds; a computed one differs behind a custom domain.
+  assert(/JSON\.stringify\(\{ url: info\.url,/.test(SRC), "must reuse the existing url");
+  // setWebhook DROPS the secret when the parameter is omitted.
+  assert(/secret_token: WEBHOOK_SECRET/.test(SRC), "must re-send the secret");
+  assert(/if \(allowed\.length === 0\) return true;/.test(SRC), "empty list is already correct");
+  assert(/url\.searchParams\.has\("webhook"\)/.test(SRC), "readback must be exposed");
+});
+
+Deno.test("compose-box menu button is default, not pinned to commands", () => {
+  assert(/menu_button: \{ type: "default" \}/.test(SRC), "should set default");
+  assert(!/menu_button: \{ type: "commands" \}/.test(SRC), "should not force commands");
+});
+
+Deno.test("flashcard examples are tenant-scoped and fail soft", () => {
+  // Unscoped, a customer's flashcard could take its example from another couple's private
+  // conversation -- and it would look like the feature working rather than a leak.
+  assert(/p_tenant_id: tenantId/.test(SRC), "the RPC call must pass a tenant");
+  assert(/pickExamples\(user\.tenant_id,/.test(SRC), "call sites must pass the tenant");
+  const uses = [...SRC.matchAll(/example_message_id: examples\.get\(v\.id\) \?\? v\.first_seen_message_id/g)];
+  assert(uses.length === 2, `both insert sites should use the picker, found ${uses.length}`);
+  assert(!/example_message_id: v\.first_seen_message_id,/.test(SRC), "no unguarded first_seen insert");
+  assert(/pick_example_messages failed, falling back to first_seen/.test(SRC), "must fail soft");
+});
+
+Deno.test("the picker migration scopes by tenant and stays caller-rights", () => {
+  const ddl = SQL_PICK.replace(/^\s*--.*$/gm, "");
+  // Comments are stripped first: this file explains why it is not SECURITY DEFINER, so
+  // matching raw text would pass on the prose without inspecting the DDL.
+  assert(!/SECURITY DEFINER/.test(ddl), "must not be SECURITY DEFINER");
+  assert(/m\.tenant_id = s\.tenant_id/.test(ddl), "message search must be tenant-scoped");
+  assert(/AND tenant_id = p_tenant_id/.test(ddl), "vocabulary lookup must be tenant-scoped");
+  assert(/COALESCE\(best\.id, s\.first_seen_message_id\)/.test(ddl), "must fall back, never return null");
+  assert(/GRANT {2}EXECUTE ON FUNCTION public\.pick_example_messages\(uuid, uuid\[\]\) TO service_role/.test(SQL_PICK), "granted");
+  assert(/REVOKE EXECUTE ON FUNCTION public\.pick_example_messages\(uuid, uuid\[\]\) FROM PUBLIC/.test(SQL_PICK), "revoked");
+});
+
+Deno.test("tenant scoping: raw dbAdmin use stays rare and commented", () => {
+  // Every customer-facing read goes through tenantDb. dbAdmin bypasses that by design and
+  // is legitimate in a few places (instance-wide health, provisioning), but each one is a
+  // place a tenant boundary could be crossed, so the count is pinned rather than trusted.
+  //
+  // 44 is the count at the time of writing, not a target. It is a ratchet: raising it
+  // should be a deliberate act with a reason, because each new dbAdmin call is a place a
+  // tenant boundary could be crossed. The newest one is the flashcard example picker,
+  // which is legitimate precisely because it passes p_tenant_id and the SQL scopes on it.
+  const uses = [...SRC.matchAll(/\bdbAdmin\b/g)].length;
+  assert(uses <= 44, `dbAdmin used ${uses} times, was 44 -- each new one bypasses tenantDb, so justify it`);
+  assert(/function tenantDb\(/.test(SRC), "tenantDb must exist");
+});
