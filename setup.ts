@@ -714,8 +714,14 @@ async function main() {
   // Step 12 - webhook + manual test
   step(12, "Connect Telegram + final test");
   const hookUrl = `https://${ref}.supabase.co/functions/v1/${FUNCTION}`;
+  // allowed_updates is passed EXPLICITLY. Telegram's contract is "If not specified, the
+  // previous setting will be used", so omitting it preserves whatever the webhook already
+  // had rather than resetting to the default -- and a webhook narrowed to ["message"]
+  // silently drops every callback_query, which is what stopped the inline buttons working.
+  const allowed = encodeURIComponent(JSON.stringify(["message", "edited_message", "callback_query"]));
   const set = `https://api.telegram.org/bot${values.TELEGRAM_BOT_TOKEN}/setWebhook` +
-    `?url=${encodeURIComponent(hookUrl)}&secret_token=${encodeURIComponent(values.WEBHOOK_SECRET)}`;
+    `?url=${encodeURIComponent(hookUrl)}&secret_token=${encodeURIComponent(values.WEBHOOK_SECRET)}` +
+    `&allowed_updates=${allowed}`;
   let webhookOk = false;
   try {
     const r = await (await fetch(set)).json();

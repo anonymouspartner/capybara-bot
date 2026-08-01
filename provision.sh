@@ -60,8 +60,14 @@ do_webhook() {
   : "${WEBHOOK_SECRET:?WEBHOOK_SECRET missing in .env}"
   local url="https://$PROJECT_REF.supabase.co/functions/v1/$FUNCTION"
   echo "==> Pointing Telegram webhook at $url"
+  # allowed_updates is passed EXPLICITLY and must stay that way. Telegram's contract is
+  # "If not specified, the previous setting will be used" -- so omitting it preserves
+  # whatever the webhook already had. A webhook narrowed to ["message"] once stays narrow
+  # forever, silently dropping every callback_query, which is what stopped the inline
+  # buttons working on the first instance. Omitting it is not "use the default".
   curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
-    --get --data-urlencode "url=${url}" --data-urlencode "secret_token=${WEBHOOK_SECRET}"
+    --get --data-urlencode "url=${url}" --data-urlencode "secret_token=${WEBHOOK_SECRET}" \
+    --data-urlencode 'allowed_updates=["message","edited_message","callback_query"]'
   echo
   echo "==> getWebhookInfo:"
   curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"; echo
