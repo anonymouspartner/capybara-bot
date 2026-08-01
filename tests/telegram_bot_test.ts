@@ -206,6 +206,33 @@ Deno.test("the health readback reports per-chat menus without identifying anyone
   assert(/lang: viewerLang\(undefined, u\)/.test(health), "language, not an id, identifies the row");
 });
 
+Deno.test("the webhook is kept wide enough to deliver button taps", () => {
+  // setWebhook's contract is "If not specified, the previous setting will be used", so
+  // allowed_updates is sticky: a webhook narrowed to ["message"] once stays narrow through
+  // every later registration that omits the parameter. Telegram then silently stops
+  // delivering callback_query, and from inside the bot that is indistinguishable from
+  // nobody tapping anything. It is why the /education buttons did nothing.
+  assert(/const REQUIRED_UPDATES = \[.*"callback_query".*\]/.test(SRC), "callback_query must be required");
+  assert(/async function ensureWebhookAllowsCallbacks\(/.test(SRC), "self-heal must exist");
+  assert(/await ensureWebhookAllowsCallbacks\(\) && ok/.test(SRC), "must run, and gate the retry latch");
+  // Reuse the URL Telegram already holds: a URL computed from env differs behind a custom
+  // domain, and re-registering with it would point the webhook away from the bot.
+  assert(/JSON\.stringify\(\{ url: info\.url,/.test(SRC), "must reuse the existing url");
+  // setWebhook DROPS the secret when the parameter is omitted, leaving the endpoint open.
+  assert(/secret_token: WEBHOOK_SECRET/.test(SRC), "must re-send the secret");
+  // An empty allowed_updates already means "all default types" -- rewriting it then would
+  // be a config write for no reason.
+  assert(/if \(allowed\.length === 0\) return true;/.test(SRC), "empty list is already correct");
+});
+
+Deno.test("health reports whether Telegram will deliver callbacks at all", () => {
+  const health = SRC.slice(SRC.indexOf('status: "ok",'), SRC.indexOf("const secret = req.headers"));
+  assert(/deliversCallbacks:/.test(health), "should report deliverability");
+  assert(/body\.webhook = wh/.test(health), "should report the webhook block");
+  // The url carries the function path and teaches nothing here.
+  assert(!/url: wh\.url/.test(health), "must not echo the webhook url");
+});
+
 Deno.test("compose-box menu button is released to default, not pinned to commands", () => {
   // "commands" renders as a blue hamburger in the left slot and opens a sheet; "default"
   // gives the "/" shortcut inside the input field, which autofills and so composes with

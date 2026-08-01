@@ -9,7 +9,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v93";
+const BUILD_VERSION = "v94";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -226,6 +226,21 @@ Deno.serve(async (req) => {
         await describe("adminChat", { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
       }
       body.commandMenu = menus;
+
+      // Whether Telegram will even DELIVER a button tap. A narrow allowed_updates is
+      // invisible from inside the bot -- no error, no request, nothing to log -- so it
+      // has to be read back from Telegram like the command menu is. The url is not
+      // reported: it carries the function path and there is nothing to learn from it here.
+      const wh = await getWebhookInfo();
+      body.webhook = wh
+        ? {
+            allowedUpdates: wh.allowed_updates ?? [],   // [] means Telegram's default: all types
+            deliversCallbacks: (wh.allowed_updates ?? []).length === 0 ||
+              (wh.allowed_updates ?? []).includes("callback_query"),
+            pendingUpdateCount: wh.pending_update_count ?? 0,
+            lastErrorMessage: wh.last_error_message ?? null,
+          }
+        : null;
 
       // The chat-scoped lists are the ones that actually decide what each partner sees,
       // so reporting only the default sets would answer the wrong question.
@@ -1525,6 +1540,68 @@ async function setChatMenuButtonToDefault(): Promise<boolean> {
   return true;
 }
 
+// Every update type this bot needs. Telegram's own default covers all of these, but the
+// default is NOT what an existing webhook falls back to.
+//
+// setWebhook's contract: "If not specified, the previous setting will be used." So
+// allowed_updates is sticky -- once a webhook has been registered with a narrow list,
+// every later setWebhook call that omits the parameter silently preserves the narrow
+// list. Neither provision.sh nor setup.ts passes it, so a webhook restricted to
+// ["message"] at any point in its life stays that way forever, and no error is ever
+// raised: Telegram simply never delivers the other types.
+//
+// That is what broke the /education and /memory buttons. A tap produces a callback_query,
+// the callback_query was never delivered, and the function was never invoked -- the
+// request log showed the two typed commands either side of the tap and nothing between.
+// Nothing in the bot could have detected it, because from inside there is no difference
+// between "no one tapped" and "taps are not being delivered".
+const REQUIRED_UPDATES = ["message", "edited_message", "callback_query"];
+
+async function getWebhookInfo(): Promise<any | null> {
+  try {
+    const resp = await fetch(`${TELEGRAM_API}/getWebhookInfo`);
+    const json = await resp.json().catch(() => null);
+    return json?.ok ? json.result : null;
+  } catch (e) {
+    console.error("getWebhookInfo failed:", e);
+    return null;
+  }
+}
+
+// Widen allowed_updates if it is set and missing something we need.
+//
+// Deliberately conservative. It reuses the URL Telegram ALREADY HAS rather than a URL
+// computed from env -- a computed one would differ behind a custom domain, and this would
+// then point the webhook somewhere the bot is not. It re-sends secret_token because
+// setWebhook DROPS the secret when the parameter is omitted, which would leave the
+// endpoint unauthenticated. And it does nothing at all when allowed_updates is absent or
+// empty, since that already means "all default types".
+async function ensureWebhookAllowsCallbacks(): Promise<boolean> {
+  const info = await getWebhookInfo();
+  if (!info) return false;
+  const allowed: string[] = info.allowed_updates ?? [];
+  if (allowed.length === 0) return true;                      // empty = Telegram's default = fine
+  const missing = REQUIRED_UPDATES.filter((u) => !allowed.includes(u));
+  if (missing.length === 0) return true;
+  if (!info.url) { console.error("webhook has no url; refusing to re-register"); return false; }
+  console.error(`webhook allowed_updates is missing ${missing.join(", ")} -- widening it`);
+  const merged = [...new Set([...allowed, ...REQUIRED_UPDATES])];
+  try {
+    const resp = await fetch(`${TELEGRAM_API}/setWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: info.url, secret_token: WEBHOOK_SECRET, allowed_updates: merged }),
+    });
+    const json = await resp.json().catch(() => null);
+    if (!json?.ok) { console.error("setWebhook (widen allowed_updates) failed:", json?.description); return false; }
+    console.log(`webhook allowed_updates widened to: ${merged.join(", ")}`);
+    return true;
+  } catch (e) {
+    console.error("setWebhook (widen allowed_updates) threw:", e);
+    return false;
+  }
+}
+
 // A chat-scoped command list for each registered user, in their own native_language.
 // The admin's list additionally carries /management -- and must still spread the public
 // commands, since a chat scope replaces the default one rather than adding to it, so a
@@ -1583,6 +1660,7 @@ async function ensureCommandsRegistered(): Promise<void> {
   ok = await registerPerUserMenus() && ok;
 
   ok = await setChatMenuButtonToDefault() && ok;
+  ok = await ensureWebhookAllowsCallbacks() && ok;
   if (ok) commandsRegistered = true;
 }
 
