@@ -27,7 +27,7 @@ the other person, translating any caption along the way.
 > and onboarding that starts inside Telegram rather than with a payment link. Its
 > customer-facing copy is translated into all eight registry languages, so a Ukrainian
 > speaker signs up in Ukrainian. See [Two products](#two-products) and
-> [Localization](#localization-paid-build).
+> [Localization](#localization).
 
 ---
 
@@ -39,13 +39,16 @@ the other person, translating any caption along the way.
 - [The model: one instance per pair](#the-model-one-instance-per-pair)
 - [Two products](#two-products)
 - [Customer onboarding (paid service)](#customer-onboarding-paid-service)
-- [Localization (paid build)](#localization-paid-build)
+- [Localization](#localization)
 - [Data model](#data-model)
 - [Repository map](#repository-map)
 - [Prerequisites](#prerequisites)
 - [Quick start](#quick-start)
 - [Secrets](#secrets-set-on-your-supabase-project)
 - [Deploying](#deploying)
+- [Verifying what a deploy cannot verify for itself](#verifying-what-a-deploy-cannot-verify-for-itself)
+- [Flashcard examples are chosen on evidence](#flashcard-examples-are-chosen-on-evidence)
+- [Reproducibility & determinism](#reproducibility--determinism)
 - [Bot commands](#bot-commands)
 - [Privacy](#privacy)
 - [Admin & maintenance commands](#admin--maintenance-commands)
@@ -346,13 +349,20 @@ The payer can use the bot **solo** in the gap before their partner joins. Once t
 seat is filled the `pairing_code` is cleared, so a forwarded link is inert from then on,
 and the payer is told their partner arrived.
 
-## Localization (paid build)
+## Localization
 
 The paid build talks to each person **in their own language** — all eight in the registry,
 across every customer-facing surface: the intro a stranger sees, the trial, onboarding,
 `/start`, `/help`, `/management`, quota warnings, the study commands, the grammar assistant,
-media and voice errors, and the account-deletion goodbyes. **155 keys x 8 languages**, in
-`supabase/functions/telegram-bot-saas/strings.ts`.
+media and voice errors, the account-deletion goodbyes — and the **"/" command menu itself**.
+**185 keys x 8 languages**, in `supabase/functions/telegram-bot-saas/strings.ts`.
+
+The menu was the last holdout and the most visible one: its descriptions were hardcoded
+English literals and `setMyCommands` took no `language_code`, so the list of what the
+product does could never render in anything else, however carefully every message body had
+been translated. Telegram picks a set by matching `language_code` against the reader's
+**Telegram app language** — not the language they chose here — so a chat-scoped list in
+their own choice is registered too, lazily, once per customer per warm instance.
 
 This existed because of a real signup: a Ukrainian speaker, with Telegram in Ukrainian,
 was offered a language picker with eight options and then addressed in English whichever
@@ -393,9 +403,17 @@ is exercised with real variables; no key is defined twice (`Object.keys` dedupes
 duplicate silently shadows the earlier definition); and no entry contains CJK, kana or
 hangul — a stray Chinese glyph reached the French copy twice.
 
-The single-tenant build is deliberately **not** localized: it serves one pair whose
-languages are known and who are both fluent in its English UI. This is a feature for
-strangers, and that build has none.
+**The single-tenant build is localized too, in two languages.** It used to say here that
+it deliberately was not — that it served one pair fluent in its English UI. That reasoning
+did not survive contact with the pair: it had run an English interface at a Ukrainian
+native speaker for a year, which is the same defect this section describes, just with an
+audience of one. It now carries **128 keys x 2 languages** in
+`supabase/functions/telegram-bot/strings.ts`.
+
+Two, not eight, and that is the actual difference between the builds: the paid service
+sells to strangers whose language is unknown until they arrive, so it must carry every
+language it offers. A personal instance is provisioned by hand for a known pair. Adding a
+language there is a column, not a rewrite.
 
 ## Data model
 
@@ -455,6 +473,9 @@ database, not Storage).
 | `deploy.ps1` / `predeploy-check.ps1` | Fallback deploy spine: gate → CLI-from-disk deploy → health smoke. (Windows PowerShell.) |
 | `deploy.sh` / `predeploy-check.sh` | Same fallback spine, ported to bash (macOS/Linux). |
 | `provision.sh` | Scripts the automatable provisioning glue (secrets, webhook, health). |
+| `supabase/functions/telegram-bot/strings.ts` | The personal build's copy, in English and Ukrainian. |
+| `tests/` | Guard tests for both builds, run by CI on every push (`deno test --allow-read tests/`). |
+| `bootstrap-dev.sh` | Restores a runnable toolchain (deno + the gate + the tests) in one command. |
 | `deno.json` | Deno tasks (`check`, `lock`) + lockfile config for deterministic builds. |
 | `.devcontainer/` | Codespaces config (Deno + Supabase CLI) for laptop-free setup. |
 | `docs/` | Background & design history (deploy-safety + reproducibility handoffs). |
@@ -629,6 +650,83 @@ multiple deployments can share this single repo and one `GITHUB_DEPLOY_TOKEN`:
 - The read-only version *check* needs only `GITHUB_REPO` (a public repo's raw file needs no
   token), so it is always safe to share; only the **Deploy** button needs `GITHUB_DEPLOY_TOKEN`.
 
+## Verifying what a deploy cannot verify for itself
+
+A deploy proves the function boots. It cannot prove the bot is reachable, or that the
+things it configured on Telegram's side actually took. Several of those failures are
+**silent by construction**, so the health route reads them back from Telegram rather than
+reporting what the bot believes it sent.
+
+| Probe | Answers |
+|---|---|
+| `?health` | Function up, version, admin secret present. No DB, no API — stays green when an upstream is down. |
+| `?seed` | Is there anything to serve (users, or tenants on the paid build). |
+| `?commands` | What Telegram **holds** for the "/" menu: the fallback set and each language, with a sample line. |
+| `?webhook` | `allowedUpdates`, `deliversCallbacks`, pending count, last delivery error. |
+
+Each is opt-in, because each costs an external call and the plain probe must stay
+dependency-free for the deploy smoke test.
+
+**Why read back rather than report a flag.** `setMyCommands` runs as background work: if it
+fails, the webhook still returns 200 and the request log is clean. A flag saying "we
+registered the menu" would go green on exactly the failure it exists to catch. The same
+reasoning produced `stripeMode` on the billing function, after a Stripe cutover reported
+fully green while every secret was still a test value.
+
+**A sample line, not just a count.** A count proves a list exists; only reading one line
+proves it is in the right *language* — and on an eight-language build, a customer served
+the wrong one cannot tell you which set is missing.
+
+**`allowed_updates` is sticky, and this is the trap.** `setWebhook`'s contract is *"If not
+specified, the previous setting will be used"* — omitting it does **not** mean "use the
+default", it preserves whatever the webhook already had. A webhook narrowed to
+`["message"]` once stays narrow through every later registration, and Telegram then simply
+stops delivering `callback_query` with no error, no retry and no request. From inside the
+bot, "nobody tapped anything" and "taps are not being delivered" are identical.
+
+That is not hypothetical: it silently disabled every inline button on the personal instance
+— including the deploy button — and went unnoticed because the symptom is nothing
+happening. `provision.sh` and `setup.ts` now pass the list explicitly so a new instance
+cannot start in that state, and both builds widen it at boot if they find it narrow,
+reusing the URL Telegram already holds and re-sending `secret_token` (which `setWebhook`
+drops when the parameter is omitted).
+
+**The paid build's `?commands` deliberately reports less.** The personal one lists its two
+per-chat menus; on the paid service the number of chat scopes *is* the customer count, and
+this route is unauthenticated by necessity — the deploy smoke test calls it before anything
+is signed in. A health endpoint is not the place to publish that.
+
+## Flashcard examples are chosen on evidence
+
+Each card shows a real sentence from your own conversation. Choosing that sentence used to
+mean "the first message this word ever appeared in", with nothing checking that the card's
+own taught translation survives into it. It frequently does not, because good translation
+is idiomatic: *"Enjoy work"* becomes «Гарної роботи», so a card teaching *насолоджуватися*
+would display a sentence that does not contain the word. The learner is tested on one thing
+and shown evidence for another.
+
+Measured on a live 466-card deck before anything was changed: ~19% failed a mechanical
+check, and hand-classifying a sample put the real rate near **12%**. **66.5% of all
+examples came from the corpus's first week** — vocabulary accumulates fastest at the start,
+so "first seen" anchors the whole deck to the earliest days, exactly when messages are
+shortest and most idiomatic.
+
+`pick_example_messages()` now takes the shortest message between 40 and 250 characters
+whose lemma side contains the word **and** whose other side contains its taught
+translation. Checking both sides is the point. The 40-character floor is not arbitrary: at
+25, the best match for `сьогодні` was a message with the word misspelt.
+
+Matching is deliberately crude — prefix stems over apostrophe-folded text — and falls back
+to the old behaviour when it finds nothing, so it can only improve a card or leave it
+alone. Trigram similarity was tried and rejected: on a hand-labelled set the score ranges
+overlapped (a wrong pair at 0.429 sat above a right pair at 0.375), so no threshold
+separates them. Detecting an inflected Slavic word by string similarity is not reliably
+solvable that way; a lemmatiser is the real upgrade.
+
+On the paid build the same function takes a tenant and scopes every read to it. That is not
+bookkeeping: unscoped, a customer's flashcard could draw its example sentence from another
+couple's private conversation — and it would look like the feature working.
+
 ## Reproducibility & determinism
 
 A few things keep a fresh instance reproducible from the committed files alone:
@@ -757,6 +855,16 @@ deploy-safety and reproducibility handoffs that shaped them.
   bucket is missing; the upload error is logged and ignored. Create the bucket.
 - **`getWebhookInfo` shows a `last_error_message`** — usually a wrong webhook URL or a
   `secret_token` that doesn't match `WEBHOOK_SECRET`. Re-run `setWebhook`.
+- **Inline buttons do nothing at all** — no reply, no error, nothing in the logs. Check
+  `?health&webhook`: if `deliversCallbacks` is `false`, Telegram is dropping every
+  `callback_query` before it reaches the bot, because `allowed_updates` was narrowed at
+  some point and is sticky. Both builds self-heal at boot; sending the bot any message
+  triggers it. See *Verifying what a deploy cannot verify for itself*.
+- **The "/" menu is in the wrong language** — Telegram matches its command sets against
+  the reader's **Telegram app language**, not the language they chose in the bot. Check
+  `?health&commands` to confirm the set for that language is registered; if it is, the
+  chat-scoped list (which follows their chosen language and outranks the default) lands on
+  their next message, and their client may need a restart to refresh.
 - **Deploy aborted by the gate** — `predeploy-check.ps1` failed (`deno check`, line
   count, or missing anchors). Fix the reported issue; nothing was deployed.
 
