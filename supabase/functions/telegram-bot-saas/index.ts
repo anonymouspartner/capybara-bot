@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v30";
+const BUILD_VERSION = "saas-v31";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -577,7 +577,10 @@ async function handleUpdate(update: any) {
   // embeds, so both genuinely spend.
   if (!isSuperadmin(msg.from?.id) &&
       !isCmd(msg.text ?? "", "management", "billing", "plans", "subscribe", "pricing", "promo", "code", "delete_account", "export", "mistakes",
-             "leave", "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned")) {
+             "leave", "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned",
+             // Turning practice OFF must work at the cap -- otherwise the setting that is
+             // spending the allowance is the one you cannot reach to stop.
+             "practice")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
       await sendMessage(msg.chat.id, quotaRefusalText(viewerLang(msg.from, user), verdict), "HTML");
@@ -636,6 +639,7 @@ async function handleUpdate(update: any) {
     { match: t => isCmd(t, "export"),                                                   handle: handleExport },
     { match: t => isCmd(t, "mistakes"),                                                 handle: handleMistakes },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
+    { match: t => t === "/practice" || t.startsWith("/practice ") || t.startsWith("/practice@"), handle: handlePractice },
     { match: t => isCmd(t, "backfill_grammar"),                                          handle: handleBackfillGrammar },
     { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
@@ -2310,6 +2314,12 @@ async function handleTextMessage(msg: any, user: any) {
   if (translationOk) {
     await sendMessage(msg.chat.id, `${t(viewerLang(msg.from, user), "translation_header", { lang: translationTargetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, originalText, translated!, originalLang, translationTargetLang);
+    // Solo practice: with no partner there is nobody for forwardToPartner to reach, so the
+    // bot answers instead. Backgrounded -- the translation is what they paid for and must
+    // not wait on a second model call.
+    if (user.practice_partner && !(await lookupPartner(db, user.id))) {
+      scheduleBackgroundWork("practiceReply", practiceReply(user, msg.chat.id, originalText));
+    }
   } else {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "translation_failed_saved", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) }));
   }
@@ -2613,6 +2623,100 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
 
 // /capybara [on|off] -- per-user toggle for the grammar assistant. Bare /capybara
 // flips the current state.
+// /practice [on|off] -- the solo conversation partner. Bare /practice flips it.
+async function handlePractice(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
+  const lang = viewerLang(msg.from, user);
+  // Refuse rather than silently store a setting that will never fire: with a partner
+  // present, forwardToPartner handles the reply and the practice path never runs.
+  if (await lookupPartner(db, user.id)) {
+    await sendMessage(msg.chat.id, t(lang, "practice_has_partner"));
+    return;
+  }
+  const arg = (msg.text ?? "").replace(/^\/practice(@\S+)?/i, "").trim().toLowerCase();
+  const enabled = arg === "on" ? true : arg === "off" ? false : !user.practice_partner;
+  const { error } = await db.from("users").update({ practice_partner: enabled }).eq("id", user.id);
+  if (error) {
+    console.error("practice toggle failed:", error);
+    await sendMessage(msg.chat.id, t(lang, "practice_save_failed"));
+    return;
+  }
+  await sendMessage(msg.chat.id,
+    t(lang, enabled ? "practice_on" : "practice_off", { lang: langLabel(user.learning_language) }),
+    "HTML");
+}
+
+// How many turns of the thread to replay. Enough that it remembers what you just said and
+// what it asked you; short enough that a long session does not grow the prompt without
+// bound. Ten is five exchanges.
+const PRACTICE_CONTEXT_TURNS = 10;
+
+// The bot takes the empty seat. Replies in the learner's TARGET language -- the whole
+// point is production practice, so answering in their native language would defeat it.
+//
+// Runs in the background, after the translation has already been sent: the translation is
+// what they paid for and must not wait on this.
+async function practiceReply(user: any, chatId: number, userText: string) {
+  const db = tenantDb(user.tenant_id);
+
+  // A reply is a model call, so it costs a message. Charged rather than absorbed: at the
+  // measured per-message rate, giving it away would roughly double the cost of serving a
+  // Standard plan and erase its margin. On refusal, say nothing -- they have already had
+  // their translation, and the next message they send hits the gate and explains properly.
+  const verdict = await consumeQuota(user.tenant_id);
+  if (!verdict.allowed) return;
+
+  const { data: history } = await db
+    .from("practice_turns")
+    .select("role, content")
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: false })
+    .limit(PRACTICE_CONTEXT_TURNS);
+  const thread = (history ?? []).reverse()
+    .map((r: any) => ({ role: r.role === "assistant" ? "assistant" as const : "user" as const, content: r.content }));
+
+  const target = langMeta(user.learning_language).englishName;
+  const native = langMeta(user.native_language).englishName;
+  const system =
+    `You are a friendly conversation partner helping someone practise ${target}. ` +
+    `Their native language is ${native}.\n` +
+    `- Reply ONLY in ${target}. Never translate, never explain grammar, never switch to ${native}.\n` +
+    `- Keep it to 1-3 short sentences, and end with a question so the conversation continues.\n` +
+    `- Match their level: mirror the complexity of what they wrote rather than showing off.\n` +
+    `- Be a person having a chat, not a teacher. Do not correct their mistakes -- something ` +
+    `else does that, and being corrected mid-conversation is what stops people talking.\n` +
+    `- If they write to you in ${native}, answer in ${target} anyway, simply.`;
+
+  try {
+    const result = await withRetry(() => anthropic.messages.create({
+      // Same model as translation and the grammar check, not the cheap one. This is the
+      // conversational surface of a product that sells language quality: a stilted or
+      // wrong-register reply in the language they are learning is exactly what makes
+      // someone turn the feature off. The quota unit charged above pays for it.
+      model: CLAUDE_MODEL,
+      max_tokens: 300,
+      system,
+      messages: [...thread, { role: "user" as const, content: userText }],
+    }));
+    const block = result.content.find((b: any) => b.type === "text");
+    const reply = block?.type === "text" ? block.text.trim() : "";
+    if (!reply) { console.error("practiceReply: empty response"); return; }
+    await sendMessage(chatId, escapeHtml(reply), "HTML");
+    // Both sides recorded, so the thread reads as a conversation next time. This table is
+    // NOT the corpus: nothing here is annotated, mined for vocabulary, or embedded for
+    // /recap. The user's own turn is already in messages, where it does all of that.
+    const { error } = await db.from("practice_turns").insert([
+      { user_id: user.id, role: "user", content: userText },
+      { user_id: user.id, role: "assistant", content: reply },
+    ]);
+    if (error) console.error("practice_turns insert failed:", error);
+  } catch (e) {
+    // Silent: they already have their translation, and an apology in the wrong language
+    // is worse than nothing.
+    console.error("practiceReply failed:", e);
+  }
+}
+
 async function handleCapybara(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
   const arg = msg.text.replace(/^\/capybara(@\S+)?/i, "").trim().toLowerCase();
@@ -3127,6 +3231,10 @@ const PUBLIC_COMMANDS: { command: string; key: string }[] = [
   { command: "export",     key: "cmd_export" },
   { command: "mistakes",   key: "cmd_mistakes" },
   { command: "capybara",   key: "cmd_capybara" },
+  // In the menu despite only applying to solo customers: otherwise nobody finds it. A
+  // paired customer who taps it gets a one-line explanation of what it is and why it is
+  // not for them, which is a better outcome than an undiscoverable feature.
+  { command: "practice",   key: "cmd_practice" },
   { command: "ask",        key: "cmd_ask" },
   { command: "note",       key: "cmd_note" },
   { command: "pin",        key: "cmd_pin" },

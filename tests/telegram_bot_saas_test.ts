@@ -66,7 +66,9 @@ Deno.test('the "/" menu is keyed, and every key resolves in all eight languages'
   assert(!/command: "start", description:/.test(SRC), "no literal descriptions");
   const block = SRC.slice(SRC.indexOf("const PUBLIC_COMMANDS"), SRC.indexOf("const SUPERADMIN_EXTRA"));
   const keys = [...block.matchAll(/key: "([a-z_]+)"/g)].map((m) => m[1]);
-  assert(keys.length === 16, `expected 16 menu entries, got ${keys.length}`);
+  // A ratchet, not a target: the menu was curated down deliberately, so growing it should
+  // be a decision someone made on purpose. 17 since /practice was added.
+  assert(keys.length === 17, `expected 17 menu entries, got ${keys.length}`);
   for (const k of keys) {
     assert(k in STRINGS, `${k} missing from the catalog`);
     for (const l of LANGS) {
@@ -167,6 +169,42 @@ Deno.test("the picker migration scopes by tenant and stays caller-rights", () =>
   assert(/COALESCE\(best\.id, s\.first_seen_message_id\)/.test(ddl), "must fall back, never return null");
   assert(/GRANT {2}EXECUTE ON FUNCTION public\.pick_example_messages\(uuid, uuid\[\]\) TO service_role/.test(SQL_PICK), "granted");
   assert(/REVOKE EXECUTE ON FUNCTION public\.pick_example_messages\(uuid, uuid\[\]\) FROM PUBLIC/.test(SQL_PICK), "revoked");
+});
+
+Deno.test("solo practice: the bot's words never reach the study corpus", () => {
+  // The whole constraint of this feature. Vocabulary, flashcards, /recap and /ask are
+  // supposed to be built from real human conversation; a deck mined from model output
+  // would quietly stop being that. The bot's turns go to practice_turns, which nothing in
+  // the study pipeline reads -- so it holds BY CONSTRUCTION rather than by remembering to
+  // filter every reader of messages.
+  const fn = SRC.slice(SRC.indexOf("async function practiceReply("), SRC.indexOf("async function handleCapybara("));
+  assert(fn.length > 0, "practiceReply not found");
+  assert(/\.from\("practice_turns"\)\s*\n?\s*\.insert/.test(fn), "turns go to practice_turns");
+  assert(!/\.from\("messages"\)/.test(fn), "must never write the bot's words to messages");
+  assert(!/scheduleAnnotation|embedMessageBackground/.test(fn), "must not annotate or embed its own output");
+  const sql = read("supabase/migrations-saas/20260806070000_practice_partner.sql");
+  assert(/CREATE TABLE IF NOT EXISTS public\.practice_turns/.test(sql), "table must exist");
+  assert(/ENABLE ROW LEVEL SECURITY/.test(sql), "as private as the conversation it replaces");
+  assert(/RAISE EXCEPTION 'practice_turns is readable by anon\/authenticated'/.test(sql), "self-asserting");
+});
+
+Deno.test("solo practice: replies in the target language, costs a quota unit, is opt-in", () => {
+  const fn = SRC.slice(SRC.indexOf("async function practiceReply("), SRC.indexOf("async function handleCapybara("));
+  // Production practice is the point -- answering in their native language would defeat it.
+  assert(/Reply ONLY in \$\{target\}/.test(fn), "must reply in the language being learned");
+  assert(/langMeta\(user\.learning_language\)\.englishName/.test(fn), "target is learning_language");
+  // A reply is a model call. Absorbing it would roughly double the cost of serving a plan.
+  assert(/const verdict = await consumeQuota\(user\.tenant_id\);/.test(fn), "must charge a message");
+  assert(/if \(!verdict\.allowed\) return;/.test(fn), "must stop at the cap");
+  // Correcting mid-conversation is what stops people talking; /capybara already does it.
+  assert(/Do not correct their mistakes/.test(fn), "conversation partner, not a teacher");
+  // Off by default, and only fires with no partner.
+  assert(/practice_partner boolean NOT NULL DEFAULT false/.test(read("supabase/migrations-saas/20260806070000_practice_partner.sql")), "off by default");
+  assert(/if \(user\.practice_partner && !\(await lookupPartner\(db, user\.id\)\)\)/.test(SRC), "solo only");
+  // Turning it OFF must work at the cap, or the setting spending the allowance is the one
+  // you cannot reach to stop.
+  const gate = SRC.slice(SRC.indexOf('"leave", "help", "start"'), SRC.indexOf('const verdict = await consumeQuota'));
+  assert(/"practice"/.test(gate), "/practice must be exempt from the quota gate");
 });
 
 Deno.test("tenant scoping: raw dbAdmin use stays rare and commented", () => {

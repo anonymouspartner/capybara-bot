@@ -516,6 +516,70 @@ export const STRINGS: Record<string, Row> = {
     pt: "Planos e preços",
     pl: "Plany i ceny",
   },
+  // ------------------------------------------------------- solo practice partner
+  //
+  // For a subscriber with no partner. The intro already sells solo use, but a solo
+  // customer writes into silence -- nothing answers. This lets the bot take the empty
+  // seat and reply in the language they are practising.
+  //
+  // practice_on states the cost plainly. Each reply is a model call, so it consumes a
+  // message from the allowance; a customer who discovers that from a quota refusal
+  // instead would be right to be annoyed.
+
+  practice_on: {
+    en: (v: any) => `🗣 <b>Practice partner on.</b> While you have no partner, I'll reply to you in ${v.lang} so you have someone to talk to. Your own words still build your deck — mine never do.\n\n<i>Each reply counts as one message from your monthly allowance. Turn it off with /practice off.</i>`,
+    uk: (v: any) => `🗣 <b>Мовний партнер увімкнено.</b> Поки в тебе немає партнера, я відповідатиму ${v.lang}, щоб було з ким говорити. Твої слова й далі наповнюють колоду — мої ніколи.\n\n<i>Кожна відповідь рахується як одне повідомлення з місячного ліміту. Вимкнути: /practice off.</i>`,
+    es: (v: any) => `🗣 <b>Compañero de práctica activado.</b> Mientras no tengas pareja, te responderé en ${v.lang} para que tengas con quién hablar. Tus palabras siguen llenando tu mazo; las mías nunca.\n\n<i>Cada respuesta cuenta como un mensaje de tu límite mensual. Desactívalo con /practice off.</i>`,
+    fr: (v: any) => `🗣 <b>Partenaire d'entraînement activé.</b> Tant que tu n'as pas de partenaire, je te répondrai en ${v.lang} pour que tu aies quelqu'un à qui parler. Tes mots continuent d'alimenter ton paquet ; les miens jamais.\n\n<i>Chaque réponse compte comme un message de ton quota mensuel. Désactive avec /practice off.</i>`,
+    de: (v: any) => `🗣 <b>Übungspartner an.</b> Solange du keinen Partner hast, antworte ich dir auf ${v.lang}, damit du jemanden zum Reden hast. Deine Wörter füllen weiterhin deinen Stapel — meine nie.\n\n<i>Jede Antwort zählt als eine Nachricht deines Monatskontingents. Ausschalten mit /practice off.</i>`,
+    it: (v: any) => `🗣 <b>Partner di pratica attivo.</b> Finché non hai un partner, ti risponderò in ${v.lang} così hai con chi parlare. Le tue parole continuano a riempire il mazzo; le mie mai.\n\n<i>Ogni risposta conta come un messaggio del tuo limite mensile. Disattiva con /practice off.</i>`,
+    pt: (v: any) => `🗣 <b>Parceiro de prática ligado.</b> Enquanto não tiveres parceiro, respondo-te em ${v.lang} para teres com quem falar. As tuas palavras continuam a encher o baralho; as minhas nunca.\n\n<i>Cada resposta conta como uma mensagem do teu limite mensal. Desliga com /practice off.</i>`,
+    pl: (v: any) => `🗣 <b>Partner do ćwiczeń włączony.</b> Dopóki nie masz partnera, będę odpowiadać po ${v.lang}, żebyś miał z kim rozmawiać. Twoje słowa nadal budują talię — moje nigdy.\n\n<i>Każda odpowiedź liczy się jako jedna wiadomość z miesięcznego limitu. Wyłącz: /practice off.</i>`,
+  },
+
+  practice_off: {
+    en: "Practice partner off. I'll go back to just translating.",
+    uk: "Мовного партнера вимкнено. Повертаюся до звичайного перекладу.",
+    es: "Compañero de práctica desactivado. Vuelvo a solo traducir.",
+    fr: "Partenaire d'entraînement désactivé. Je me contente de traduire à nouveau.",
+    de: "Übungspartner aus. Ich übersetze wieder nur.",
+    it: "Partner di pratica disattivato. Torno a tradurre soltanto.",
+    pt: "Parceiro de prática desligado. Volto a apenas traduzir.",
+    pl: "Partner do ćwiczeń wyłączony. Wracam do samego tłumaczenia.",
+  },
+
+  practice_has_partner: {
+    en: "You already have a partner, so I'll stay out of the way. This is for people using Capybara on their own.",
+    uk: "У тебе вже є партнер, тож я не втручатимусь. Це для тих, хто користується Capybara наодинці.",
+    es: "Ya tienes pareja, así que no me meto. Esto es para quien usa Capybara en solitario.",
+    fr: "Tu as déjà un partenaire, je te laisse donc tranquille. C'est pour ceux qui utilisent Capybara seuls.",
+    de: "Du hast schon einen Partner, also halte ich mich raus. Das ist für alle, die Capybara allein nutzen.",
+    it: "Hai già un partner, quindi resto da parte. Questo è per chi usa Capybara da solo.",
+    pt: "Já tens parceiro, por isso fico de fora. Isto é para quem usa o Capybara sozinho.",
+    pl: "Masz już partnera, więc się nie wtrącam. To dla osób korzystających z Capybary samodzielnie.",
+  },
+
+  practice_save_failed: {
+    en: "⚠️ Couldn't save that setting — please try again.",
+    uk: "⚠️ Не вдалося зберегти налаштування — спробуй ще раз.",
+    es: "⚠️ No se pudo guardar ese ajuste — inténtalo de nuevo.",
+    fr: "⚠️ Impossible d'enregistrer ce réglage — réessaie.",
+    de: "⚠️ Einstellung konnte nicht gespeichert werden — versuch es erneut.",
+    it: "⚠️ Impossibile salvare l'impostazione — riprova.",
+    pt: "⚠️ Não foi possível guardar essa definição — tenta de novo.",
+    pl: "⚠️ Nie udało się zapisać ustawienia — spróbuj ponownie.",
+  },
+
+  cmd_practice: {
+    en: "Chat with me to practise (solo users)",
+    uk: "Розмовляти зі мною для практики (соло)",
+    es: "Charla conmigo para practicar (en solitario)",
+    fr: "Discuter avec moi pour t'entraîner (solo)",
+    de: "Zum Üben mit mir chatten (allein)",
+    it: "Chiacchiera con me per esercitarti (da solo)",
+    pt: "Conversa comigo para praticar (a solo)",
+    pl: "Rozmawiaj ze mną, by ćwiczyć (solo)",
+  },
   cmd_delete_account: {
     en: "Delete the account and all its data (permanent)", uk: "Видалити акаунт і всі дані (назавжди)",
     es: "Borrar la cuenta y todos sus datos (permanente)", fr: "Supprimer le compte et toutes ses données (définitif)",
