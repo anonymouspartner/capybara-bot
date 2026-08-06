@@ -119,6 +119,28 @@ Deno.test("the webhook is kept wide enough to deliver button taps", () => {
   assert(/url\.searchParams\.has\("webhook"\)/.test(SRC), "readback must be exposed");
 });
 
+Deno.test("?commands reads the menu back, and does not publish the customer count", () => {
+  // A count of chat scopes IS the customer count, and this route is unauthenticated by
+  // necessity -- the deploy smoke test calls it before anything is signed in. Reporting
+  // per-chat menus here, as the single-tenant build does, would publish business
+  // information. That is the one place the two readbacks must differ.
+  assert(/url\.searchParams\.has\("commands"\)/.test(SRC), "readback must be exposed");
+  assert(/\$\{TELEGRAM_API\}\/getMyCommands/.test(SRC), "must ask Telegram, not report a flag");
+  assert(/sample: r\.commands\[0\]\?\.description/.test(SRC), "a count alone cannot show language");
+  assert(/await describe\("fallback"\);/.test(SRC), "fallback set checked on its own");
+  assert(!/perChatMenus/.test(SRC), "must not enumerate customer chat scopes");
+  // Scoped to the ?commands branch itself. tenantCount elsewhere is fine -- it is the
+  // long-standing ?seed check, deliberately opt-in and documented. What must not happen is
+  // the menu readback walking the users table to report a scope per customer.
+  const block = SRC.slice(
+    SRC.indexOf('url.searchParams.has("commands")'),
+    SRC.indexOf('url.searchParams.has("webhook")'),
+  );
+  assert(block.length > 0, "?commands block not found");
+  assert(!/\.from\("users"\)/.test(block), "menu readback must not enumerate users");
+  assert(!/tenantCount|count\(/.test(block), "menu readback must not report customer counts");
+});
+
 Deno.test("compose-box menu button is default, not pinned to commands", () => {
   assert(/menu_button: \{ type: "default" \}/.test(SRC), "should set default");
   assert(!/menu_button: \{ type: "commands" \}/.test(SRC), "should not force commands");

@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v29";
+const BUILD_VERSION = "saas-v30";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -410,6 +410,34 @@ Deno.serve(async (req) => {
     // onboarding wizard, i.e. every path a paying customer takes. Off the default probe
     // because it calls an external API and plain health must stay dependency-free.
     // The url is not reported: it carries the function path and teaches nothing here.
+    // Opt-in command-menu check (?commands): what Telegram holds for the fallback set and
+    // for each language. A count proves a list exists; only a sample line proves it is in
+    // the right language, which is the failure actually worth catching.
+    //
+    // Per-CHAT menus are deliberately NOT reported. This route is unauthenticated -- the
+    // deploy smoke test calls it before anything is signed in -- and on a paid product the
+    // number of chat scopes is the customer count. That is business information, and a
+    // health endpoint is not the place to publish it.
+    if (url.searchParams.has("commands")) {
+      const menus: Record<string, unknown> = {};
+      const describe = async (label: string, scope?: unknown, languageCode?: string) => {
+        const r = await getMyCommands(scope, languageCode);
+        menus[label] = r.ok
+          ? { count: r.commands.length, sample: r.commands[0]?.description ?? null }
+          : { error: r.error };
+      };
+      // No language_code = Telegram's fallback set, a distinct list rather than a synonym
+      // for English, so it is checked on its own.
+      await describe("fallback");
+      for (const lang of LANGS) {
+        if (lang === "en") continue;
+        await describe(lang, undefined, lang);
+      }
+      if (!Number.isNaN(SUPERADMIN_TELEGRAM_ID)) {
+        await describe("superadminChat", { type: "chat", chat_id: SUPERADMIN_TELEGRAM_ID });
+      }
+      body.commandMenu = menus;
+    }
     if (url.searchParams.has("webhook")) {
       const wh = await getWebhookInfo();
       body.webhook = wh
@@ -3177,6 +3205,31 @@ async function setChatMenuButtonToDefault(): Promise<boolean> {
 // onboarding wizard and the trial flow are inline keyboards, so a customer who has just
 // paid would tap and get nothing, with no error to report and nothing in the logs.
 const REQUIRED_UPDATES = ["message", "edited_message", "callback_query"];
+
+// Ask Telegram what it ACTUALLY holds. setMyCommands runs as background work, so a
+// failure leaves the webhook returning 200 and the request log clean -- "did the menu
+// register" is not answerable from inside the process. That matters more here than on the
+// single-tenant build: there are eight language sets, and a customer served the wrong one
+// has no way to tell you which of them is missing.
+async function getMyCommands(scope?: unknown, languageCode?: string): Promise<
+  { ok: true; commands: { command: string; description: string }[] } | { ok: false; error: string }
+> {
+  try {
+    const body: Record<string, unknown> = {};
+    if (scope) body.scope = scope;
+    if (languageCode) body.language_code = languageCode;
+    const resp = await fetch(`${TELEGRAM_API}/getMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok || !json?.ok) return { ok: false, error: `HTTP ${resp.status}${json?.description ? `: ${json.description}` : ""}` };
+    return { ok: true, commands: json.result ?? [] };
+  } catch (e) {
+    return { ok: false, error: (e as Error)?.message ?? String(e) };
+  }
+}
 
 async function getWebhookInfo(): Promise<any | null> {
   try {
