@@ -21,11 +21,46 @@ jobs:
         with:
           deno-version: v2.x
 
+      # esm.sh has 522'd three times in one afternoon, and a failed import fails the
+      # gate. Restoring DENO_DIR means a run only reaches the network when deno.lock
+      # changes, so a transient CDN outage no longer blocks a deploy. Integrity is still
+      # enforced -- deno.lock carries the hashes, so a poisoned cache is rejected rather
+      # than trusted.
+      - name: Cache Deno modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
       # predeploy-check.sh runs `deno check`, asserts the line-count floor, and
       # asserts every required code anchor is present.
       - name: Run pre-deploy sanity gate
-        run: bash ./predeploy-check.sh
+        run: bash ./predeploy-check.sh telegram-bot
+
+      # The multi-tenant fork is a separate deployable and must clear the same
+      # bar; without this it could ship as a stub with CI still green.
+      - name: Pre-deploy sanity gate (telegram-bot-saas)
+        run: bash ./predeploy-check.sh telegram-bot-saas
+
+      # The Stripe webhook is a third deployable. Its gate asserts that signature
+      # verification and the replay window are still present -- a billing endpoint that
+      # loses either one accepts forged subscription events.
+      - name: Pre-deploy sanity gate (stripe-billing)
+        run: bash ./predeploy-check.sh stripe-billing
 
       # Type-check the setup wizard too, so a broken setup.ts is caught here.
       - name: Type-check the setup wizard
         run: deno check setup.ts
+
+      # Behavioural guards the sanity gate cannot express: the string catalog renders in
+      # both languages, the "/" menu is keyed rather than hardcoded English, the admin
+      # callback gate still precedes the deploy button, and no localized handler has gone
+      # back to a bare string literal.
+      #
+      # These ran outside the repo until a container reset deleted every one of them at
+      # once, with the code they guarded still live. A test only one machine can run is a
+      # test that does not exist.
+      - name: Run the guard tests
+        run: deno test --allow-read tests/

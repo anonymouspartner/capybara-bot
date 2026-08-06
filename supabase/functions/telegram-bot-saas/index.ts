@@ -1,16 +1,125 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.108.1";
 import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.39.0";
+// Customer-facing copy in eight languages. A separate module because it is ~1,000
+// strings of prose: inline it would triple this file and bury the logic. Supabase
+// deploys the whole function directory, so an import ships identically.
 import { t, viewerLang, LANGS, type Lang } from "./strings.ts";
 
 const TELEGRAM_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY")!;
-const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
+const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v94";
-const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
+const BUILD_VERSION = "saas-v32";
+// This bot's @username, without the @. Used to build the partner invite deep link. The
+// bot cannot discover it reliably at boot (getMe would need a call on every cold start),
+// and onboarding degrades to "send them this code" if it is unset rather than failing.
+// Normalized and validated the same way stripe-billing does it -- both build t.me links
+// from this and they must agree, or the partner invite and the post-payment redirect
+// would point at different places. Accepts "@name", "name", or a full t.me URL; anything
+// that is not a legal Telegram username is treated as unset, which degrades onboarding to
+// "here is your code" rather than handing out a broken link.
+const BOT_USERNAME = (() => {
+  const raw = (Deno.env.get("TELEGRAM_BOT_USERNAME") ?? "").trim();
+  const name = raw
+    .replace(/^https?:\/\/(t\.me|telegram\.me)\//i, "")
+    .replace(/^@/, "")
+    .replace(/\/+$/, "");
+  if (!/^[A-Za-z0-9_]{5,32}$/.test(name)) {
+    if (raw) console.error(`TELEGRAM_BOT_USERNAME is not a valid Telegram username: ${JSON.stringify(raw)}`);
+    return "";
+  }
+  return name;
+})();
+// Used to mint Stripe customer-portal links for /billing, and to read the live price of
+// each plan for the intro message. Unset degrades /billing to a read-only summary and the
+// intro to its fallback prices, rather than breaking either.
+const STRIPE_SECRET_KEY = (Deno.env.get("STRIPE_SECRET_KEY") ?? "").trim();
+
+// --- The front door -----------------------------------------------------------------
+// Where a stranger who finds this bot on Telegram goes to subscribe. Until these were
+// added the bot could describe the product but not sell it: the only route in was a
+// Payment Link pasted by hand, so anyone who arrived on their own hit a dead end.
+//
+// Unset is a supported state, not a broken one -- the intro drops the buttons and says to
+// get in touch instead. A missing link must never render as a button that goes nowhere.
+const PAYMENT_LINK_STANDARD = (Deno.env.get("STRIPE_PAYMENT_LINK_STANDARD") ?? "").trim();
+const PAYMENT_LINK_ULTIMATE = (Deno.env.get("STRIPE_PAYMENT_LINK_ULTIMATE") ?? "").trim();
+// The same price ids stripe-billing maps to plans. Here they are read-only: the bot never
+// provisions anything, it just asks Stripe what each plan costs so the number a customer
+// reads is by construction the number their card is charged. A displayed price that
+// disagrees with the charged one is the one bug in this feature that costs trust rather
+// than money, and hardcoding the copy is how that happens.
+// .trim() is not defensive padding -- a trailing newline in this secret was observed on
+// the live project (QUOTA_ULTIMATE was stored as "2500\n"). Number() tolerates that, so
+// the quota was fine; an === comparison does not. planForPrice matches a Checkout
+// session's price id against these by identity, so one invisible newline means every
+// purchase of that plan is refused: the customer is charged and never provisioned, with
+// nothing in the UI to suggest why.
+const PRICE_ID_STANDARD = (Deno.env.get("STRIPE_PRICE_STANDARD") ?? "").trim();
+const PRICE_ID_ULTIMATE = (Deno.env.get("STRIPE_PRICE_ULTIMATE") ?? "").trim();
+
+// Shown only when Stripe cannot be reached. Deliberately vague rather than a precise
+// wrong number: "from $15" that turns out to be $19 reads as a bait and switch, where an
+// approximate figure reads as an approximation.
+const PLAN_FALLBACK: Record<PlanKey, string> = {
+  standard: "see link for price",
+  ultimate: "see link for price",
+};
+
+// Quotas quoted in the intro. Read from the SAME secrets, with the same defaults, as
+// stripe-billing's QUOTA_STANDARD / QUOTA_ULTIMATE -- which is what actually writes
+// tenants.message_quota at provisioning.
+//
+// Hardcoding these would mean setting QUOTA_STANDARD to 1000 makes the bot advertise 750
+// while provisioning 1000: a number a customer reads that isn't the number they get. That
+// is the same failure the live Stripe price lookup exists to prevent, and there is no
+// reason to fix it for price and not for quota. Both functions must be given the secret,
+// and both must be redeployed when it changes.
+const PLAN_QUOTA: Record<PlanKey, number> = {
+  standard: Number(Deno.env.get("QUOTA_STANDARD") ?? 750),
+  ultimate: Number(Deno.env.get("QUOTA_ULTIMATE") ?? 2500),
+};
+
+type PlanKey = "standard" | "ultimate";
+
+// Annotation depth is what separates the plans.
+//
+// Every message has two annotatable sides: the text a human wrote, and the bot's
+// translation of it. Annotating both doubles the flashcards and very nearly doubles the
+// cost, since annotation is ~83% of API spend -- roughly $0.007 a message against $0.012.
+//
+//   Standard  -> the human-written side only
+//   Ultimate  -> both sides
+//
+// This started life as a cost cut (the single-tenant bot dropped the machine side in v84)
+// and became the product axis because the pricing forced the question. At $0.012 a
+// Standard subscriber at their 750 cap cost $9.00 of inference, pinning the break-even
+// floor near $9.58 and making any price under $12 a loss on heavy users -- a 60% cost
+// ratio. Rather than discount into that, the plans now differ by something a customer can
+// understand and that tracks what it actually costs to serve them.
+//
+// The half Standard gives up is the one sourced from Claude's output rather than a
+// partner's actual writing, and it is where a wrong-sense card is most likely, since it
+// re-analyses text that was itself generated under sense pressure. Measured on a real
+// corpus, what remains is 53% of Ukrainian and 48% of English card supply.
+//
+// backfill_pending_sides (migrations-saas/20260727000200) applies the SAME rule, reading
+// the plan off the tenant row. If these two ever disagree the distinction is fiction: the
+// grind would quietly annotate what the live path declined to.
+function annotatesBothSides(plan: string | null | undefined): boolean {
+  return plan === "ultimate";
+}
+
+// How much a stranger gets before the wall, and the ceiling across every stranger per day.
+// Passed into consume_trial_message so these constants stay the single source of truth
+// rather than being duplicated in SQL.
+const TRIAL_MESSAGE_LIMIT = 5;
+const TRIAL_DAILY_CAP = 500;
+// One trial message must not be able to be a novel. Applied before any model call.
+const TRIAL_MAX_CHARS = 500;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
@@ -47,24 +156,33 @@ const MODEL_RATES: Record<string, { input: number; output: number }> = {
   "claude-haiku-4-5-20251001": { input: 1, output: 5 },
 };
 
-const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));
+// The OPERATOR -- the person who runs the service, not a customer. On the single-tenant
+// build "admin" and "the couple who owns the instance" were the same person, so one
+// Telegram id covered both. Here they are different roles entirely: every tenant has
+// members, and exactly one person across the whole instance may deploy builds, run the
+// API-spend grinds, or read instance-wide diagnostics.
+//
+// Reads SUPERADMIN_TELEGRAM_ID, falling back to the single-tenant build's
+// ADMIN_TELEGRAM_ID so an existing deployment keeps working without re-setting secrets.
+const SUPERADMIN_TELEGRAM_ID = Number(
+  Deno.env.get("SUPERADMIN_TELEGRAM_ID") ?? Deno.env.get("ADMIN_TELEGRAM_ID"),
+);
 
-// --- /update (self-deploy) config; all optional. The feature is INERT unless these
-// are set as function secrets: with none, /update is unavailable to deploy and only
-// reports version status. GITHUB_REPO alone enables the version check (a public repo's
-// raw file needs no token); a deploy button additionally needs GITHUB_DEPLOY_TOKEN.
-// GITHUB_DEPLOY_TOKEN is named to avoid colliding with Actions' built-in GITHUB_TOKEN.
-const GITHUB_DEPLOY_TOKEN = Deno.env.get("GITHUB_DEPLOY_TOKEN") ?? "";
-const GITHUB_REPO = Deno.env.get("GITHUB_REPO") ?? ""; // "owner/name"
-const GITHUB_DEPLOY_BRANCH = Deno.env.get("GITHUB_DEPLOY_BRANCH") ?? "main";
-const GITHUB_DEPLOY_WORKFLOW = "deploy.yml";
-// This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
-// (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
-// deploys to THIS couple's project — not whatever single project the repo's default
-// SUPABASE_PROJECT_REF secret points at. Lets several couples share one repo + token.
-const SELF_PROJECT_REF = (() => {
-  try { return new URL(SUPABASE_URL).hostname.split(".")[0]; } catch { return ""; }
-})();
+// Tenant membership needs no check of its own: a user row carries its tenant_id, and
+// every query goes through tenantDb, so a member can only ever reach their own couple's
+// data. What still needs an explicit gate is the operator-only surface below.
+function isSuperadmin(telegramId: number | undefined): boolean {
+  return !Number.isNaN(SUPERADMIN_TELEGRAM_ID) && telegramId === SUPERADMIN_TELEGRAM_ID;
+}
+
+// Uniform denial. Deliberately says nothing about whether the command exists or what
+// would make it work -- a customer probing operator commands learns nothing.
+async function denyUnlessSuperadmin(msg: any): Promise<boolean> {
+  if (isSuperadmin(msg.from?.id)) return false;
+  await sendMessage(msg.chat.id, "Not authorized.");
+  return true;
+}
+
 
 // /backfill runs as a time-boxed background grind: each tap annotates pending sides in
 // small concurrent waves until the backlog is empty or the budget is hit (kept under the
@@ -142,8 +260,79 @@ const RECAP_PIN_BOOST = 0.005;
 const RECAP_CANDIDATE_POOL = 50;
 const RECAP_BACKFILL_BATCH_SIZE = 50;
 
-const supabase = createClient(SUPABASE_URL, SERVICE_ROLE);
+// The raw, UNSCOPED client. It sees every tenant's rows, so it is deliberately not
+// named `supabase` -- in the single-tenant build that name was on every query, and
+// keeping it would let a copy-pasted line silently read the whole instance. Reach for
+// this only where crossing the tenant boundary is the actual intent (resolving an
+// incoming Telegram id to a tenant, superadmin totals, the media-group orphan sweep);
+// every such use is commented with why. Everything else goes through tenantDb().
+const dbAdmin = createClient(SUPABASE_URL, SERVICE_ROLE);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+
+// A tenant-scoped view of the database: reads get `.eq("tenant_id", …)`, writes get
+// tenant_id stamped into the payload, and RPCs get p_tenant_id prepended.
+//
+// This is the whole point of the phase-2 refactor. Scoping by hand means every one of
+// ~50 call sites has to remember a filter, and the failure mode of forgetting is silent
+// -- one couple reading another's messages, with no error to notice. Here the filter is
+// structural: a scoped call cannot omit it, and an unscoped call has to name dbAdmin.
+type TenantDb = ReturnType<typeof tenantDb>;
+function tenantDb(tenantId: string) {
+  if (!tenantId) throw new Error("tenantDb: called without a tenant id");
+  const stamp = (rows: any) =>
+    Array.isArray(rows)
+      ? rows.map((r) => ({ ...r, tenant_id: tenantId }))
+      : { ...rows, tenant_id: tenantId };
+  return {
+    tenantId,
+    // Both type parameters are load-bearing, not decoration. supabase-js computes a
+    // query's row type from the table name and the column string as LITERAL types; widen
+    // either to plain `string` and GetResult degrades to GenericStringError, so every
+    // downstream property access (`partner.telegram_id`, `row.original_text`) stops
+    // compiling. Forwarding T and Q keeps the literals intact through the wrapper, so
+    // scoped queries infer exactly what the unscoped ones did.
+    from<T extends string>(table: T) {
+      return {
+        select: <Q extends string = "*">(columns?: Q, options?: { count?: "exact" | "planned" | "estimated"; head?: boolean }) =>
+          dbAdmin.from(table).select(columns, options).eq("tenant_id", tenantId),
+        // Stamped rather than filtered: the caller's payload never carries tenant_id, so
+        // the column is set here or the NOT NULL constraint rejects the insert.
+        insert: (rows: any) => dbAdmin.from(table).insert(stamp(rows)),
+        upsert: (rows: any, opts?: any) => dbAdmin.from(table).upsert(stamp(rows), opts),
+        update: (patch: any) => dbAdmin.from(table).update(patch).eq("tenant_id", tenantId),
+        delete: () => dbAdmin.from(table).delete().eq("tenant_id", tenantId),
+      };
+    },
+    // Every tenant-scoped SQL function takes p_tenant_id first (migrations-saas
+    // 20260726000100/200). Spreading the caller's args after it means a caller cannot
+    // accidentally override the tenant with its own p_tenant_id key.
+    rpc: (fn: string, args: Record<string, unknown> = {}) =>
+      dbAdmin.rpc(fn, { ...args, p_tenant_id: tenantId }),
+    // Storage is pathed per tenant by the caller; the bucket itself is shared.
+    storage: dbAdmin.storage,
+  };
+}
+
+// Each tenant owns exactly one conversation. The single-tenant build could hardcode its
+// id (DEFAULT_CONVERSATION_ID, the seeded all-zeros-but-one uuid) because there was only
+// ever one; here it has to be looked up, and every message insert needs it, so the
+// result is memoized per tenant for the life of the warm instance. Conversations are
+// created once at onboarding and never renamed or replaced, so the entry cannot go
+// stale -- and a cold start simply re-reads it.
+const conversationIdCache = new Map<string, string>();
+async function conversationIdFor(db: TenantDb): Promise<string> {
+  const cached = conversationIdCache.get(db.tenantId);
+  if (cached) return cached;
+  const { data, error } = await db.from("conversations").select("id")
+    .order("created_at", { ascending: true }).limit(1).maybeSingle();
+  if (error) throw new Error(`conversationIdFor: read failed: ${error.message}`);
+  // Throw rather than invent one. A tenant with no conversation is a broken onboarding,
+  // and inserting a message against a fabricated id would violate the FK anyway --
+  // failing here names the real problem instead of surfacing a constraint error.
+  if (!data?.id) throw new Error(`conversationIdFor: tenant ${db.tenantId} has no conversation row`);
+  conversationIdCache.set(db.tenantId, data.id);
+  return data.id;
+}
 
 declare const EdgeRuntime: { waitUntil: (p: Promise<unknown>) => void };
 
@@ -177,35 +366,58 @@ Deno.serve(async (req) => {
     const body: Record<string, unknown> = {
       status: "ok",
       version: BUILD_VERSION,
-      adminConfigured: !Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID),
+      adminConfigured: !Number.isNaN(SUPERADMIN_TELEGRAM_ID),
+      // The front door. Reported, NOT asserted by the deploy smoke test -- these are
+      // launch configuration rather than things the bot needs to serve existing
+      // customers, and a hard assertion would fail every deploy until Stripe is wired
+      // up. Both false means a stranger gets the intro with no way to buy.
+      paymentLinksConfigured: Boolean(PAYMENT_LINK_STANDARD) && Boolean(PAYMENT_LINK_ULTIMATE),
+      // False means the intro falls back to vague price copy rather than live amounts.
+      pricesConfigured: Boolean(STRIPE_SECRET_KEY) && Boolean(PRICE_ID_STANDARD) && Boolean(PRICE_ID_ULTIMATE),
+      // The quotas this build ADVERTISES. stripe-billing reports the ones it PROVISIONS
+      // from the same secrets; if the two disagree, one of the functions is running an
+      // older deploy and customers are being told a number they will not get.
+      quotaStandard: PLAN_QUOTA.standard,
+      quotaUltimate: PLAN_QUOTA.ultimate,
     };
-    // Opt-in seed check (?seed): a read-only users count so a post-deploy smoke
-    // test can catch an UNSEEDED instance — an empty users table makes every
-    // sender see "not registered" even though the function is healthy. Kept off
-    // the default probe so plain health stays DB-free and doesn't go red when
-    // the DB is briefly unreachable. seeded is null if the count couldn't run.
+    // Opt-in seed check (?seed): a read-only count so a post-deploy smoke test can
+    // catch an instance that cannot serve anyone. Kept off the default probe so plain
+    // health stays DB-free and doesn't go red when the DB is briefly unreachable.
+    // seeded is null if the count couldn't run.
+    //
+    // Counts TENANTS, not users. On the single-tenant build an empty users table meant
+    // an unprovisioned instance; here users arrive through self-serve onboarding, so a
+    // healthy multi-tenant instance legitimately has zero of them on day one. Tenants
+    // are what must exist for the bot to have anything to serve.
+    //
+    // Unscoped by nature -- an instance-wide total has no tenant to belong to.
     if (url.searchParams.has("seed")) {
       try {
-        const { count, error } = await supabase
-          .from("users")
+        const { count, error } = await dbAdmin
+          .from("tenants")
           .select("*", { count: "exact", head: true });
         if (error) throw error;
-        body.userCount = count ?? 0;
+        body.tenantCount = count ?? 0;
         body.seeded = (count ?? 0) > 0;
       } catch (e) {
         body.seeded = null;
         body.seedCheckError = (e as Error)?.message ?? String(e);
       }
     }
-    // Opt-in command-menu check (?commands). Reads the menu BACK from Telegram for each
-    // language, plus the admin's chat-scoped list, so "did the Ukrainian menu register"
-    // is a URL rather than an inference. Off the default probe for the same reason ?seed
-    // is: it calls an external API, and plain health must stay dependency-free so it
-    // reports function-up even when an upstream is down.
+    // Opt-in webhook check (?webhook). Whether Telegram will DELIVER a button tap at all
+    // is invisible from inside -- no error, no request, nothing to log -- so it has to be
+    // read back. On this build a delivery gap silently breaks the plan picker and the
+    // onboarding wizard, i.e. every path a paying customer takes. Off the default probe
+    // because it calls an external API and plain health must stay dependency-free.
+    // The url is not reported: it carries the function path and teaches nothing here.
+    // Opt-in command-menu check (?commands): what Telegram holds for the fallback set and
+    // for each language. A count proves a list exists; only a sample line proves it is in
+    // the right language, which is the failure actually worth catching.
     //
-    // Each entry carries a SAMPLE description, not just a count. A count proves a list
-    // exists; only reading one line proves it is in the right language -- and a list in
-    // the wrong language is exactly the failure this was added to catch.
+    // Per-CHAT menus are deliberately NOT reported. This route is unauthenticated -- the
+    // deploy smoke test calls it before anything is signed in -- and on a paid product the
+    // number of chat scopes is the customer count. That is business information, and a
+    // health endpoint is not the place to publish it.
     if (url.searchParams.has("commands")) {
       const menus: Record<string, unknown> = {};
       const describe = async (label: string, scope?: unknown, languageCode?: string) => {
@@ -214,56 +426,29 @@ Deno.serve(async (req) => {
           ? { count: r.commands.length, sample: r.commands[0]?.description ?? null }
           : { error: r.error };
       };
-      // No language_code = Telegram's fallback set, served to every app language that
-      // has no set of its own. It is a distinct list from any language's, not a synonym
+      // No language_code = Telegram's fallback set, a distinct list rather than a synonym
       // for English, so it is checked on its own.
       await describe("fallback");
       for (const lang of LANGS) {
         if (lang === "en") continue;
         await describe(lang, undefined, lang);
       }
-      if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
-        await describe("adminChat", { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
+      if (!Number.isNaN(SUPERADMIN_TELEGRAM_ID)) {
+        await describe("superadminChat", { type: "chat", chat_id: SUPERADMIN_TELEGRAM_ID });
       }
       body.commandMenu = menus;
-
-      // Whether Telegram will even DELIVER a button tap. A narrow allowed_updates is
-      // invisible from inside the bot -- no error, no request, nothing to log -- so it
-      // has to be read back from Telegram like the command menu is. The url is not
-      // reported: it carries the function path and there is nothing to learn from it here.
+    }
+    if (url.searchParams.has("webhook")) {
       const wh = await getWebhookInfo();
       body.webhook = wh
         ? {
-            allowedUpdates: wh.allowed_updates ?? [],   // [] means Telegram's default: all types
+            allowedUpdates: wh.allowed_updates ?? [],
             deliversCallbacks: (wh.allowed_updates ?? []).length === 0 ||
               (wh.allowed_updates ?? []).includes("callback_query"),
             pendingUpdateCount: wh.pending_update_count ?? 0,
             lastErrorMessage: wh.last_error_message ?? null,
           }
         : null;
-
-      // The chat-scoped lists are the ones that actually decide what each partner sees,
-      // so reporting only the default sets would answer the wrong question.
-      //
-      // Deliberately identity-free: no telegram_id, no display name. This route is
-      // UNAUTHENTICATED -- it has to be, the deploy smoke test calls it before anything
-      // is signed in -- so it must not become a way to enumerate who is on the instance.
-      // A language and a sample line prove the menu landed without naming anyone.
-      try {
-        const { data: us } = await supabase.from("users").select("telegram_id, native_language");
-        const perChat: unknown[] = [];
-        for (const u of (us ?? []) as any[]) {
-          if (!u.telegram_id) continue;
-          const r = await getMyCommands({ type: "chat", chat_id: u.telegram_id });
-          perChat.push(r.ok
-            ? { lang: viewerLang(undefined, u), count: r.commands.length, sample: r.commands[0]?.description ?? null }
-            : { lang: viewerLang(undefined, u), error: r.error });
-        }
-        body.perChatMenus = perChat;
-      } catch (e) {
-        body.perChatMenus = null;
-        body.perChatError = (e as Error)?.message ?? String(e);
-      }
     }
     return new Response(
       JSON.stringify(body),
@@ -299,53 +484,174 @@ function isCmd(text: string, ...names: string[]): boolean {
 async function handleUpdate(update: any) {
   // Populate the "/" command menu on first use per warm instance (background, idempotent).
   scheduleBackgroundWork("ensureCommandsRegistered", ensureCommandsRegistered());
-  // Inline-button taps (e.g. the /update deploy button) arrive as callback_query,
-  // not message. Auth is by callback_query.from.id, so this is handled before the
-  // users-table lookup below.
+  // Inline-button taps (onboarding, account deletion) arrive as callback_query, not
+  // message, and come from senders who may not be in the users table yet -- so they are
+  // routed before the lookup below rather than after it.
   if (update.callback_query) { await handleCallbackQuery(update.callback_query); return; }
   const msg = update.message;
   if (!msg) return;
   const user = await lookupUser(msg.from);
+  if (user) scheduleBackgroundWork("setChatMenuForUser", setChatMenuForUser(user));
   if (!user) {
-    // No user row yet, so Telegram's own language_code is the only signal there is --
-    // which is exactly the case viewerLang's second rung exists for.
-    await sendMessage(msg.chat.id, t(viewerLang(msg.from), "not_registered", { id: msg.from.id }));
+    // Not a member of any tenant. The single-tenant build's answer here was "ask the
+    // owner to add your id", which assumed a human operator doing manual seeding. The
+    // only way in now is a paid pairing code, so the one thing worth checking is whether
+    // they are arriving with one.
+    const startPayload = parseStartPayload(msg.text ?? "");
+    if (startPayload) { await beginOnboarding(msg, startPayload); return; }
+
+    // A bare /start, or /plans, is someone arriving cold: pitch, then let them try it or
+    // buy it. Previously this branch described the product and then dead-ended, telling
+    // them they'd get a link "once you've subscribed" without ever saying how to.
+    // isCmd rather than an equality test: it also matches "/start@thebot", which Telegram
+    // sends in groups and a person can type anywhere. A bare compare misses it, and the
+    // miss is not harmless -- the text falls through to the trial path and "/start@thebot"
+    // gets translated. Any /start still here has already failed parseStartPayload above,
+    // so a malformed setup code lands on the intro rather than being translated too.
+    const cmd = (msg.text ?? "").trim();
+
+    // /promo <code>. Deliberately NOT advertised in the intro or the "/" menu: a visible
+    // promo box invites code-hunting and teaches everyone that the list price is optional.
+    // It is here for people who were handed a code, and it turns "find the promotion field
+    // at checkout" into a link that already has the discount on it.
+    if (isCmd(cmd, "promo", "code")) {
+      const lang = viewerLang(msg.from);
+      const arg = cmd.replace(/^\/(promo|code)(@\S+)?\s*/, "").trim();
+      if (!arg) {
+        await sendMessage(msg.chat.id, t(lang, "promo_usage"), "HTML");
+        return;
+      }
+      if (!looksLikePromoCode(arg)) {
+        await sendMessage(msg.chat.id, t(lang, "promo_bad_shape"), "HTML");
+        return;
+      }
+      const withCode = await plansMessage(lang, t(lang, "promo_applied", { code: escapeHtml(arg) }), arg);
+      await sendMessage(msg.chat.id, withCode.text, "HTML", withCode.keyboard);
+      return;
+    }
+
+    if (isCmd(cmd, "start", "plans", "subscribe", "pricing")) {
+      // Nothing is known about this person yet, so the language comes from Telegram's own
+      // UI setting. That is the whole point: a Ukrainian speaker's very first screen is in
+      // Ukrainian, before they have told the bot anything.
+      const lang = viewerLang(msg.from);
+      const intro = isCmd(cmd, "start") ? await introMessage(lang) : await plansMessage(lang);
+      await sendMessage(msg.chat.id, intro.text, "HTML", intro.keyboard);
+      return;
+    }
+    // Anything else from a stranger is a trial attempt. handleTrialMessage does its own
+    // gating and answers with the intro if they haven't picked a language pair yet.
+    await handleTrialMessage(msg);
     return;
+  }
+  // Everything past this point is scoped to the sender's tenant. lookupUser is the only
+  // read that crosses the boundary; from here the tenant is known and fixed for the rest
+  // of the update.
+  const db = tenantDb(user.tenant_id);
+
+  // A second /start with a code, from someone already registered. Almost always the
+  // owner re-opening their own link; answering plainly beats treating it as a command.
+  const restart = parseStartPayload(msg.text ?? "");
+  if (restart) {
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "ob_already_setup"));
+    return;
+  }
+
+  // Subscription + quota gate. Runs before anything that costs money, and before the
+  // command table, so a lapsed tenant can still reach /billing to fix it.
+  //
+  // Placed on the update rather than on individual handlers deliberately: the expensive
+  // paths (translate, annotate, /recap synthesis, Whisper) are spread across a dozen
+  // handlers, and a gate that has to be remembered in each of them is a gate that will
+  // eventually be forgotten in one.
+  // The exempt list is every command a customer might need precisely BECAUSE they are
+  // blocked -- billing and its aliases must stay reachable when the subscription has
+  // lapsed or the allowance is spent, or the way out is behind the wall it opens.
+  //
+  // It also covers the commands that cost nothing to serve. A message is the billable
+  // unit because a message means a translation plus an annotation pass; /help and /vocab
+  // are pure database reads with no model call behind them, and charging an allowance
+  // for them bills the customer for our disk. The people who pay that tax are the ones
+  // who just subscribed and are still finding their way around -- exactly the wrong
+  // ones. /recap and /note are NOT here: /recap synthesises and /note classifies then
+  // embeds, so both genuinely spend.
+  if (!isSuperadmin(msg.from?.id) &&
+      !isCmd(msg.text ?? "", "management", "billing", "plans", "subscribe", "pricing", "promo", "code", "delete_account", "export", "mistakes",
+             "leave", "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned",
+             // Turning practice OFF must work at the cap -- otherwise the setting that is
+             // spending the allowance is the one you cannot reach to stop.
+             "practice",
+             // Printing a list of commands is a pure read; billing a message for it
+             // charges the customer for our own menu.
+             "education", "study", "memory")) {
+    const verdict = await consumeQuota(user.tenant_id);
+    if (!verdict.allowed) {
+      await sendMessage(msg.chat.id, quotaRefusalText(viewerLang(msg.from, user), verdict), "HTML");
+      return;
+    }
+    // The gate already read the tenant row under lock, so the plan came back with the
+    // verdict for free. Annotation depth is per-plan and the handlers that schedule it
+    // are several frames down, so it rides on the user object for the rest of this
+    // update rather than being fetched again in each of them.
+    user.plan = verdict.plan;
+    // One heads-up as they approach the cap, so the first they hear of it isn't a
+    // refusal. Fires on the single crossing message, not on every one after it.
+    if (verdict.quota && verdict.used === Math.floor(verdict.quota * 0.9)) {
+      await sendMessage(msg.chat.id,
+        t(viewerLang(msg.from, user), "quota_heads_up", { used: verdict.used, quota: verdict.quota }));
+    }
+  } else {
+    // Gate skipped: the superadmin, a command that must work while blocked, or one that
+    // costs nothing to serve. The plan still has to be right -- otherwise the operator's
+    // own tenant would silently be annotated at Standard depth no matter what they pay
+    // for, which is exactly the account used to test that Ultimate looks different.
+    //
+    // Note this also means a lapsed tenant keeps read access to the study data it already
+    // built -- /vocab, /learn, /pinned. That matches /export, which was always exempt for
+    // the same reason: refusing someone their own corpus is a hostage tactic, not a
+    // subscription gate, and it costs nothing to keep serving.
+    const { data: t } = await dbAdmin.from("tenants").select("plan").eq("id", user.tenant_id).maybeSingle();
+    user.plan = t?.plan ?? null;
   }
   // Command dispatch table — to add a command, append one entry here.
   type Cmd = { match: (t: string) => boolean; handle: (m: any, u: any) => Promise<void> };
   const COMMANDS: Cmd[] = [
     { match: t => t === "/start", handle: async (m, u) => {
         const lang = viewerLang(m.from, u);
-        const solo = !(await lookupPartner(u.id));
-        await sendMessage(m.chat.id, [
+        const solo = !(await lookupPartner(db, u.id));
+        await sendMessage(m.chat.id,
           t(lang, "start_greeting", {
-            name: escapeHtml(u.display_name),
+            name: u.display_name,
             a: langLabel(u.native_language),
             b: langLabel(u.learning_language),
-          }),
-          "",
-          t(lang, solo ? "start_media_solo" : "start_media_pair"),
-          "",
-          t(lang, solo ? "start_tail_solo" : "start_tail_pair"),
-        ].join("\n"), "HTML"); } },
+          }) + "\n\n" +
+          t(lang, solo ? "start_media_solo" : "start_media_partner") + "\n\n" +
+          t(lang, solo ? "start_tail_solo" : "start_tail_partner")); } },
+    // /plans is in the public menu for strangers, so it is visible to customers too.
+    // Without an entry here it would fall through to the media handlers below and get
+    // TRANSLATED and forwarded to their partner, costing them a quota message. For
+    // someone who already subscribes, "plans and pricing" is what /billing answers.
+    { match: t => isCmd(t, "management", "billing", "plans", "subscribe", "pricing"),   handle: handleManagement },
+    { match: t => isCmd(t, "promo", "code"),                                            handle: handlePromo },
+    { match: t => isCmd(t, "delete_account"),                                           handle: handleDeleteAccount },
+    { match: t => isCmd(t, "leave"),                                                    handle: handleLeave },
+    { match: t => isCmd(t, "education", "study"),                                        handle: handleEducation },
+    { match: t => isCmd(t, "memory"),                                                    handle: handleMemory },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
-    { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
+    { match: t => isCmd(t, "export"),                                                   handle: handleExport },
     { match: t => isCmd(t, "mistakes"),                                                 handle: handleMistakes },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
+    { match: t => t === "/practice" || t.startsWith("/practice ") || t.startsWith("/practice@"), handle: handlePractice },
     { match: t => isCmd(t, "backfill_grammar"),                                          handle: handleBackfillGrammar },
     { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
-    { match: t => isCmd(t, "education", "study"),                                       handle: handleEducation },
-    { match: t => isCmd(t, "memory"),                                                    handle: handleMemory },
-    { match: t => isCmd(t, "management"),                                               handle: handleManagement },
+    { match: t => isCmd(t, "tenants"),                                                  handle: handleTenants },
     { match: t => t === "/diag",                                                         handle: handleDiag },
-    { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
     { match: t => t === "/reconcile" || t.startsWith("/reconcile@"),                    handle: handleReconcile },
     { match: t => t === "/restore" || t.startsWith("/restore@"),                        handle: handleRestore },
     { match: t => t === "/pin" || t.startsWith("/pin@"),                                handle: handlePin },
@@ -379,6 +685,1379 @@ async function handleUpdate(update: any) {
   else { await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unsupported_media")); }
 }
 
+// ---------------------------------------------------------------------------- Billing gate
+//
+// A tenant's entitlement is one atomic question -- is the subscription live, has the
+// period rolled, is there budget left, and claim one unit if so -- answered by
+// consume_message_quota (migrations-saas/20260726000400). Doing it in SQL rather than as
+// a read-then-write here is what stops two messages arriving together from both seeing
+// the last unit as available.
+//
+// Counted per INBOUND MESSAGE, not per API call. One message triggers a translation and
+// two annotation passes, so per-call accounting would be both harder to explain on an
+// invoice and easy to drift from the code as call sites change.
+
+type QuotaVerdict = {
+  allowed: boolean;
+  reason: string;
+  used: number;
+  quota: number | null;
+  periodEnd: string | null;
+  // The tenant's plan, carried out of the gate so the caller can pick annotation depth
+  // without a second read. Null when the gate could not read it (an RPC error, or a
+  // superadmin bypassing the gate entirely), which annotationDepth treats as Standard --
+  // the cheaper of the two, so an unknown plan never bills for what it did not sell.
+  plan: string | null;
+};
+
+async function consumeQuota(tenantId: string): Promise<QuotaVerdict> {
+  const { data, error } = await dbAdmin.rpc("consume_message_quota", { p_tenant_id: tenantId });
+  if (error) {
+    // Fail OPEN. A database blip must not look to a paying customer like a billing
+    // problem, and the downside is bounded -- a handful of messages past the cap during
+    // an outage, versus telling everyone their subscription is broken.
+    console.error("consume_message_quota failed; allowing message:", error);
+    return { allowed: true, reason: "rpc_error", used: 0, quota: null, periodEnd: null, plan: null };
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    allowed: Boolean(row?.allowed),
+    reason: row?.reason ?? "unknown",
+    used: row?.used ?? 0,
+    quota: row?.quota ?? null,
+    periodEnd: row?.period_end ?? null,
+    plan: row?.plan ?? null,
+  };
+}
+
+function quotaRefusalText(lang: Lang, v: QuotaVerdict): string {
+  if (v.reason === "quota_exceeded") {
+    // Date formatted in the reader's locale rather than always en-GB: "26 серпня" beats
+    // "26 August" for the person being told when their allowance comes back.
+    const resumes = v.periodEnd
+      ? t(lang, "quota_resets_on", {
+          date: new Date(v.periodEnd).toLocaleDateString(lang, { day: "numeric", month: "long" }),
+        })
+      : "";
+    return t(lang, "quota_exceeded", { quota: v.quota, resumes });
+  }
+  if (v.reason === "inactive_subscription") return t(lang, "quota_inactive");
+  return t(lang, "quota_unverifiable");
+}
+
+
+// ---------------------------------------------------------------------------- Onboarding
+//
+// Replaces seed_couple.sql. Provisioning a couple used to mean collecting two Telegram
+// ids by hand, editing a SQL file and running it in the dashboard; here the couple does
+// it themselves in the chat, immediately after paying.
+//
+// The wizard is STATELESS. Each question is an inline keyboard whose buttons carry every
+// answer chosen so far in their callback_data, so the next tap arrives with the full
+// picture and nothing has to be remembered between updates. That matters more than it
+// might look: edge functions are per-invocation, so any in-memory state would be lost
+// between taps, and a table of half-finished signups would need its own expiry and
+// cleanup. Telegram's 64-byte callback_data budget is the constraint, and the longest
+// payload here ("ob|g|" + 12-char code + two language codes + a gender) is about 30.
+//
+// The one thing not asked is the display name, which comes from the Telegram profile.
+// A free-text answer is the only kind that cannot be a button, and it would have forced
+// exactly the state-machine this design avoids -- for a field the user can already see
+// and rarely wants to change.
+//
+// Every step re-validates the pairing code against the database rather than trusting the
+// callback payload. callback_data is client-supplied: without that check, anyone could
+// hand-craft a tap carrying a tenant id and add themselves to a stranger's subscription.
+
+// The two gender buttons, labelled in the reader's language. Built rather than declared
+// because the LABEL is localized while the CODE stored in the database must not be --
+// tenants.gender is 'female'/'male' regardless of what the button said.
+// The codes written to users.gender. Deliberately separate from the button labels: the
+// label is copy and changes per language, the code is data and must never.
+const GENDER_CODES = ["female", "male"] as const;
+
+function genderKeyboardRow(lang: Lang, data: (code: string) => string) {
+  return [
+    { text: t(lang, "ob_gender_she"), callback_data: data("female") },
+    { text: t(lang, "ob_gender_he"), callback_data: data("male") },
+  ];
+}
+
+// --- The front door: intro, live prices, free trial ---------------------------------
+//
+// Everything below runs for senders with NO tenant -- people who have not paid and may
+// never. It is the only place in this build where an unauthenticated stranger can cause
+// API spend, so the trial path is gated by consume_trial_message before any model call
+// and by the cheap local checks (private chat, text only, length) before even that.
+//
+// Trial text is translated and DISCARDED. Nothing a stranger sends is written to
+// public.messages: there is no tenant to own it, a null tenant_id would break the orphan
+// check in LAUNCH_SAAS.md step 7, and storing strangers' private messages is a liability
+// with no upside. Only counters and the chosen language pair persist.
+
+// Live prices, read from Stripe so the number a customer reads is by construction the
+// number their card is charged. Cached at module scope: Supabase keeps an isolate warm
+// between invocations, so this is roughly one Stripe call per cold start rather than one
+// per curious stranger. A failure is not an error path worth surfacing -- the intro still
+// renders, with vaguer copy.
+type PriceCache = { text: Record<PlanKey, string>; fetchedAt: number };
+const PRICE_TTL_MS = 10 * 60 * 1000;
+let priceCache: PriceCache | null = null;
+
+function formatStripeAmount(unitAmount: number, currency: string): string {
+  const symbol = { usd: "$", eur: "€", gbp: "£" }[currency?.toLowerCase()] ?? "";
+  const major = unitAmount / 100;
+  // Stripe amounts are integer minor units; show cents only when they are non-zero, so
+  // $15 reads as "$15/mo" rather than "$15.00/mo".
+  const shown = Number.isInteger(major) ? String(major) : major.toFixed(2);
+  return symbol ? `${symbol}${shown}/mo` : `${shown} ${currency?.toUpperCase()}/mo`;
+}
+
+async function stripePriceText(): Promise<Record<PlanKey, string>> {
+  if (priceCache && Date.now() - priceCache.fetchedAt < PRICE_TTL_MS) return priceCache.text;
+  const text: Record<PlanKey, string> = { ...PLAN_FALLBACK };
+  const wanted: [PlanKey, string][] = [["standard", PRICE_ID_STANDARD], ["ultimate", PRICE_ID_ULTIMATE]];
+  for (const [plan, id] of wanted) {
+    if (!STRIPE_SECRET_KEY || !id) continue;
+    try {
+      const resp = await fetch(`https://api.stripe.com/v1/prices/${encodeURIComponent(id)}`, {
+        headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}`, "Stripe-Version": "2024-06-20" },
+      });
+      if (!resp.ok) { console.error(`stripe price ${plan} lookup failed: ${resp.status}`); continue; }
+      const body = await resp.json();
+      if (typeof body?.unit_amount === "number") text[plan] = formatStripeAmount(body.unit_amount, body.currency);
+    } catch (e) {
+      console.error(`stripe price ${plan} lookup threw:`, e);
+    }
+  }
+  // Cached even on a partial failure, so a Stripe outage doesn't mean a fresh round of
+  // failing calls for every message that arrives during it.
+  priceCache = { text, fetchedAt: Date.now() };
+  return text;
+}
+
+// The plans differ by more than a number, so the copy has to say what. Quota alone reads
+// as "same thing, bigger" and gives nobody a reason to upgrade beyond running out; the
+// deck depth is the real difference and it is the one that tracks what each plan costs to
+// run. Stated in terms of what the customer gets, never "one annotation pass".
+function planComparison(lang: Lang, prices: Record<PlanKey, string>): string {
+  return (
+    t(lang, "plan_standard", { price: prices.standard, quota: PLAN_QUOTA.standard.toLocaleString() }) + "\n\n" +
+    t(lang, "plan_pro", { price: prices.ultimate, quota: PLAN_QUOTA.ultimate.toLocaleString() }) + "\n\n" +
+    t(lang, "plan_covers_both")
+  );
+}
+
+function plansConfigured(): boolean {
+  return Boolean(PAYMENT_LINK_STANDARD || PAYMENT_LINK_ULTIMATE);
+}
+
+// [Try it free] + one URL button per plan. A plan whose Payment Link is unset is omitted
+// rather than rendered as a dead button; if BOTH are unset the caller falls back to copy
+// that tells the reader to get in touch, so the bot never advertises a way to pay that
+// does not work.
+//
+// The plan NAMES stay untranslated: "Standard" and "Pro" are product names and must match
+// the Stripe product the customer's receipt will show. Only the button verb is localized.
+// The two language codes a /learn or /forget usage line should offer. Was hardcoded
+// "uk|en", which is wrong for every pair but one -- the same assumption /help carried.
+function deckCodes(user: any): string {
+  return `${user.native_language}|${user.learning_language}`;
+}
+
+// Stripe substitutes a promotion code into Checkout from the link itself, via
+// prefilled_promo_code. That is strictly better than telling someone to find the "add
+// promotion code" box: the discount is visible on the first screen they see, so they never
+// have to trust that it applied, and there is no step to forget.
+//
+// This only works if allow_promotion_codes is enabled on the Payment Link -- otherwise
+// Stripe renders no promotion field at all and the parameter is silently dropped. That is
+// a dashboard setting, not something this build can set, and it is the reason a correctly
+// created coupon can still be impossible to redeem.
+function withPromo(url: string, promo?: string | null): string {
+  if (!promo) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}prefilled_promo_code=${encodeURIComponent(promo)}`;
+}
+
+function planKeyboard(lang: Lang, prices: Record<PlanKey, string>, includeTrial: boolean, promo?: string | null) {
+  const rows: any[] = [];
+  if (includeTrial) rows.push([{ text: t(lang, "btn_try_free"), callback_data: "tr|begin" }]);
+  if (PAYMENT_LINK_STANDARD) rows.push([{ text: `Standard — ${prices.standard}`, url: withPromo(PAYMENT_LINK_STANDARD, promo) }]);
+  if (PAYMENT_LINK_ULTIMATE) rows.push([{ text: `Pro — ${prices.ultimate}`, url: withPromo(PAYMENT_LINK_ULTIMATE, promo) }]);
+  return rows.length ? { inline_keyboard: rows } : undefined;
+}
+
+// Deliberately permissive: this checks the SHAPE, not the validity. Stripe is the only
+// authority on whether a code exists, is still within its redemption limit, and applies to
+// the plan being bought -- and it answers all of that at Checkout, on the screen the
+// customer is already looking at. Calling the API here to pre-validate would add a network
+// round trip, a second failure mode, and a way for the bot to say "invalid" about a code
+// that is actually fine. The only job here is to keep junk out of a URL.
+function looksLikePromoCode(raw: string): boolean {
+  return /^[A-Za-z0-9_-]{3,64}$/.test(raw);
+}
+
+// The message a stranger gets for saying anything at all. One screen: what it is, what
+// makes it different from a translation app, both plans, and a way in.
+async function introMessage(lang: Lang): Promise<{ text: string; keyboard: any }> {
+  const prices = await stripePriceText();
+  const plans = plansConfigured() ? planComparison(lang, prices) : t(lang, "plans_not_open");
+  return {
+    text: `${t(lang, "intro_body")}\n\n${plans}\n\n${t(lang, "intro_trial_note")}`,
+    keyboard: planKeyboard(lang, prices, true),
+  };
+}
+
+// Shown when the allowance runs out, and by /plans.
+async function plansMessage(lang: Lang, prefix?: string, promo?: string | null): Promise<{ text: string; keyboard: any }> {
+  const prices = await stripePriceText();
+  const body = plansConfigured()
+    ? `${planComparison(lang, prices)}\n\n${t(lang, "plans_after_paying")}`
+    : t(lang, "plans_not_open");
+  return {
+    text: `${prefix ? prefix + "\n\n" : ""}${body}`,
+    keyboard: planKeyboard(lang, prices, false, promo),
+  };
+}
+
+// Trial callbacks. Shape mirrors the ob|... wizard next door:
+//   tr|begin              -> ask which language they speak natively
+//   tr|n|<native>         -> native chosen, ask which they're learning
+//   tr|l|<native>|<learn> -> pair chosen, store it and invite a message
+//
+// Stateless in the same way and for the same reason: the pair is written to the trial row
+// and every later step reads it back, rather than being carried around in callback_data
+// where the client could edit it. Nothing here grants access to anything, so a forged tap
+// can at worst set the forger's own language pair.
+async function handleTrialCallback(cq: any): Promise<void> {
+  const parts = (cq.data ?? "").split("|");
+  const step = parts[1];
+  const chatId = cq.message?.chat?.id;
+  const telegramId = cq.from?.id;
+  if (!chatId || !telegramId) { await answerCallbackQuery(cq.id); return; }
+
+  // Telegram's UI language until they pick one, then their own choice -- so the second
+  // question already arrives in the language they just selected.
+  let lang = viewerLang(cq.from);
+
+  if (step === "begin") {
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId, t(lang, "trial_pick_native"), undefined, langPickerKeyboard("tr|n"));
+    return;
+  }
+  if (step === "n") {
+    const native = parts[2];
+    if (!LANGUAGES[native]) { await answerCallbackQuery(cq.id); return; }
+    lang = viewerLang(cq.from, { native_language: native });
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId, t(lang, "trial_pick_learning"), undefined, langPickerKeyboard(`tr|l|${native}`, native));
+    return;
+  }
+  if (step === "l") {
+    const native = parts[2], learning = parts[3];
+    if (!LANGUAGES[native] || !LANGUAGES[learning] || native === learning) { await answerCallbackQuery(cq.id); return; }
+    lang = viewerLang(cq.from, { native_language: native });
+    const { error } = await dbAdmin.from("trial_users").upsert(
+      { telegram_id: telegramId, native_language: native, learning_language: learning },
+      { onConflict: "telegram_id" });
+    if (error) {
+      console.error("trial pair save failed:", error);
+      await answerCallbackQuery(cq.id, t(lang, "generic_error"));
+      return;
+    }
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId,
+      t(lang, "trial_pair_set", {
+        native: langLabel(native), learning: langLabel(learning), limit: TRIAL_MESSAGE_LIMIT,
+      }), "HTML");
+    return;
+  }
+  await answerCallbackQuery(cq.id);
+}
+
+// One inbound message from someone with no tenant, after the intro. Returns having either
+// answered them or sold to them; never throws past the caller.
+async function handleTrialMessage(msg: any): Promise<void> {
+  const chatId = msg.chat.id;
+  const telegramId = msg.from?.id;
+  if (!telegramId) return;
+
+  // Cheap local refusals first, so none of them can cost a model call or an allowance.
+  // A group chat is the expensive one: the bot sitting in a group would be a free
+  // translator for everyone in it, charged to a single stranger's five-message quota.
+  if (msg.chat?.type !== "private") return;
+
+  // Read once, up front: it carries both the language pair AND the language to speak to
+  // this person in. Fetching it here rather than after the gate also removes the second
+  // read further down, so this is one query, not two.
+  const { data: trial } = await dbAdmin.from("trial_users")
+    .select("native_language, learning_language").eq("telegram_id", telegramId).maybeSingle();
+  const lang = viewerLang(msg.from, null, trial);
+
+  const text = (msg.text ?? "").trim();
+  if (!text) {
+    const { text: body, keyboard } = await plansMessage(lang, t(lang, "trial_text_only"));
+    await sendMessage(chatId, body, "HTML", keyboard);
+    return;
+  }
+  if (text.length > TRIAL_MAX_CHARS) {
+    await sendMessage(chatId, t(lang, "trial_too_long", { max: TRIAL_MAX_CHARS }));
+    return;
+  }
+
+  const { data, error } = await dbAdmin.rpc("consume_trial_message", {
+    p_telegram_id: telegramId,
+    p_trial_limit: TRIAL_MESSAGE_LIMIT,
+    p_daily_cap: TRIAL_DAILY_CAP,
+  });
+  // Fails CLOSED, unlike the paid gate: the caller has paid nothing, so erring towards
+  // "no free inference" costs a stranger one message and costs us nothing. The paid gate
+  // errs the other way on purpose, because a blip must not look like a billing problem.
+  if (error) {
+    console.error("consume_trial_message failed; refusing:", error);
+    await sendMessage(chatId, t(lang, "generic_error"));
+    return;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  const reason: string = row?.reason ?? "unknown";
+
+  if (!row?.allowed) {
+    if (reason === "no_pair") {
+      const { text: body, keyboard } = await introMessage(lang);
+      await sendMessage(chatId, body, "HTML", keyboard);
+      return;
+    }
+    if (reason === "daily_cap") {
+      const { text: body, keyboard } = await plansMessage(lang, t(lang, "trial_daily_cap"));
+      await sendMessage(chatId, body, "HTML", keyboard);
+      return;
+    }
+    const { text: body, keyboard } = await plansMessage(
+      lang, t(lang, "trial_exhausted", { limit: TRIAL_MESSAGE_LIMIT }));
+    await sendMessage(chatId, body, "HTML", keyboard);
+    return;
+  }
+
+  const native = trial?.native_language, learning = trial?.learning_language;
+  if (!native || !learning) {
+    const { text: body, keyboard } = await introMessage(lang);
+    await sendMessage(chatId, body, "HTML", keyboard);
+    return;
+  }
+
+  const from = await classifyLanguage(text, native, learning);
+  const to = from === native ? learning : native;
+  const translated = await translate(text, from, to);
+  if (!translated) {
+    await sendMessage(chatId, t(lang, "trial_translate_failed"));
+    return;
+  }
+
+  const used: number = row.used ?? 0;
+  const left = Math.max(0, TRIAL_MESSAGE_LIMIT - used);
+  let body = `${langMeta(to).flag} ${escapeHtml(translated)}`;
+
+  // The deck is the thing a price list can't convey and a translation app doesn't do, so
+  // the first message shows it. Only the first: annotation is ~83% of per-message cost,
+  // and one worked example demonstrates it as well as five.
+  if (used === 1) {
+    const sample = await trialFlashcards(lang, text, from, to, translated);
+    if (sample) body += `\n\n${sample}`;
+  }
+  body += `\n\n<i>${escapeHtml(t(lang, "trial_left", { n: left }))}</i>`;
+  await sendMessage(chatId, body, "HTML");
+}
+
+// A few flashcards from the trial message, formatted for chat. Returns null rather than
+// throwing or explaining itself: this is a flourish on top of a translation that already
+// succeeded, and a failed demo should cost the reader nothing.
+async function trialFlashcards(lang: Lang, text: string, from: LangCode, to: LangCode, translated: string): Promise<string | null> {
+  if (!hasAnnotatableWord(text)) return null;
+  try {
+    const { parsed } = await runAnnotation(ANNOTATION_MODEL, text, from, to, translated, "trial");
+    const rows = (parsed?.vocabulary ?? [])
+      .filter((v: any) => v?.lemma && v?.lemma_translation)
+      .slice(0, 4);
+    if (rows.length === 0) return null;
+    const lines = rows.map((v: any) => `• <b>${escapeHtml(String(v.lemma))}</b> — ${escapeHtml(String(v.lemma_translation))}`).join("\n");
+    return `${escapeHtml(t(lang, "trial_flashcards_header"))}\n${lines}`;
+  } catch (e) {
+    console.error("trial flashcards failed:", e);
+    return null;
+  }
+}
+
+// Telegram sends "/start <payload>" when a t.me/<bot>?start=<payload> link is opened.
+// Returns the payload, or null if this isn't a /start carrying one.
+function parseStartPayload(text: string): string | null {
+  const m = /^\/start(?:@\S+)?\s+(\S+)$/.exec(text.trim());
+  if (!m) return null;
+  // Same alphabet the billing function generates. Anything else is not a code we issued,
+  // and rejecting it here keeps junk out of the database lookup.
+  return /^[A-Za-z0-9_-]{6,64}$/.test(m[1]) ? m[1] : null;
+}
+
+function langPickerKeyboard(prefix: string, exclude?: string) {
+  const codes = Object.keys(LANGUAGES).filter((c) => c !== exclude);
+  const rows: any[] = [];
+  for (let i = 0; i < codes.length; i += 2) {
+    rows.push(codes.slice(i, i + 2).map((c) => ({
+      text: `${langMeta(c).flag} ${langMeta(c).nativeName}`,
+      callback_data: `${prefix}|${c}`,
+    })));
+  }
+  return { inline_keyboard: rows };
+}
+
+// Shared entry for "/start <code>": validates the code and asks the first question.
+// Which question depends on whether this is the first or second seat.
+async function beginOnboarding(msg: any, code: string): Promise<void> {
+  const { data, error } = await dbAdmin.rpc("claim_tenant_seat", { p_pairing_code: code });
+  if (error) {
+    console.error("claim_tenant_seat failed:", error);
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from), "ob_link_check_failed"));
+    return;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  const outcome: string = row?.outcome ?? "unknown_code";
+  if (outcome !== "ok") {
+    await sendMessage(msg.chat.id, onboardingRefusal(viewerLang(msg.from), outcome));
+    return;
+  }
+
+  if ((row.seats_taken ?? 0) === 0) {
+    // First seat: the person who paid. They choose the language pair for the couple.
+    await sendMessage(msg.chat.id,
+      t(viewerLang(msg.from), "ob_welcome_first"),
+      undefined, langPickerKeyboard(`ob|l|${code}`));
+    return;
+  }
+
+  // Second seat: the partner. The pair is already fixed by the first person's choice, so
+  // asking again could only produce a contradiction. Confirm it and ask the one thing
+  // that is genuinely theirs.
+  const partnerLangs = await tenantLanguagePair(row.tenant_id);
+  if (!partnerLangs) {
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from), "ob_partner_not_ready"));
+    return;
+  }
+  // The second seat's own native language is already known from the pair, so this person
+  // is greeted in their language on their very first screen -- no guessing needed.
+  const pLang = viewerLang(msg.from, { native_language: partnerLangs.native });
+  await sendMessage(msg.chat.id,
+    t(pLang, "ob_partner_welcome", {
+      native: langLabel(partnerLangs.native), learning: langLabel(partnerLangs.learning),
+    }),
+    undefined,
+    { inline_keyboard: [genderKeyboardRow(pLang, (code2) => `ob|p|${code}|${code2}`)] });
+}
+
+function onboardingRefusal(lang: Lang, outcome: string): string {
+  switch (outcome) {
+    case "expired_code":         return t(lang, "refusal_expired");
+    case "full":                 return t(lang, "refusal_full");
+    case "inactive_subscription": return t(lang, "refusal_inactive");
+    default:                     return t(lang, "refusal_unknown");
+  }
+}
+
+// The couple's pair, read off whoever is already registered. Returns it from the
+// perspective of the SECOND person: their native language is the first person's learning
+// language, and vice versa.
+async function tenantLanguagePair(tenantId: string): Promise<{ native: string; learning: string } | null> {
+  const { data } = await dbAdmin.from("users")
+    .select("native_language, learning_language")
+    .eq("tenant_id", tenantId).is("left_at", null).limit(1).maybeSingle();
+  if (!data) return null;
+  return { native: data.learning_language, learning: data.native_language };
+}
+
+// Handles every "ob|..." callback. Shape:
+//   ob|l|<code>            -> native language chosen, ask learning language
+//   ob|g|<code>|<nat>      -> learning language chosen, ask gender
+//   ob|d|<code>|<nat>|<lrn>-> gender chosen, create the first user
+//   ob|p|<code>            -> partner's gender chosen, create the second user
+async function handleOnboardingCallback(cq: any): Promise<void> {
+  const parts = (cq.data ?? "").split("|");
+  const step = parts[1];
+  const code = parts[2];
+  const chatId = cq.message?.chat?.id;
+  if (!code || !chatId) { await answerCallbackQuery(cq.id); return; }
+
+  // Re-validated on EVERY step, never taken from the callback payload -- see the note at
+  // the top of this section. A stale keyboard (code since consumed or expired) also lands
+  // here, and gets a real explanation rather than a silent no-op.
+  const { data, error } = await dbAdmin.rpc("claim_tenant_seat", { p_pairing_code: code });
+  if (error) {
+    console.error("claim_tenant_seat failed mid-wizard:", error);
+    await answerCallbackQuery(cq.id, t(viewerLang(cq.from), "generic_error"));
+    return;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  if (row?.outcome !== "ok") {
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId, onboardingRefusal(viewerLang(cq.from), row?.outcome ?? "unknown_code"));
+    return;
+  }
+  const tenantId: string = row.tenant_id;
+  const seatsTaken: number = row.seats_taken ?? 0;
+
+  // WHICH seat this is decides which wizard the tap belongs to, and claim_tenant_seat
+  // answers "ok" for both the first and the second -- it only rejects a full tenant. So
+  // the branch has to check it too.
+  //
+  // Without this, the partner (who legitimately holds the pairing code, it is their
+  // invite link) could send an owner-flow payload and reach finishOnboarding with
+  // isOwner true, taking ownership of the subscription: the Stripe portal to cancel or
+  // change the payer's card, and /delete_account to erase the couple's corpus. Telegram's
+  // own clients only send callback_data the bot issued, but MTProto's
+  // getBotCallbackAnswer takes an arbitrary payload, so that is not a boundary to rely on.
+  //
+  // There is also a no-forgery version: if the code reaches the partner before the owner
+  // finishes the wizard, seats_taken is still 0 and both are legitimately handed the
+  // owner flow, with the last to finish overwriting the first.
+  const ownerSteps = step === "l" || step === "g" || step === "d";
+  if (ownerSteps && seatsTaken !== 0) {
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId,
+      "Your partner has already set this account up. Open your invite link again and I'll finish adding you.");
+    return;
+  }
+  if (step === "p" && seatsTaken !== 1) {
+    await answerCallbackQuery(cq.id);
+    await sendMessage(chatId, t(viewerLang(cq.from), "ob_step_expired"));
+    return;
+  }
+
+  switch (step) {
+    case "l": {
+      const native = parts[3];
+      if (!LANGUAGES[native]) { await answerCallbackQuery(cq.id); return; }
+      await answerCallbackQuery(cq.id);
+      await editMessageReplyMarkup(chatId, cq.message.message_id);
+      await sendMessage(chatId,
+        t(viewerLang(cq.from, { native_language: native }), "ob_ask_learning", { native: langLabel(native) }),
+        undefined, langPickerKeyboard(`ob|g|${code}|${native}`, native));
+      return;
+    }
+    case "g": {
+      const [native, learning] = [parts[3], parts[4]];
+      if (!LANGUAGES[native] || !LANGUAGES[learning] || native === learning) { await answerCallbackQuery(cq.id); return; }
+      await answerCallbackQuery(cq.id);
+      await editMessageReplyMarkup(chatId, cq.message.message_id);
+      const gLang = viewerLang(cq.from, { native_language: native });
+      await sendMessage(chatId,
+        t(gLang, "ob_ask_gender"),
+        undefined,
+        { inline_keyboard: [genderKeyboardRow(gLang, (c) => `ob|d|${code}|${native}|${learning}|${c}`)] });
+      return;
+    }
+    case "d": {
+      const [native, learning, gender] = [parts[3], parts[4], parts[5]];
+      if (!LANGUAGES[native] || !LANGUAGES[learning]) { await answerCallbackQuery(cq.id); return; }
+      await answerCallbackQuery(cq.id);
+      await editMessageReplyMarkup(chatId, cq.message.message_id);
+      await finishOnboarding(cq, tenantId, code, native, learning, gender, /* isOwner */ true);
+      return;
+    }
+    case "p": {
+      const gender = parts[3];
+      const pair = await tenantLanguagePair(tenantId);
+      if (!pair) { await answerCallbackQuery(cq.id, t(viewerLang(cq.from), "ob_partner_not_ready")); return; }
+      await answerCallbackQuery(cq.id);
+      await editMessageReplyMarkup(chatId, cq.message.message_id);
+      await finishOnboarding(cq, tenantId, code, pair.native, pair.learning, gender, /* isOwner */ false);
+      return;
+    }
+    default:
+      await answerCallbackQuery(cq.id);
+  }
+}
+
+async function finishOnboarding(
+  cq: any, tenantId: string, code: string,
+  native: string, learning: string, gender: string, isOwner: boolean,
+): Promise<void> {
+  const chatId = cq.message.chat.id;
+  const tgUser = cq.from;
+  const displayName = (tgUser?.first_name ?? "").trim() || "Partner";
+
+  const { data: created, error } = await dbAdmin.from("users").insert({
+    tenant_id: tenantId,
+    telegram_id: tgUser.id,
+    display_name: displayName,
+    native_language: native,
+    learning_language: learning,
+    gender: (GENDER_CODES as readonly string[]).includes(gender) ? gender : null,
+  }).select("id").single();
+
+  if (error) {
+    // users.telegram_id is globally unique, so the realistic failure is one Telegram
+    // account trying to join a second couple. Say so plainly -- it is a real situation
+    // (someone re-subscribing) and "something went wrong" would send them to support for
+    // no reason.
+    console.error("onboarding user insert failed:", error);
+    await sendMessage(chatId,
+      "This Telegram account is already linked to a Capybara subscription. " +
+      "Use a different account for this one, or contact support to move it.");
+    return;
+  }
+
+  if (isOwner) {
+    // Record the payer. Only they may manage the subscription.
+    //
+    // `.is("owner_user_id", null)` makes this write-once at the database: a second
+    // attempt matches no row rather than replacing the owner. The caller already checks
+    // the seat count, so this is the backstop -- ownership is the authority behind
+    // cancelling a card and deleting the couple's data, and it should not be possible to
+    // move it by any route that isn't deliberate.
+    const { data: owned, error: ownErr } = await dbAdmin.from("tenants")
+      .update({ owner_user_id: created.id })
+      .eq("id", tenantId).is("owner_user_id", null)
+      .select("id");
+
+    // Not silent any more. If this does not land the tenant has no owner, and since a
+    // null owner now DENIES /billing and /delete_account, the couple would be quietly
+    // locked out of managing their own subscription. Better they know immediately.
+    if (ownErr || !owned || owned.length === 0) {
+      console.error(`owner_user_id not set for tenant ${tenantId}:`, ownErr ?? "no row updated");
+      await sendMessage(chatId,
+        t(viewerLang(cq.from, { native_language: native }), "ob_owner_error"));
+    }
+
+    const invite = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+    // By now the person has chosen a native language, so this is definitive rather than a
+    // guess from Telegram's UI setting.
+    const lang = viewerLang(cq.from, { native_language: native });
+    await sendMessage(chatId,
+      t(lang, "ob_all_set", {
+        name: escapeHtml(displayName),
+        native: langLabel(native),
+        learning: langLabel(learning),
+      }),
+      "HTML");
+
+    // The invite goes out as its OWN message, with no parse_mode at all.
+    //
+    // Two reasons, and the first is not stylistic. A bot username legitimately contains
+    // underscores (@capybara_translate_bot), and under Markdown those are italic markers:
+    // the link rendered as @capybaratranslatebot, a handle that does not exist, so the
+    // second seat could never be claimed. Telegram linkifies a bare URL on its own, so
+    // sending it unformatted is both correct and unbreakable -- no escaping to get wrong
+    // later.
+    //
+    // The second is that a link alone is forwardable. Buried in a paragraph, the partner
+    // receives a wall of text about someone else's account; on its own they receive the
+    // one thing they need to tap.
+    if (invite) {
+      await sendMessage(chatId, invite);
+    } else {
+      await sendMessage(chatId, t(lang, "ob_invite_code_fallback", { code }));
+    }
+    return;
+  }
+
+  // Second seat filled: retire the code so a forwarded link is inert from here on.
+  const { error: clearErr } = await dbAdmin.from("tenants")
+    .update({ pairing_code: null, pairing_code_expires_at: null }).eq("id", tenantId);
+  if (clearErr) console.error("pairing_code clear failed:", clearErr);
+
+  await sendMessage(chatId,
+    `You're all set, ${displayName}! Write in ${langLabel(native)} or ${langLabel(learning)} and I'll ` +
+    `translate for both of you.\n\nType /help to see everything.`);
+
+  // Tell the first person their partner arrived -- they have been waiting on it, and it
+  // is the only signal that the couple is now fully set up.
+  // native_language again: this greeting is read by the person who was already here, so
+  // it is their language that decides, not the joiner's.
+  const { data: others } = await dbAdmin.from("users")
+    .select("telegram_id, display_name, native_language")
+    .eq("tenant_id", tenantId).neq("id", created.id).is("left_at", null);
+  for (const o of others ?? []) {
+    await sendMessage(o.telegram_id,
+      t(viewerLang(undefined, o), "ob_partner_joined", { name: displayName }));
+  }
+}
+
+// Customer-facing name for a stored plan id. The database keeps a lowercase slug
+// ("standard", "ultimate") because that is what the price mapping produces and what is
+// stable to query; the customer sees what Stripe charged them for. Those must agree --
+// someone reading "ultimate" in the bot and "Capybara Ultimate" on their receipt has to
+// work out for themselves that they are the same thing, and the moment they doubt it
+// they open a support ticket.
+//
+// Unknown slugs fall through capitalized rather than being hidden, so a plan added later
+// still reads sensibly before anyone remembers to update this.
+//
+// The KEY is the internal plan slug and matches tenants.plan, the QUOTA_* / STRIPE_PRICE_*
+// secret names, and planForPrice in stripe-billing. "ultimate" is kept as that slug even
+// though the tier is sold as Pro: renaming it would mean a data migration over
+// tenants.plan plus re-entering three secrets, to change something no customer ever sees.
+// The VALUE is what customers see, and must match the Stripe product name exactly.
+const PLAN_LABELS: Record<string, string> = {
+  standard: "Capybara Standard",
+  ultimate: "Capybara Pro",
+  comped: "Complimentary",
+};
+function planLabel(plan: string | null | undefined): string {
+  if (!plan) return "\u2014";
+  return PLAN_LABELS[plan] ?? (plan.charAt(0).toUpperCase() + plan.slice(1));
+}
+
+// ---------------------------------------------------------------------------- /billing
+//
+// Stripe's hosted customer portal does the actual work -- card updates, plan changes,
+// invoices, cancellation -- so none of that has to be rebuilt in a chat window, and no
+// payment details ever touch this code.
+//
+// Portal links are short-lived and single-customer, so one is minted per request rather
+// than stored. Anyone with the link can manage the subscription, which is why it is only
+// ever sent to the OWNER: the partner is a member of the couple, not the account holder,
+// and giving them a cancel button for someone else's card would be a support incident
+// waiting to happen.
+// A code from someone who already has an account -- most often a lapsed subscriber coming
+// back. Their route is the Stripe portal rather than a Payment Link, and the portal takes
+// promotion codes on its own screens, so this points them there instead of handing them a
+// link that would start a SECOND subscription alongside the one they already have.
+async function handlePromo(msg: any, user: any): Promise<void> {
+  const lang = viewerLang(msg.from, user);
+  await sendMessage(msg.chat.id, t(lang, "promo_existing_account"), "HTML");
+}
+
+// ---------------------------------------------------------------------------- /management
+//
+// Renamed from /billing, because it stopped being only about billing: it is where you see
+// the subscription AND who is on the account, and where the owner adds or removes a
+// partner. /billing still works as an alias -- customers learned that name, and silently
+// breaking a command someone reaches for when their card has failed is the worst possible
+// moment to be pedantic about naming.
+async function handleManagement(msg: any, user: any): Promise<void> {
+  const lang = viewerLang(msg.from, user);
+  const { data: tenant, error } = await dbAdmin.from("tenants")
+    .select("stripe_customer_id, owner_user_id, plan, status, message_quota, messages_used, current_period_end")
+    .eq("id", user.tenant_id).maybeSingle();
+  if (error || !tenant) {
+    console.error("billing: tenant read failed:", error);
+    await sendMessage(msg.chat.id, t(lang, "billing_load_failed"));
+    return;
+  }
+
+  const used = tenant.messages_used ?? 0;
+  const quota = tenant.message_quota;
+  const renews = tenant.current_period_end
+    ? new Date(tenant.current_period_end).toLocaleDateString(lang, { day: "numeric", month: "long", year: "numeric" })
+    : "—";
+  const summary = t(lang, "billing_summary", {
+    plan: planLabel(tenant.plan),
+    status: tenant.status,
+    usage: quota ? `${used} / ${quota}` : `${used} (${t(lang, "billing_unlimited")})`,
+    renews,
+  });
+
+  // Strict equality: a NULL owner denies everyone, rather than admitting everyone.
+  // `owner && owner !== user` reads as an ownership check but is really "deny only if
+  // someone else owns it" -- with no owner recorded it grants the Stripe portal, and
+  // below it grants irreversible deletion, to whichever partner asks first.
+  if (tenant.owner_user_id !== user.id) {
+    await sendMessage(msg.chat.id, `${summary}\n\n${t(lang, "billing_not_owner")}`, "HTML");
+    return;
+  }
+  if (!STRIPE_SECRET_KEY || !tenant.stripe_customer_id) {
+    await sendMessage(msg.chat.id, `${summary}\n\n${t(lang, "billing_not_configured")}`, "HTML");
+    return;
+  }
+
+  const portalUrl = await createBillingPortalSession(tenant.stripe_customer_id);
+  if (!portalUrl) {
+    await sendMessage(msg.chat.id, `${summary}\n\n${t(lang, "billing_portal_failed")}`, "HTML");
+    return;
+  }
+  // Who is on the account. The owner is the only one who can change it, and this is the
+  // one screen where they would think to look.
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
+  const rows: any[] = [[{ text: t(lang, "billing_btn_manage"), url: portalUrl }]];
+  let seatLine: string;
+  if (partner) {
+    seatLine = t(lang, "mgmt_partner_line", { name: escapeHtml(partner.display_name) });
+    rows.push([{ text: t(lang, "mgmt_btn_remove"), callback_data: `mg|rm|${partner.id}` }]);
+  } else {
+    seatLine = t(lang, "mgmt_seat_free");
+  }
+
+  // /delete_account is surfaced here rather than in the "/" menu: this is where someone
+  // who wants out actually looks, and a destructive command does not belong one tap away
+  // in a menu used every day.
+  await sendMessage(msg.chat.id,
+    `${summary}${seatLine}\n\n${t(lang, "billing_manage")}`,
+    "HTML",
+    { inline_keyboard: rows });
+
+  // The invite goes as its own message with no parse_mode: a bot username contains
+  // underscores, which Markdown renders as italics and turns into a handle that does not
+  // exist. Only when the seat is actually free -- an unsolicited invite link on a full
+  // account is just confusing.
+  if (!partner) {
+    const { data: tRow } = await dbAdmin.from("tenants")
+      .select("pairing_code").eq("id", user.tenant_id).maybeSingle();
+    const code = tRow?.pairing_code;
+    if (code) {
+      const invite = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+      if (invite) await sendMessage(msg.chat.id, invite);
+      else await sendMessage(msg.chat.id, t(lang, "ob_invite_code_fallback", { code }));
+    }
+  }
+}
+
+// Owner-initiated removal. Same data path as leaving -- release_seat covers both -- but a
+// different consent story: the person being removed did not ask, so they are told, and the
+// confirmation spells out what survives rather than implying everything goes.
+async function handleRemovePartnerConfirm(cq: any, targetId: string): Promise<void> {
+  const chatId = cq.message?.chat?.id;
+  const user = await lookupUser(cq.from);
+  if (!user) { await answerCallbackQuery(cq.id, "Not authorized."); return; }
+  const lang = viewerLang(cq.from, user);
+
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
+  // Re-read rather than trusting the id in callback_data: it is client-supplied, and the
+  // partner could have left of their own accord between the screen and the tap.
+  if (!partner || partner.id !== targetId) {
+    await answerCallbackQuery(cq.id, "…");
+    await sendMessage(chatId, t(lang, "mgmt_remove_failed"));
+    return;
+  }
+
+  const { count } = await dbAdmin.from("messages")
+    .select("id", { count: "exact", head: true }).eq("tenant_id", user.tenant_id);
+
+  await answerCallbackQuery(cq.id, "…");
+  if (chatId) await editMessageReplyMarkup(chatId, cq.message.message_id);
+  await sendMessage(chatId,
+    t(lang, "mgmt_remove_confirm", { name: escapeHtml(partner.display_name), n: count ?? 0 }),
+    "HTML",
+    { inline_keyboard: [[{ text: t(lang, "mgmt_btn_remove"), callback_data: `mg|rmy|${partner.id}` }]] });
+}
+
+async function handleRemovePartnerDo(cq: any, targetId: string): Promise<void> {
+  const chatId = cq.message?.chat?.id;
+  const user = await lookupUser(cq.from);
+  if (!user) { await answerCallbackQuery(cq.id, "Not authorized."); return; }
+  const lang = viewerLang(cq.from, user);
+
+  await answerCallbackQuery(cq.id, "…");
+  if (chatId) await editMessageReplyMarkup(chatId, cq.message.message_id);
+
+  // Authorisation lives in SQL, not here: release_seat verifies the actor owns the tenant
+  // and that both rows belong to it. A check in TypeScript alone would be one refactor
+  // away from being bypassed by a second call site.
+  const { data, error } = await dbAdmin.rpc("release_seat", {
+    p_actor_user_id: user.id,
+    p_target_user_id: targetId,
+  });
+  const row = Array.isArray(data) ? data[0] : data;
+  const outcome: string = row?.outcome ?? "error";
+  if (error || outcome !== "ok") {
+    console.error(`release_seat (remove) failed for ${targetId}:`, error ?? outcome);
+    await sendMessage(chatId, t(lang, "mgmt_remove_failed"));
+    return;
+  }
+  console.log(`user ${user.id} removed ${targetId} from tenant ${user.tenant_id}`);
+
+  const code: string | null = row?.pairing_code ?? null;
+  const removedName: string = row?.target_display_name ?? "";
+
+  await sendMessage(chatId, t(lang, "mgmt_removed_owner", { name: escapeHtml(removedName) }), "HTML");
+  const invite = BOT_USERNAME && code ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+  if (invite) await sendMessage(chatId, invite);
+  else if (code) await sendMessage(chatId, t(lang, "ob_invite_code_fallback", { code }));
+
+  // Tell the person who was removed, in THEIR language. release_seat returns their id and
+  // language with the result, so this needs no second read against the row it just wrote.
+  const tgId = row?.target_telegram_id;
+  if (tgId) {
+    const rLang = viewerLang(undefined, { native_language: row?.target_native_language });
+    await sendMessage(Number(tgId),
+      t(rLang, "mgmt_removed_partner", { name: escapeHtml(user.display_name) }), "HTML");
+  }
+}
+
+// ---------------------------------------------------------------------------- /tenants (operator)
+//
+// The one view that is about the SERVICE rather than about a couple. Everything else in
+// this file is deliberately confined to one tenant; this is the exception, so it is
+// superadmin-gated and reads through dbAdmin on purpose.
+//
+// It leads with what needs action rather than with totals. A dashboard of counts is
+// something you have to remember to interpret; "2 paid but never set up" is something you
+// can act on. That case in particular is the one worth catching early -- money taken with
+// no service delivered, and the customer's own next step is to complain or charge back.
+//
+// Aggregated in TypeScript over two reads rather than in SQL. At the scale this product
+// is meant to reach -- tens to low hundreds of couples -- pulling the tenant rows is
+// nothing, and it keeps the numbers in the same place as the text that explains them. If
+// it ever stops being nothing, that is a good problem and the fix is a view.
+
+// Per-message cost BY PLAN, since Ultimate annotates both sides and Standard does not --
+// a single blended constant would misreport whichever mix you actually have. Calibrated
+// against real spend rather than modelled (the cost model came in 20% under the actual
+// bill, so it is scaled to match). The trajectory: $0.015 before any of the annotation
+// work, $0.012 after dropping the write-only grammar/idiom/register fields and
+// skipping/reusing what it could, and $0.007 again for the side that is no longer
+// annotated. Used only for the estimate in /tenants, so drift costs nothing; re-derive
+// from the Anthropic console after a month of real traffic.
+const EST_COST_PER_MESSAGE_USD: Record<string, number> = { standard: 0.007, ultimate: 0.012 };
+const EST_COST_FALLBACK_USD = 0.012;
+
+// Supabase free tier database ceiling. The commercial project runs on it for now, so the
+// number that matters operationally is not the bill (there isn't one) but the headroom:
+// nothing is ever deleted, and embeddings are ~6 KB per message before indexes, so the
+// database only grows and grows faster the better the product does.
+const FREE_TIER_DB_BYTES = 500 * 1024 * 1024;
+
+async function handleTenants(msg: any, _user: any): Promise<void> {
+  if (await denyUnlessSuperadmin(msg)) return;
+
+  const { data: tenants, error } = await dbAdmin.from("tenants")
+    .select("id, plan, status, message_quota, messages_used, created_at, pairing_code");
+  if (error) {
+    console.error("/tenants: read failed:", error);
+    await sendMessage(msg.chat.id, "Couldn't read tenants.");
+    return;
+  }
+  if (!tenants || tenants.length === 0) {
+    await sendMessage(msg.chat.id, "No tenants yet.");
+    return;
+  }
+
+  // One read for the seat counts rather than a query per tenant.
+  const { data: allUsers } = await dbAdmin.from("users").select("tenant_id");
+  const seats = new Map<string, number>();
+  for (const u of allUsers ?? []) seats.set(u.tenant_id, (seats.get(u.tenant_id) ?? 0) + 1);
+
+  const byStatus = new Map<string, number>();
+  const byPlan = new Map<string, number>();
+  const usedByPlan = new Map<string, number>();
+  let totalUsed = 0;
+  const unclaimed: any[] = [];   // paid, nobody has set up at all
+  const halfSet: any[] = [];     // one seat taken, partner never joined
+  const overQuota: any[] = [];
+  const nearQuota: any[] = [];
+
+  for (const t of tenants) {
+    byStatus.set(t.status, (byStatus.get(t.status) ?? 0) + 1);
+    totalUsed += t.messages_used ?? 0;
+    // Priced per plan: Ultimate annotates both sides and costs about twice as much per
+    // message, so a blended rate would misreport whichever mix actually exists.
+    usedByPlan.set(t.plan, (usedByPlan.get(t.plan) ?? 0) + (t.messages_used ?? 0));
+
+    const entitled = t.status === "active" || t.status === "trialing";
+    if (entitled) {
+      byPlan.set(t.plan, (byPlan.get(t.plan) ?? 0) + 1);
+      const taken = seats.get(t.id) ?? 0;
+      if (taken === 0) unclaimed.push(t);
+      else if (taken === 1) halfSet.push(t);
+
+      if (t.message_quota) {
+        const ratio = (t.messages_used ?? 0) / t.message_quota;
+        if (ratio >= 1) overQuota.push(t);
+        else if (ratio >= 0.8) nearQuota.push(t);
+      }
+    }
+  }
+
+  const ageDays = (iso: string) => Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
+  const oldest = (rows: any[]) => rows.length
+    ? Math.max(...rows.map((r) => ageDays(r.created_at)))
+    : 0;
+
+  const lines: string[] = [];
+  lines.push(`*Capybara operations* — ${tenants.length} tenant${tenants.length === 1 ? "" : "s"}`);
+
+  // Attention first, and only when there is something to say. An empty section trains
+  // you to skim past the place the warnings appear.
+  const attention: string[] = [];
+  if (unclaimed.length) {
+    attention.push(`• *${unclaimed.length} paid but never set up* (oldest ${oldest(unclaimed)}d) — they have been charged and have nothing`);
+  }
+  if (halfSet.length) {
+    attention.push(`• ${halfSet.length} waiting on a partner to join (oldest ${oldest(halfSet)}d)`);
+  }
+  if (overQuota.length) {
+    attention.push(`• ${overQuota.length} over quota — currently blocked`);
+  }
+  if (nearQuota.length) {
+    attention.push(`• ${nearQuota.length} above 80% of quota`);
+  }
+  const pastDue = byStatus.get("past_due") ?? 0;
+  const unpaid = byStatus.get("unpaid") ?? 0;
+  if (pastDue + unpaid > 0) {
+    attention.push(`• ${pastDue + unpaid} with a failed payment`);
+  }
+  if (attention.length) {
+    lines.push("", "*Needs attention*", ...attention);
+  }
+
+  lines.push("", "*Subscriptions*");
+  for (const [status, n] of [...byStatus.entries()].sort((a, b) => b[1] - a[1])) {
+    lines.push(`• ${status}: ${n}`);
+  }
+  if (byPlan.size) {
+    lines.push("", "*Active plans*");
+    for (const [plan, n] of [...byPlan.entries()].sort((a, b) => b[1] - a[1])) {
+      lines.push(`• ${planLabel(plan)}: ${n}`);
+    }
+  }
+
+  lines.push("",
+    `*Usage this period*`,
+    `• ${totalUsed.toLocaleString("en-GB")} messages`,
+    // Cost, not revenue: revenue lives in Stripe and duplicating it here would just be a
+    // number that goes stale. This is the side Stripe cannot tell you.
+    `• ~$${estimatedSpend(usedByPlan).toFixed(2)} estimated API spend`);
+
+  // Storage headroom. On the free tier this is the limit that actually bites: there is no
+  // bill to warn you, nothing is ever deleted, and the database grows FASTER the better
+  // the product does. Reported last but flagged into "needs attention" when it matters,
+  // because a number you have to remember to read is a number you find out about at 100%.
+  const storage = await instanceStorageLine();
+  if (storage) lines.push("", ...storage);
+
+  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
+}
+
+// Spend priced per plan rather than blended. An unrecognised plan is charged at the
+// dearer rate: an estimate that flatters the bill is worse than one that doesn't.
+function estimatedSpend(usedByPlan: Map<string, number>): number {
+  let total = 0;
+  for (const [plan, used] of usedByPlan) {
+    total += used * (EST_COST_PER_MESSAGE_USD[plan] ?? EST_COST_FALLBACK_USD);
+  }
+  return total;
+}
+
+// The storage section of /tenants. Returns null rather than throwing or explaining itself:
+// this is a footnote on an operations report that has already been assembled, and a
+// missing RPC (an instance where 20260727000100 has not been applied) must not take the
+// whole command down.
+function formatBytes(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
+  if (n >= 1024 ** 2) return `${Math.round(n / 1024 ** 2)} MB`;
+  return `${Math.round(n / 1024)} kB`;
+}
+
+async function instanceStorageLine(): Promise<string[] | null> {
+  try {
+    const { data, error } = await dbAdmin.rpc("instance_storage");
+    if (error) { console.error("instance_storage failed:", error); return null; }
+    const row = Array.isArray(data) ? data[0] : data;
+    const bytes = Number(row?.db_bytes ?? 0);
+    if (!bytes) return null;
+    const pct = (bytes / FREE_TIER_DB_BYTES) * 100;
+    // 60% is early enough to act on: moving to Pro means a plan change and a backup, not
+    // a click, and the growth curve steepens with every new couple.
+    const flag = pct >= 80 ? " ⚠️" : pct >= 60 ? " — plan the move to Pro" : "";
+    const out = [
+      `*Storage*`,
+      `• ${formatBytes(bytes)} of ${formatBytes(FREE_TIER_DB_BYTES)} (${pct.toFixed(1)}%)${flag}`,
+    ];
+    if (row?.largest_table) {
+      out.push(`• largest: ${row.largest_table} (${formatBytes(Number(row.largest_bytes ?? 0))})`);
+    }
+    // The free tier has no backups and no point-in-time recovery. On a product whose value
+    // is a private history, that is a worse exposure than the size cap, and it is silent.
+    if (pct >= 60) out.push(`• _free tier has no backups — pg_dump before you grow further_`);
+    return out;
+  } catch (e) {
+    console.error("instance_storage threw:", e);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------- /delete_account
+//
+// Irreversible, so it is deliberately two steps: the command explains exactly what goes
+// and what it costs, and only a button press actually does it. Owner-only, for the same
+// reason /billing is -- one half of a couple must not be able to erase the other's
+// messages, and the account belongs to whoever pays for it.
+//
+// Order is chosen so that a partial failure is survivable in the direction that favours
+// the customer:
+//
+//   1. Cancel the Stripe subscription FIRST. If anything after this fails they have
+//      stopped being charged, which is the one outcome that is unacceptable to get
+//      wrong. Deleting someone's data while still billing them is worse than leaving
+//      data behind.
+//   2. Delete the Storage objects. They are not covered by any database cascade, so
+//      losing this step would orphan voice recordings with nothing left pointing at them.
+//   3. Delete the tenant row LAST. ON DELETE CASCADE takes every table with it, and it is
+//      the row that makes the rest reachable -- dropping it first would strand both of
+//      the steps above with no way to find what they were meant to clean up.
+// ---------------------------------------------------------------------------- Leaving
+//
+// The second seat's own exit. Until this existed the only way out was /delete_account,
+// which is owner-only and destroys the couple -- so a partner in an ended relationship
+// had no lever at all, and their messages stayed in someone else's account indefinitely.
+//
+// This is a SOFT leave. messages.sender_id is ON DELETE RESTRICT, which is the schema
+// saying a shared conversation is not one participant's to erase: the other person paid
+// for that corpus and /recap is grounded in it. So leaving revokes access and removes
+// what is genuinely personal -- decks, notes, corrections -- and the history stays with
+// the account that owns it. Anyone wanting the whole corpus gone still has
+// /delete_account, which the owner runs and which cancels billing first.
+async function handleLeave(msg: any, user: any): Promise<void> {
+  const lang = viewerLang(msg.from, user);
+  const { data: tenant, error } = await dbAdmin.from("tenants")
+    .select("id, owner_user_id").eq("id", user.tenant_id).maybeSingle();
+  if (error || !tenant) {
+    console.error("leave: tenant read failed:", error);
+    await sendMessage(msg.chat.id, t(lang, "account_load_failed"));
+    return;
+  }
+
+  // The owner cannot leave: the subscription is theirs, and a tenant whose owner walked
+  // out would keep billing with nobody able to reach /billing to stop it.
+  if (tenant.owner_user_id === user.id) {
+    await sendMessage(msg.chat.id, t(lang, "leave_owner_cannot"));
+    return;
+  }
+
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
+  if (!partner) {
+    await sendMessage(msg.chat.id, t(lang, "leave_solo"));
+    return;
+  }
+
+  const { count } = await dbAdmin.from("messages")
+    .select("id", { count: "exact", head: true }).eq("tenant_id", tenant.id);
+
+  await sendMessage(msg.chat.id,
+    t(lang, "leave_confirm", { n: count ?? 0, owner: escapeHtml(partner.display_name) }),
+    "HTML",
+    { inline_keyboard: [[{ text: t(lang, "leave_btn"), callback_data: "lv|confirm" }]] });
+}
+
+async function handleLeaveConfirm(cq: any): Promise<void> {
+  const chatId = cq.message?.chat?.id;
+  // Re-resolve from scratch: the button carries no authority, and ownership could have
+  // changed between the command and the tap.
+  const user = await lookupUser(cq.from);
+  if (!user) { await answerCallbackQuery(cq.id, "Not authorized."); return; }
+  const lang = viewerLang(cq.from, user);
+
+  await answerCallbackQuery(cq.id, "…");
+  if (chatId) await editMessageReplyMarkup(chatId, cq.message.message_id);
+
+  // Read the owner BEFORE leaving: afterwards lookupPartner returns nothing for this
+  // user, and there would be no way left to tell them.
+  const db = tenantDb(user.tenant_id);
+  const owner = await lookupPartner(db, user.id);
+
+  // One RPC so a failure rolls back whole. A half-applied leave -- personal data gone but
+  // the seat still held -- would strand someone with no access and no way to be replaced.
+  const { data, error } = await dbAdmin.rpc("release_seat", {
+    p_actor_user_id: user.id,
+    p_target_user_id: user.id,
+  });
+  const row = Array.isArray(data) ? data[0] : data;
+  const outcome: string = row?.outcome ?? "error";
+  const code: string | null = row?.pairing_code ?? null;
+
+  if (error || outcome !== "ok") {
+    if (outcome === "is_owner") {
+      await sendMessage(chatId, t(lang, "leave_owner_cannot"));
+      return;
+    }
+    console.error(`release_seat (leave) failed for ${user.id}:`, error ?? outcome);
+    await sendMessage(chatId, t(lang, "leave_failed"));
+    return;
+  }
+  console.log(`user ${user.id} left tenant ${user.tenant_id}`);
+
+  await sendMessage(chatId, t(lang, "leave_done"));
+
+  // Tell the owner, in THEIR language, and hand them the freed seat. The invite goes as
+  // its own message with no parse_mode -- a bot username contains underscores, and under
+  // Markdown those render as italics, producing a handle that does not exist.
+  if (owner) {
+    const oLang = viewerLang(undefined, owner);
+    await sendMessage(owner.telegram_id,
+      t(oLang, "leave_owner_notice", { name: escapeHtml(user.display_name) }), "HTML");
+    const invite = BOT_USERNAME && code ? `https://t.me/${BOT_USERNAME}?start=${code}` : null;
+    if (invite) await sendMessage(owner.telegram_id, invite);
+    else if (code) await sendMessage(owner.telegram_id, t(oLang, "ob_invite_code_fallback", { code }));
+  }
+}
+
+async function handleDeleteAccount(msg: any, user: any): Promise<void> {
+  const { data: tenant, error } = await dbAdmin.from("tenants")
+    .select("id, owner_user_id, stripe_subscription_id, status")
+    .eq("id", user.tenant_id).maybeSingle();
+  if (error || !tenant) {
+    console.error("delete_account: tenant read failed:", error);
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "account_load_failed"));
+    return;
+  }
+  if (tenant.owner_user_id !== user.id) {
+    await sendMessage(msg.chat.id,
+      "Only the person who set up the subscription can delete the account. " +
+      "Ask them to run /delete_account.");
+    return;
+  }
+
+  const { count: messageCount } = await dbAdmin.from("messages")
+    .select("id", { count: "exact", head: true }).eq("tenant_id", tenant.id);
+
+  await sendMessage(msg.chat.id,
+    "*Delete your Capybara account?*\n\n" +
+    "This cancels your subscription and permanently deletes:\n" +
+    `• all ${messageCount ?? 0} messages, and their translations\n` +
+    "• your vocabulary, flashcards and grammar corrections\n" +
+    "• your notes, pins and conversation memory\n" +
+    "• any voice recordings\n\n" +
+    "Both of you lose access. *This cannot be undone.*\n\n" +
+    "If you want to keep your study decks, send /export first and wait for the file — " +
+    "then come back to this.",
+    "Markdown",
+    { inline_keyboard: [[{ text: "Delete everything permanently", callback_data: "del|confirm" }]] });
+}
+
+async function handleDeleteAccountConfirm(cq: any): Promise<void> {
+  const chatId = cq.message?.chat?.id;
+  // Re-resolve the sender from scratch. The button carries no authority of its own, and
+  // ownership could have changed between the command and the tap.
+  const user = await lookupUser(cq.from);
+  if (!user) { await answerCallbackQuery(cq.id, "Not authorized."); return; }
+
+  const { data: tenant } = await dbAdmin.from("tenants")
+    .select("id, owner_user_id, stripe_subscription_id")
+    .eq("id", user.tenant_id).maybeSingle();
+  if (!tenant || tenant.owner_user_id !== user.id) {
+    await answerCallbackQuery(cq.id, "Not authorized.");
+    return;
+  }
+
+  await answerCallbackQuery(cq.id, "Deleting…");
+  if (chatId) await editMessageReplyMarkup(chatId, cq.message.message_id);
+
+  // Tell the partner before the data goes. Once the tenant row is gone there is no way
+  // left to find out who they were.
+  // native_language rides along because the goodbye below is addressed to THEM, not to
+  // the owner doing the deleting. Selecting only telegram_id would make viewerLang fall
+  // through to English without any error -- the exact silent failure this catalog exists
+  // to remove.
+  const { data: members } = await dbAdmin.from("users")
+    .select("telegram_id, native_language")
+    .eq("tenant_id", tenant.id).neq("id", user.id).is("left_at", null);
+
+  // 1. Stop the billing.
+  if (tenant.stripe_subscription_id) {
+    const cancelled = await cancelStripeSubscription(tenant.stripe_subscription_id);
+    if (!cancelled) {
+      // Abort rather than continue. Deleting the data now would leave them paying for an
+      // account that no longer exists, and they would have no way to reach /billing.
+      await sendMessage(chatId,
+        "I couldn't cancel your subscription just now, so I've stopped before deleting anything — " +
+        "I don't want to delete your account while you're still being charged.\n\n" +
+        "Please try again in a few minutes, or use /billing to cancel directly.");
+      return;
+    }
+  }
+
+  // 2. Voice files: no database cascade reaches Storage.
+  await deleteTenantStorage(tenant.id);
+
+  // 3. The row, and with it every table that references it.
+  const { error: delErr } = await dbAdmin.from("tenants").delete().eq("id", tenant.id);
+  if (delErr) {
+    console.error(`delete_account: tenant delete failed for ${tenant.id}:`, delErr);
+    await sendMessage(chatId,
+      "Your subscription is cancelled, but I hit an error deleting your data. " +
+      "Support has been notified and will finish removing it.");
+    return;
+  }
+  console.log(`deleted tenant ${tenant.id} at owner request`);
+
+  await sendMessage(chatId, t(viewerLang(cq.from, user), "account_deleted_self"));
+  for (const m of members ?? []) {
+    await sendMessage(m.telegram_id, t(viewerLang(undefined, m), "account_deleted_partner"));
+  }
+}
+
+async function cancelStripeSubscription(subscriptionId: string): Promise<boolean> {
+  if (!STRIPE_SECRET_KEY) {
+    console.error("cancelStripeSubscription: STRIPE_SECRET_KEY not set");
+    return false;
+  }
+  try {
+    const resp = await fetch(`https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}`, "Stripe-Version": "2024-06-20" },
+    });
+    // 404 means it is already gone, which is the state we wanted anyway.
+    if (resp.status === 404) return true;
+    if (!resp.ok) {
+      console.error(`subscription cancel failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error("subscription cancel threw:", e);
+    return false;
+  }
+}
+
+// Voice uploads are stored at <tenant_id>/<user_id>/<file>, so a tenant's audio is one
+// prefix. Storage has no recursive delete, hence the two-level walk.
+async function deleteTenantStorage(tenantId: string): Promise<void> {
+  try {
+    const { data: userDirs, error } = await dbAdmin.storage.from("voice-messages").list(tenantId);
+    if (error) { console.error(`storage list failed for tenant ${tenantId}:`, error); return; }
+
+    const paths: string[] = [];
+    for (const dir of userDirs ?? []) {
+      const { data: files } = await dbAdmin.storage.from("voice-messages").list(`${tenantId}/${dir.name}`);
+      for (const f of files ?? []) paths.push(`${tenantId}/${dir.name}/${f.name}`);
+    }
+    if (paths.length === 0) return;
+
+    // Chunked: remove() takes a path array, and a long-lived couple can accumulate
+    // thousands of recordings.
+    for (let i = 0; i < paths.length; i += 100) {
+      const { error: rmErr } = await dbAdmin.storage.from("voice-messages").remove(paths.slice(i, i + 100));
+      if (rmErr) console.error(`storage remove failed for tenant ${tenantId}:`, rmErr);
+    }
+    console.log(`deleted ${paths.length} voice files for tenant ${tenantId}`);
+  } catch (e) {
+    // Never fatal: orphaned audio is a cleanup chore, whereas aborting here would leave
+    // the customer's account half-deleted with their subscription already cancelled.
+    console.error(`deleteTenantStorage threw for ${tenantId}:`, e);
+  }
+}
+
+async function createBillingPortalSession(customerId: string): Promise<string | null> {
+  try {
+    const resp = await fetch("https://api.stripe.com/v1/billing_portal/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+        "Stripe-Version": "2024-06-20",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ customer: customerId }).toString(),
+    });
+    if (!resp.ok) {
+      console.error(`billing portal session failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`);
+      return null;
+    }
+    return (await resp.json())?.url ?? null;
+  } catch (e) {
+    console.error("billing portal session threw:", e);
+    return null;
+  }
+}
+
 async function lookupUser(tgUser: any) {
   // Distinguish "no such user" (a clean read that returns no row) from a transient
   // read failure. Swallowing the error here made a *registered* user see the
@@ -388,10 +2067,25 @@ async function lookupUser(tgUser: any) {
   // below), retry, and if the read keeps failing THROW so the caller aborts
   // silently instead of misinforming the user. The "not registered" branch must
   // fire only on a genuine, error-free absence.
+  //
+  // Unscoped, necessarily: this IS the tenant-resolution step. An incoming update
+  // carries only a Telegram id, and which tenant that id belongs to is exactly what
+  // this read answers -- there is no tenant context to filter by until it returns.
+  // users.telegram_id is unique among ACTIVE members (a partial index, see
+  // migrations-saas/20260727010000), so the row it finds determines the tenant for
+  // everything downstream.
+  //
+  // is("left_at", null) is what makes leaving mean anything. The departed row is retained
+  // -- messages.sender_id is ON DELETE RESTRICT, so the shared history needs it to stay
+  // attributable -- and without this filter that row keeps resolving, so someone who left
+  // would still be served, still be forwarded messages, and still consume their ex's
+  // quota. Filtering here revokes access in exactly one place: everything downstream
+  // takes a null user as "not a member", which is now true. They fall through to the
+  // stranger path and can subscribe again with anyone.
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const { data, error } = await supabase.from("users").select("*")
-      .eq("telegram_id", tgUser.id).maybeSingle();
+    const { data, error } = await dbAdmin.from("users").select("*")
+      .eq("telegram_id", tgUser.id).is("left_at", null).maybeSingle();
     if (!error) return data ?? null;
     lastErr = error;
     console.error(`lookupUser read failed (attempt ${attempt}):`, error);
@@ -402,20 +2096,25 @@ async function lookupUser(tgUser: any) {
   );
 }
 
-async function lookupPartner(userId: string) {
+async function lookupPartner(db: TenantDb, userId: string) {
   // Partner = the other member of the couple: the user whose native language is this
   // user's learning language. Keying on the complementary language (instead of
   // .neq("id")) means a stray 3rd row never breaks things, and it generalizes to any
   // configured pair (no en/uk assumption).
-  const { data: self } = await supabase.from("users").select("native_language, learning_language").eq("id", userId).single();
+  const { data: self } = await db.from("users").select("native_language, learning_language").eq("id", userId).single();
   if (!self) return null;
-  const { data, error } = await supabase.from("users").select("*").eq("native_language", self.learning_language).maybeSingle();
+  // is("left_at", null): a departed member is not a partner. Without this their row keeps
+  // answering here, so translations would still be forwarded to someone who left and the
+  // remaining person would be told they still have a partner.
+  const { data, error } = await db.from("users").select("*")
+    .eq("native_language", self.learning_language).is("left_at", null).maybeSingle();
   if (error) { console.error("lookupPartner failed:", error); return null; }
   return data;
 }
 
-async function lookupLearnerOfLanguage(lang: LangCode): Promise<any | null> {
-  const { data, error } = await supabase.from("users").select("*").eq("learning_language", lang).maybeSingle();
+async function lookupLearnerOfLanguage(db: TenantDb, lang: LangCode): Promise<any | null> {
+  const { data, error } = await db.from("users").select("*")
+    .eq("learning_language", lang).is("left_at", null).maybeSingle();
   if (error) { console.error("lookupLearnerOfLanguage failed:", error); return null; }
   return data;
 }
@@ -490,28 +2189,6 @@ function hasAnnotatableWord(text: string): boolean {
   return ANNOTATABLE_WORD.test(text ?? "");
 }
 
-// Annotate only what a human wrote, not what the bot wrote back.
-//
-// Every message used to get two annotation passes: one on the original text, one on the
-// translation. Both fed flashcards -- your partner's cards come from your originals,
-// yours come from the translations of your own messages -- but the two halves are not
-// equal. The second pass mines vocabulary out of the model's own output, which is also
-// where a wrong-sense card is most likely, since it re-analyzes text that was itself
-// generated under sense pressure.
-//
-// Measured over 90 days before this was turned off: both partners write overwhelmingly in
-// their native language (87% and 91%), so dropping the machine side retains 53.4% of
-// Ukrainian and 47.7% of English card supply, every card of it sourced from human
-// writing. Annotation is ~83% of API spend and this halves it.
-//
-// Flipping this back on is not sufficient on its own: migration 20260726010000 stopped
-// backfill_pending_sides from offering translation sides, so re-enabling here without
-// reverting that leaves the newly annotated sides invisible to /backfill. The commercial
-// build has no such constant and still annotates both sides.
-// Typed as boolean, not inferred as the literal `false`, so the guarded call sites stay
-// live code to the type checker and a flip back to true type-checks without edits.
-const ANNOTATE_TRANSLATION_SIDE: boolean = false;
-
 // The instance's two languages are the sender's native and learning languages (one
 // couple, two complementary languages). otherLang flips between them; isInstanceLang
 // tests membership.
@@ -579,7 +2256,7 @@ function exampleScriptMatchesLanguage(text: string, language: LangCode): boolean
   return cyrillicRatio <= (1 - CYRILLIC_SKIP_THRESHOLD);
 }
 
-function scheduleAnnotation(messageId: string, text: string, language: LangCode, otherLanguage: LangCode, source: string, parallelText?: string) {
+function scheduleAnnotation(db: TenantDb, messageId: string, text: string, language: LangCode, otherLanguage: LangCode, source: string, parallelText?: string) {
   if (!text) return;
   // Only meaningful for cross-script pairs: if the two instance languages share a
   // script, latin/cyrillic ratios never contradict the claimed language, so the check
@@ -591,7 +2268,7 @@ function scheduleAnnotation(messageId: string, text: string, language: LangCode,
     (expectedScript === "cyrillic" && cyrillicRatio < (1 - CYRILLIC_SKIP_THRESHOLD));
   if (wrongScript) {
     console.log(`skip annotation: ${source} ${messageId} letters=${letters} cyrillic=${Math.round(cyrillicRatio * 100)}%, expected ${language}`);
-    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(messageId, language));
+    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(db, messageId, language));
     return;
   }
   // Nothing a model could find. Retire the side with the same language-keyed row the
@@ -599,26 +2276,27 @@ function scheduleAnnotation(messageId: string, text: string, language: LangCode,
   // /backfill would re-annotate it on every run, spending exactly what was saved here.
   if (!hasAnnotatableWord(text)) {
     console.log(`skip annotation: ${source} ${messageId} no annotatable word (${language})`);
-    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(messageId, language));
+    scheduleBackgroundWork(`fallbackRow (${source}, ${messageId})`, writeFallbackAnnotation(db, messageId, language));
     return;
   }
-  scheduleBackgroundWork(`annotateMessage (${source}, ${messageId})`, annotateMessage(messageId, text, language, otherLanguage, parallelText));
+  scheduleBackgroundWork(`annotateMessage (${source}, ${messageId})`, annotateMessage(db, messageId, text, language, otherLanguage, parallelText));
 }
 
 // Language-tagged so message_annotations.language (generated from details->>'language')
 // is the real side language, letting the backfill anti-join retire the side.
-async function writeFallbackAnnotation(messageId: string, language: LangCode) {
-  const { error } = await supabase.from("message_annotations").upsert(
+async function writeFallbackAnnotation(db: TenantDb, messageId: string, language: LangCode) {
+  const { error } = await db.from("message_annotations").upsert(
     [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral", details: { language } }],
     { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
   if (error) console.error("fallback row insert failed:", error);
 }
 
 async function handleTextMessage(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const originalText = msg.text;
   const originalLang = await classifyLanguage(originalText, user.native_language, user.learning_language);
   const translationTargetLang = otherLang(originalLang, user);
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   const persons = buildPersonMap(user, partner);
   const speaker = persons[originalLang];
   // No partner (solo instance) = no fixed addressee, so skip addressee gender agreement.
@@ -626,8 +2304,8 @@ async function handleTextMessage(msg: any, user: any) {
   const translated = await translate(originalText, originalLang, translationTargetLang, speaker, addressee);
   const translationOk = translated !== null;
 
-  const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
-    conversation_id: DEFAULT_CONVERSATION_ID,
+  const { data: inserted, error: insertErr } = await db.from("messages").insert({
+    conversation_id: await conversationIdFor(db),
     sender_id: user.id,
     telegram_message_id: msg.message_id,
     original_text: originalText,
@@ -641,15 +2319,21 @@ async function handleTextMessage(msg: any, user: any) {
   if (translationOk) {
     await sendMessage(msg.chat.id, `${t(viewerLang(msg.from, user), "translation_header", { lang: translationTargetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, originalText, translated!, originalLang, translationTargetLang);
+    // Solo practice: with no partner there is nobody for forwardToPartner to reach, so the
+    // bot answers instead. Backgrounded -- the translation is what they paid for and must
+    // not wait on a second model call.
+    if (user.practice_partner && !(await lookupPartner(db, user.id))) {
+      scheduleBackgroundWork("practiceReply", practiceReply(user, msg.chat.id, originalText));
+    }
   } else {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "translation_failed_saved", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) }));
   }
 
   if (inserted) {
-    if (isInstanceLang(originalLang, user)) scheduleAnnotation(inserted.id, originalText, originalLang, translationTargetLang, "text-original", translationOk ? translated! : undefined);
-    if (ANNOTATE_TRANSLATION_SIDE && translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
+    if (isInstanceLang(originalLang, user)) scheduleAnnotation(db, inserted.id, originalText, originalLang, translationTargetLang, "text-original", translationOk ? translated! : undefined);
+    if (annotatesBothSides(user.plan) && translationOk && isInstanceLang(translationTargetLang, user)) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "text-translation", originalText);
     if (isInstanceLang(originalLang, user)) {
-      scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, originalText, originalLang));
+      scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, originalText, originalLang));
     }
   }
 
@@ -664,6 +2348,7 @@ async function handleTextMessage(msg: any, user: any) {
 }
 
 async function handleVoiceMessage(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const voice = msg.voice;
   let fileInfo: any;
   try {
@@ -684,8 +2369,12 @@ async function handleVoiceMessage(msg: any, user: any) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "voice_download_failed"));
     return;
   }
-  const storagePath = `${user.id}/${Date.now()}_${voice.file_id}.ogg`;
-  const { error: uploadErr } = await supabase.storage.from("voice-messages").upload(storagePath, audioBlob, { contentType: "audio/ogg" });
+  // Tenant-prefixed. The bucket is private and only the service role touches it, so this
+  // is defense in depth rather than the access control itself -- but it means a tenant's
+  // audio lives under one prefix, which is what makes "delete this account's data" a
+  // single recursive remove instead of a join against messages.
+  const storagePath = `${db.tenantId}/${user.id}/${Date.now()}_${voice.file_id}.ogg`;
+  const { error: uploadErr } = await db.storage.from("voice-messages").upload(storagePath, audioBlob, { contentType: "audio/ogg" });
   if (uploadErr) console.error("storage upload:", uploadErr);
 
   const transcribeResult = await transcribeWithWhisper(audioBlob, user);
@@ -702,15 +2391,15 @@ async function handleVoiceMessage(msg: any, user: any) {
     ? whisperCode
     : await classifyLanguage(transcript, user.native_language, user.learning_language);
   const targetLang = otherLang(originalLang, user);
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   const persons = buildPersonMap(user, partner);
   const speaker = persons[originalLang];
   const addressee = partner ? persons[targetLang] : undefined;
   const translated = await translate(transcript, originalLang, targetLang, speaker, addressee);
   const translationOk = translated !== null;
 
-  const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
-    conversation_id: DEFAULT_CONVERSATION_ID,
+  const { data: inserted, error: insertErr } = await db.from("messages").insert({
+    conversation_id: await conversationIdFor(db),
     sender_id: user.id,
     telegram_message_id: msg.message_id,
     original_text: transcript,
@@ -725,19 +2414,17 @@ async function handleVoiceMessage(msg: any, user: any) {
   if (insertErr) console.error("messages insert (voice) failed:", insertErr);
 
   if (translationOk) {
-    const vl = viewerLang(msg.from, user);
-    await sendMessage(msg.chat.id, `${t(vl, "voice_heard", { lang: originalLang })}\n${escapeHtml(transcript)}\n\n${t(vl, "translation_header", { lang: targetLang })}\n${escapeHtml(translated)}`, "HTML");
+    await sendMessage(msg.chat.id, `${t(viewerLang(msg.from, user), "voice_heard", { lang: originalLang })}\n${escapeHtml(transcript)}\n\n${t(viewerLang(msg.from, user), "translation_header", { lang: targetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardVoiceToPartner(user, voice.file_id, transcript, translated!, originalLang, targetLang);
   } else {
-    const vl = viewerLang(msg.from, user);
-    await sendMessage(msg.chat.id, `${t(vl, "voice_heard", { lang: originalLang })}\n${transcript}\n\n${t(vl, "translation_failed_transcript", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) })}`);
+    await sendMessage(msg.chat.id, `${t(viewerLang(msg.from, user), "voice_heard", { lang: originalLang })}\n${transcript}\n\n${t(viewerLang(msg.from, user), "translation_failed_transcript", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) })}`);
   }
 
   if (inserted) {
-    if (isInstanceLang(originalLang, user)) scheduleAnnotation(inserted.id, transcript, originalLang, targetLang, "voice-original", translationOk ? translated! : undefined);
-    if (ANNOTATE_TRANSLATION_SIDE && translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
+    if (isInstanceLang(originalLang, user)) scheduleAnnotation(db, inserted.id, transcript, originalLang, targetLang, "voice-original", translationOk ? translated! : undefined);
+    if (annotatesBothSides(user.plan) && translationOk && isInstanceLang(targetLang, user)) scheduleAnnotation(db, inserted.id, translated!, targetLang, originalLang, "voice-translation", transcript);
     if (isInstanceLang(originalLang, user)) {
-      scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, transcript, originalLang));
+      scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, transcript, originalLang));
     }
   }
 }
@@ -812,9 +2499,13 @@ async function translate(
   return null;
 }
 
-// The grammar assistant's chrome used to live here, in its own two-language table --
-// the only localization this build had. It is now five keys in strings.ts (grammar_*),
-// so there is one catalog rather than two systems that drift apart.
+// Chrome around the grammar note, in the reader's own language -- the correction text
+// itself already comes back in their native language from checkGrammar. A language with
+// no entry falls back to English, the same English-fallback convention the rest of the
+// bot's UI text uses.
+// GRAMMAR_UI is gone: its five strings live in the catalog with the other 85, in eight
+// languages instead of two. Two localization systems for one job was one too many, and the
+// old one silently gave English to anyone who was not an en or uk native.
 
 // A grammar verdict. `correct: true` means nothing to fix (and nothing to store --
 // there is no card in a sentence that was already right). Otherwise the pieces are kept
@@ -908,16 +2599,15 @@ async function checkGrammar(text: string, learnLang: LangCode, nativeLang: LangC
 // also recorded so /export can turn them into study cards; a failed insert is logged
 // but never blocks the note, since the coaching is the part the user is waiting on.
 async function grammarAssist(chatId: number, text: string, user: any, messageId?: string) {
+  const db = tenantDb(user.tenant_id);
   const verdict = await checkGrammar(text, user.learning_language, user.native_language);
   if (verdict === null) return; // API/parse failed -- stay silent rather than nag.
-  // grammarAssist runs in the background off the sender's own message, so there is no
-  // `msg` in scope -- the user row is the authority here anyway.
   const lang = viewerLang(undefined, user);
   if (verdict.correct) {
     await sendMessage(chatId, t(lang, "grammar_correct"));
     return;
   }
-  const { error } = await supabase.from("grammar_corrections").insert({
+  const { error } = await db.from("grammar_corrections").insert({
     user_id: user.id,
     message_id: messageId ?? null,
     language: user.learning_language,
@@ -938,17 +2628,136 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
 
 // /capybara [on|off] -- per-user toggle for the grammar assistant. Bare /capybara
 // flips the current state.
+// The /education and /memory hubs. Printed indexes, not launchers: only argument-free
+// commands get a button, because a button cannot carry the word /learn needs or the reply
+// /pin needs. Ported from telegram-bot.
+async function handleEducation(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
+  await sendMessage(msg.chat.id, `${t(lang, "edu_header")}\n\n${t(lang, "edu_body")}`, "HTML", {
+    inline_keyboard: [[
+      { text: t(lang, "edu_btn_vocab"), callback_data: "ed|vocab" },
+      { text: t(lang, "edu_btn_export"), callback_data: "ed|export" },
+      { text: t(lang, "edu_btn_mistakes"), callback_data: "ed|mistakes" },
+    ]],
+  });
+}
+
+async function handleMemory(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
+  await sendMessage(msg.chat.id, `${t(lang, "mem_header")}\n\n${t(lang, "mem_body")}`, "HTML", {
+    inline_keyboard: [[
+      { text: t(lang, "mem_btn_pinned"), callback_data: "mem|pinned" },
+    ]],
+  });
+}
+
+// /practice [on|off] -- the solo conversation partner. Bare /practice flips it.
+async function handlePractice(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
+  const lang = viewerLang(msg.from, user);
+  // Refuse rather than silently store a setting that will never fire: with a partner
+  // present, forwardToPartner handles the reply and the practice path never runs.
+  if (await lookupPartner(db, user.id)) {
+    await sendMessage(msg.chat.id, t(lang, "practice_has_partner"));
+    return;
+  }
+  const arg = (msg.text ?? "").replace(/^\/practice(@\S+)?/i, "").trim().toLowerCase();
+  const enabled = arg === "on" ? true : arg === "off" ? false : !user.practice_partner;
+  const { error } = await db.from("users").update({ practice_partner: enabled }).eq("id", user.id);
+  if (error) {
+    console.error("practice toggle failed:", error);
+    await sendMessage(msg.chat.id, t(lang, "practice_save_failed"));
+    return;
+  }
+  await sendMessage(msg.chat.id,
+    t(lang, enabled ? "practice_on" : "practice_off", { lang: langLabel(user.learning_language) }),
+    "HTML");
+}
+
+// How many turns of the thread to replay. Enough that it remembers what you just said and
+// what it asked you; short enough that a long session does not grow the prompt without
+// bound. Ten is five exchanges.
+const PRACTICE_CONTEXT_TURNS = 10;
+
+// The bot takes the empty seat. Replies in the learner's TARGET language -- the whole
+// point is production practice, so answering in their native language would defeat it.
+//
+// Runs in the background, after the translation has already been sent: the translation is
+// what they paid for and must not wait on this.
+async function practiceReply(user: any, chatId: number, userText: string) {
+  const db = tenantDb(user.tenant_id);
+
+  // A reply is a model call, so it costs a message. Charged rather than absorbed: at the
+  // measured per-message rate, giving it away would roughly double the cost of serving a
+  // Standard plan and erase its margin. On refusal, say nothing -- they have already had
+  // their translation, and the next message they send hits the gate and explains properly.
+  const verdict = await consumeQuota(user.tenant_id);
+  if (!verdict.allowed) return;
+
+  const { data: history } = await db
+    .from("practice_turns")
+    .select("role, content")
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: false })
+    .limit(PRACTICE_CONTEXT_TURNS);
+  const thread = (history ?? []).reverse()
+    .map((r: any) => ({ role: r.role === "assistant" ? "assistant" as const : "user" as const, content: r.content }));
+
+  const target = langMeta(user.learning_language).englishName;
+  const native = langMeta(user.native_language).englishName;
+  const system =
+    `You are a friendly conversation partner helping someone practise ${target}. ` +
+    `Their native language is ${native}.\n` +
+    `- Reply ONLY in ${target}. Never translate, never explain grammar, never switch to ${native}.\n` +
+    `- Keep it to 1-3 short sentences, and end with a question so the conversation continues.\n` +
+    `- Match their level: mirror the complexity of what they wrote rather than showing off.\n` +
+    `- Be a person having a chat, not a teacher. Do not correct their mistakes -- something ` +
+    `else does that, and being corrected mid-conversation is what stops people talking.\n` +
+    `- If they write to you in ${native}, answer in ${target} anyway, simply.`;
+
+  try {
+    const result = await withRetry(() => anthropic.messages.create({
+      // Same model as translation and the grammar check, not the cheap one. This is the
+      // conversational surface of a product that sells language quality: a stilted or
+      // wrong-register reply in the language they are learning is exactly what makes
+      // someone turn the feature off. The quota unit charged above pays for it.
+      model: CLAUDE_MODEL,
+      max_tokens: 300,
+      system,
+      messages: [...thread, { role: "user" as const, content: userText }],
+    }));
+    const block = result.content.find((b: any) => b.type === "text");
+    const reply = block?.type === "text" ? block.text.trim() : "";
+    if (!reply) { console.error("practiceReply: empty response"); return; }
+    await sendMessage(chatId, escapeHtml(reply), "HTML");
+    // Both sides recorded, so the thread reads as a conversation next time. This table is
+    // NOT the corpus: nothing here is annotated, mined for vocabulary, or embedded for
+    // /recap. The user's own turn is already in messages, where it does all of that.
+    const { error } = await db.from("practice_turns").insert([
+      { user_id: user.id, role: "user", content: userText },
+      { user_id: user.id, role: "assistant", content: reply },
+    ]);
+    if (error) console.error("practice_turns insert failed:", error);
+  } catch (e) {
+    // Silent: they already have their translation, and an apology in the wrong language
+    // is worse than nothing.
+    console.error("practiceReply failed:", e);
+  }
+}
+
 async function handleCapybara(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const arg = msg.text.replace(/^\/capybara(@\S+)?/i, "").trim().toLowerCase();
   const enabled = arg === "on" ? true : arg === "off" ? false : !user.grammar_assist;
   const lang = viewerLang(msg.from, user);
-  const { error } = await supabase.from("users").update({ grammar_assist: enabled }).eq("id", user.id);
+  const { error } = await db.from("users").update({ grammar_assist: enabled }).eq("id", user.id);
   if (error) {
     console.error("grammar toggle failed:", error);
     await sendMessage(msg.chat.id, t(lang, "grammar_save_failed"));
     return;
   }
-  await sendMessage(msg.chat.id, t(lang, enabled ? "grammar_on" : "grammar_off", { lang: langLabel(user.learning_language) }));
+  await sendMessage(msg.chat.id,
+    t(lang, enabled ? "grammar_on" : "grammar_off", { lang: langLabel(user.learning_language) }));
 }
 
 type WhisperResult =
@@ -1137,7 +2946,7 @@ async function runAnnotation(
 const ANNOTATION_REUSE_MAX_CHARS = 120;
 
 async function reuseAnnotationsForIdenticalText(
-  messageId: string, text: string, language: LangCode, parallelText?: string,
+  db: TenantDb, messageId: string, text: string, language: LangCode, parallelText?: string,
 ): Promise<boolean> {
   // Long texts effectively never repeat verbatim; skipping them keeps the lookup off the
   // path where it could never pay for itself (messages.original_text is unindexed).
@@ -1149,13 +2958,13 @@ async function reuseAnnotationsForIdenticalText(
     // a different translation would reintroduce exactly the wrong-sense card the SENSE
     // ANCHOR exists to prevent. Matching the pair makes reuse provably equivalent.
     const ids: string[] = [];
-    let asOriginalQ = supabase.from("messages").select("id")
+    let asOriginalQ = db.from("messages").select("id")
       .eq("original_language", language).eq("original_text", text).neq("id", messageId);
     if (parallelText) asOriginalQ = asOriginalQ.eq("translated_text", parallelText);
     const { data: asOriginal } = await asOriginalQ.limit(5);
     for (const r of asOriginal ?? []) ids.push((r as any).id);
 
-    let asTranslationQ = supabase.from("messages").select("id")
+    let asTranslationQ = db.from("messages").select("id")
       .eq("translated_language", language).eq("translated_text", text).neq("id", messageId);
     if (parallelText) asTranslationQ = asTranslationQ.eq("original_text", parallelText);
     const { data: asTranslation } = await asTranslationQ.limit(5);
@@ -1164,7 +2973,7 @@ async function reuseAnnotationsForIdenticalText(
 
     // language is the generated column on message_annotations (20260703000000), so this
     // cannot pick up the other side's annotations for the same message.
-    const { data: rows } = await supabase.from("message_annotations")
+    const { data: rows } = await db.from("message_annotations")
       .select("annotation_type, annotation_value, details")
       .in("message_id", ids).eq("language", language);
     if (!rows || rows.length === 0) return false;
@@ -1174,7 +2983,7 @@ async function reuseAnnotationsForIdenticalText(
     const seen = new Map<string, any>();
     for (const r of rows as any[]) {
       if (!r.annotation_value) continue;
-      seen.set(`${r.annotation_type} ${r.annotation_value}`, r);
+      seen.set(`${r.annotation_type} ${r.annotation_value}`, r);
     }
     if (seen.size === 0) return false;
 
@@ -1189,7 +2998,7 @@ async function reuseAnnotationsForIdenticalText(
         language: language,
       }));
     if (vocabRows.length > 0) {
-      await supabase.from("vocabulary").upsert(vocabRows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
+      await db.from("vocabulary").upsert(vocabRows, { onConflict: "tenant_id,lemma,part_of_speech,language", ignoreDuplicates: true });
     }
 
     const copies = [...seen.values()].map((r) => ({
@@ -1198,7 +3007,7 @@ async function reuseAnnotationsForIdenticalText(
       annotation_value: r.annotation_value,
       details: r.details,
     }));
-    const { error } = await supabase.from("message_annotations").upsert(copies,
+    const { error } = await db.from("message_annotations").upsert(copies,
       { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
     if (error) { console.error("annotation reuse insert failed:", error); return false; }
     console.log(`annotation reuse: ${messageId} (${language}) reused ${copies.length} row(s), no model call`);
@@ -1209,9 +3018,9 @@ async function reuseAnnotationsForIdenticalText(
   }
 }
 
-async function annotateMessage(messageId: string, text: string, language: LangCode, otherLanguage: LangCode, parallelText?: string) {
+async function annotateMessage(db: TenantDb, messageId: string, text: string, language: LangCode, otherLanguage: LangCode, parallelText?: string) {
   const writeFallbackRow = async () => {
-    const { error } = await supabase.from("message_annotations").upsert(
+    const { error } = await db.from("message_annotations").upsert(
       [{ message_id: messageId, annotation_type: "register", annotation_value: "neutral", details: { language } }],
       { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
     if (error) console.error("fallback row insert failed:", error);
@@ -1219,7 +3028,7 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
   // Also checked here, not only in scheduleAnnotation: the /backfill grind calls this
   // directly, and the backlog already in the database predates the live-path guard.
   if (!hasAnnotatableWord(text)) { await writeFallbackRow(); return; }
-  if (await reuseAnnotationsForIdenticalText(messageId, text, language, parallelText)) return;
+  if (await reuseAnnotationsForIdenticalText(db, messageId, text, language, parallelText)) return;
   const { parsed } = await runAnnotation(ANNOTATION_MODEL, text, language, otherLanguage, parallelText, messageId);
   if (!parsed) { await writeFallbackRow(); return; }
   const vocabRows = (parsed.vocabulary ?? [])
@@ -1233,7 +3042,11 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
       language: language,
     }));
   if (vocabRows.length > 0) {
-    await supabase.from("vocabulary").upsert(vocabRows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
+    // onConflict must name the tenant-scoped key (migrations-saas/20260726000000).
+    // With the old three-column target this upsert would match ANOTHER tenant's row for
+    // the same lemma and, with ignoreDuplicates, silently drop this couple's word --
+    // their vocabulary would be missing entries that "already existed" for strangers.
+    await db.from("vocabulary").upsert(vocabRows, { onConflict: "tenant_id,lemma,part_of_speech,language", ignoreDuplicates: true });
   }
   const annotations: any[] = [];
   for (const v of parsed.vocabulary ?? []) {
@@ -1247,7 +3060,7 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
   // fix). "register": "neutral" used to supply that marker as a side effect; now that the
   // prompt no longer asks for it, the fallback row is written explicitly.
   if (annotations.length === 0) { await writeFallbackRow(); return; }
-  await supabase.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
+  await db.from("message_annotations").upsert(annotations, { onConflict: "message_id,annotation_type,annotation_value,language", ignoreDuplicates: true });
 }
 
 // Escapes text for Telegram's HTML parse mode. Only these three characters are special,
@@ -1303,8 +3116,10 @@ async function answerCallbackQuery(callbackQueryId: string, text?: string) {
   if (!resp.ok) console.error("answerCallbackQuery failed:", resp.status, await resp.text().catch(() => "<no body>"));
 }
 
-// Edit a message's inline keyboard. Omitting replyMarkup removes the keyboard
-// entirely \u2014 used to retire the /update deploy button so it can't be tapped twice.
+// Edit a message's inline keyboard. Omitting replyMarkup removes the keyboard entirely,
+// which is how the onboarding wizard retires each question once answered and how the
+// deletion confirmation is withdrawn once tapped -- in both cases so a stale button
+// cannot be pressed a second time.
 async function editMessageReplyMarkup(chatId: number, messageId: number, replyMarkup?: any) {
   const body: any = { chat_id: chatId, message_id: messageId };
   if (replyMarkup) body.reply_markup = replyMarkup;
@@ -1432,35 +3247,37 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
 // Populates Telegram's "/" menu so the bot's commands are discoverable. Scoped:
 // both partners see PUBLIC_COMMANDS (default scope); the admin ALSO sees the admin
 // commands, in their own chat only.
-// Five entries, not thirteen. The study and memory commands moved behind /education
-// and /memory, which print them with their arguments -- a menu entry can only send the
-// bare command, so /learn and /note appeared in the menu as things you tap and then get
-// a usage error from. /ask keeps its own entry because it is the one people reach for
-// most. Every command still works typed out; only the menu shrank.
+// Descriptions are catalog keys, not literals. They were hardcoded English, so the "/"
+// menu -- the first thing a customer reads, and the list of what the product does -- was
+// in the wrong language whichever one they had picked. Ported from telegram-bot.
+// Eight entries, not seventeen. The study and memory commands moved behind /education and
+// /memory, which print them WITH their arguments -- a menu entry can only send the bare
+// command, so /learn and /note appeared in the menu as things you tap and then get a usage
+// error from.
 //
-// The descriptions are catalog keys, not literals. They used to be hardcoded English,
-// so the "/" menu stayed English for a Ukrainian reader no matter what -- the first
-// surface she sees, in the wrong language, on a build whose whole point is the
-// opposite. Telegram serves a per-language set (see registerCommandMenus).
+// What stays is what someone must be able to find without being told: /ask because it is
+// the one people reach for most, /management because a lapsed card and an exhausted
+// allowance both dead-end there, /plans because the default scope is what a stranger sees
+// before they have ever spoken to the bot, and /leave because a partner who wants out
+// should not have to ask the account owner how.
+//
+// Every command still works typed out; only the menu shrank.
 const PUBLIC_COMMANDS: { command: string; key: string }[] = [
-  { command: "start",     key: "cmd_start" },
-  { command: "help",      key: "cmd_help" },
-  { command: "education", key: "cmd_education" },
-  { command: "memory",    key: "cmd_memory" },
-  { command: "ask",       key: "cmd_ask" },
+  { command: "start",      key: "cmd_start" },
+  { command: "help",       key: "cmd_help" },
+  { command: "education",  key: "cmd_education" },
+  { command: "memory",     key: "cmd_memory" },
+  { command: "ask",        key: "cmd_ask" },
+  { command: "management", key: "cmd_billing" },
+  { command: "leave",      key: "cmd_leave" },
+  { command: "plans",      key: "cmd_plans" },
 ];
-// Only the two commands an admin uses on a live instance appear in the menu. The
-// one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
-// /recap_backfill) and the reply-based /reconcile & /restore are intentionally omitted
-// to keep the menu clean -- they remain fully functional when typed, and /help still
-// lists them.
-// /diag and /update are deliberately NOT here any more: they live behind /management,
-// which is one menu entry instead of two and puts them next to the usage they are usually
-// checked alongside. Both still work when typed -- removing a command from the menu is a
-// change to discoverability, not to capability, and muscle memory should not be punished.
-const ADMIN_COMMANDS: { command: string; key: string }[] = [
-  ...PUBLIC_COMMANDS,
-  { command: "management", key: "cmd_management" },
+
+// Superadmin entries stay English literals: one operator, who reads English. They are
+// only ever registered into that operator's own chat scope.
+const SUPERADMIN_EXTRA: { command: string; description: string }[] = [
+  { command: "tenants", description: "Admin: service overview \u2014 signups, quotas, spend" },
+  { command: "diag", description: "Admin: ping upstream APIs + DB" },
 ];
 
 // Resolve a command list's descriptions into one language.
@@ -1468,10 +3285,63 @@ function commandsIn(list: { command: string; key: string }[], lang: Lang) {
   return list.map(({ command, key }) => ({ command, description: t(lang, key) }));
 }
 
-// Ask Telegram what it ACTUALLY holds, rather than reporting what we believe we sent.
-// setMyCommands runs as background work, so a failure leaves the webhook returning 200
-// and the request log clean -- which is precisely why "did the menu register" was not
-// answerable from the outside. This reads the other end.
+async function setMyCommands(
+  commands: { command: string; description: string }[],
+  scope?: unknown,
+  languageCode?: string,
+): Promise<boolean> {
+  const body: Record<string, unknown> = { commands };
+  if (scope) body.scope = scope;
+  // Omitted entirely for the fallback set. Telegram treats a list with no language_code
+  // as the default for every language that has no set of its own, so sending "" would
+  // register a set for the empty-string language and leave the fallback unset.
+  if (languageCode) body.language_code = languageCode;
+  const resp = await fetch(`${TELEGRAM_API}/setMyCommands`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) { console.error("setMyCommands failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
+  return true;
+}
+
+// Release the compose-box menu button to "default".
+//
+// Ported from telegram-bot. This used to set type "commands" under a comment claiming
+// that produced the "/" shortcut; it does the opposite. "commands" puts a blue hamburger
+// in the LEFT slot, displacing GIF and emoji, and a tap opens the command list as a
+// sheet. "default" renders "/" inside the input field instead, which AUTOFILLS the
+// command rather than sending it -- so it composes with typing an argument, which is what
+// /learn <word> and /note <text> need.
+async function setChatMenuButtonToDefault(): Promise<boolean> {
+  const resp = await fetch(`${TELEGRAM_API}/setChatMenuButton`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ menu_button: { type: "default" } }),
+  });
+  if (!resp.ok) { console.error("setChatMenuButton failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
+  return true;
+}
+
+// Every update type this bot needs. Telegram's default covers all of these, but the
+// default is NOT what an existing webhook falls back to.
+//
+// setWebhook's contract: "If not specified, the previous setting will be used." So
+// allowed_updates is sticky -- once registered narrow, every later setWebhook call that
+// omits the parameter silently preserves the narrow list, and Telegram simply stops
+// delivering the other types with no error anywhere.
+//
+// On the single-tenant bot this had left the webhook on ["message"], which killed every
+// inline button. On THIS build that failure mode is far worse: the plan picker, the whole
+// onboarding wizard and the trial flow are inline keyboards, so a customer who has just
+// paid would tap and get nothing, with no error to report and nothing in the logs.
+const REQUIRED_UPDATES = ["message", "edited_message", "callback_query"];
+
+// Ask Telegram what it ACTUALLY holds. setMyCommands runs as background work, so a
+// failure leaves the webhook returning 200 and the request log clean -- "did the menu
+// register" is not answerable from inside the process. That matters more here than on the
+// single-tenant build: there are eight language sets, and a customer served the wrong one
+// has no way to tell you which of them is missing.
 async function getMyCommands(scope?: unknown, languageCode?: string): Promise<
   { ok: true; commands: { command: string; description: string }[] } | { ok: false; error: string }
 > {
@@ -1492,71 +3362,6 @@ async function getMyCommands(scope?: unknown, languageCode?: string): Promise<
   }
 }
 
-async function setMyCommands(
-  commands: { command: string; description: string }[],
-  scope?: unknown,
-  languageCode?: string,
-): Promise<boolean> {
-  const body: Record<string, unknown> = { commands };
-  if (scope) body.scope = scope;
-  // Omitted entirely for the fallback set. Telegram treats a list with no language_code
-  // as the default for every language that has no set of its own, so sending "" here
-  // would register a set for the empty-string language and leave the fallback unset.
-  if (languageCode) body.language_code = languageCode;
-  const resp = await fetch(`${TELEGRAM_API}/setMyCommands`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) { console.error("setMyCommands failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
-  return true;
-}
-
-// Release the compose-box menu button back to "default".
-//
-// This used to set type "commands", with a comment claiming that produced the "/"
-// shortcut. It does the opposite, which a screenshot of the live chat settled: type
-// "commands" is what puts the blue hamburger in the LEFT slot, displacing the GIF and
-// emoji buttons, and a tap opens the command list as a sheet.
-//
-// Type "default" is the shape we actually want. The left slot goes back to GIF and
-// emoji, and Telegram renders "/" inside the input field instead -- which autofills a
-// slash command rather than opening a sheet, so it composes with typing an argument.
-// That matters more since the commands worth tapping now live behind /education and
-// /memory, and the ones that need an argument are typed.
-//
-// Set globally (no chat scope), so it applies to both partners. A per-chat value set
-// previously would still win over this default; none is set here.
-//
-// telegram-bot-saas never calls setChatMenuButton at all, so it has always been on
-// default -- this makes the two builds agree rather than diverge for no reason.
-async function setChatMenuButtonToDefault(): Promise<boolean> {
-  const resp = await fetch(`${TELEGRAM_API}/setChatMenuButton`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ menu_button: { type: "default" } }),
-  });
-  if (!resp.ok) { console.error("setChatMenuButton failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
-  return true;
-}
-
-// Every update type this bot needs. Telegram's own default covers all of these, but the
-// default is NOT what an existing webhook falls back to.
-//
-// setWebhook's contract: "If not specified, the previous setting will be used." So
-// allowed_updates is sticky -- once a webhook has been registered with a narrow list,
-// every later setWebhook call that omits the parameter silently preserves the narrow
-// list. Neither provision.sh nor setup.ts passes it, so a webhook restricted to
-// ["message"] at any point in its life stays that way forever, and no error is ever
-// raised: Telegram simply never delivers the other types.
-//
-// That is what broke the /education and /memory buttons. A tap produces a callback_query,
-// the callback_query was never delivered, and the function was never invoked -- the
-// request log showed the two typed commands either side of the tap and nothing between.
-// Nothing in the bot could have detected it, because from inside there is no difference
-// between "no one tapped" and "taps are not being delivered".
-const REQUIRED_UPDATES = ["message", "edited_message", "callback_query"];
-
 async function getWebhookInfo(): Promise<any | null> {
   try {
     const resp = await fetch(`${TELEGRAM_API}/getWebhookInfo`);
@@ -1568,19 +3373,16 @@ async function getWebhookInfo(): Promise<any | null> {
   }
 }
 
-// Widen allowed_updates if it is set and missing something we need.
-//
-// Deliberately conservative. It reuses the URL Telegram ALREADY HAS rather than a URL
-// computed from env -- a computed one would differ behind a custom domain, and this would
-// then point the webhook somewhere the bot is not. It re-sends secret_token because
-// setWebhook DROPS the secret when the parameter is omitted, which would leave the
-// endpoint unauthenticated. And it does nothing at all when allowed_updates is absent or
-// empty, since that already means "all default types".
+// Reuses the URL Telegram ALREADY HAS rather than one computed from env -- a computed URL
+// differs behind a custom domain and would point the webhook away from the bot, turning a
+// broken button into a dead service. Re-sends secret_token because setWebhook DROPS the
+// secret when the parameter is omitted. Does nothing when allowed_updates is empty, since
+// that already means "all default types".
 async function ensureWebhookAllowsCallbacks(): Promise<boolean> {
   const info = await getWebhookInfo();
   if (!info) return false;
   const allowed: string[] = info.allowed_updates ?? [];
-  if (allowed.length === 0) return true;                      // empty = Telegram's default = fine
+  if (allowed.length === 0) return true;
   const missing = REQUIRED_UPDATES.filter((u) => !allowed.includes(u));
   if (missing.length === 0) return true;
   if (!info.url) { console.error("webhook has no url; refusing to re-register"); return false; }
@@ -1602,23 +3404,58 @@ async function ensureWebhookAllowsCallbacks(): Promise<boolean> {
   }
 }
 
-// A chat-scoped command list for each registered user, in their own native_language.
-// The admin's list additionally carries /management -- and must still spread the public
-// commands, since a chat scope replaces the default one rather than adding to it, so a
-// chat list without them would hide /start and /help from the admin entirely.
-async function registerPerUserMenus(): Promise<boolean> {
-  const { data, error } = await supabase.from("users").select("telegram_id, native_language");
-  if (error) { console.error("per-user command menus: users read failed:", error); return false; }
-  let ok = true;
-  for (const u of (data ?? []) as any[]) {
-    if (!u.telegram_id) continue;
-    // viewerLang, not native_language directly: it normalises and falls back to English
-    // for a language this build has no copy for, rather than registering an empty menu.
-    const lang = viewerLang(undefined, u);
-    const list = Number(u.telegram_id) === BACKFILL_ADMIN_TELEGRAM_ID ? ADMIN_COMMANDS : PUBLIC_COMMANDS;
-    ok = await setMyCommands(commandsIn(list, lang), { type: "chat", chat_id: u.telegram_id }) && ok;
-  }
-  return ok;
+// A chat-scoped command list in the customer's OWN chosen language.
+//
+// The per-language sets above are matched by Telegram against the reader's APP language,
+// which is not necessarily the language they picked here -- a Ukrainian speaker running
+// Telegram in English gets the English fallback however correctly the Ukrainian set is
+// registered. A chat scope outranks the default scope, and within a scope a list with NO
+// language_code applies whatever the app language is, so this pins the menu to their
+// choice.
+//
+// Set LAZILY -- once per user per warm instance, on a message they send -- rather than by
+// iterating the users table on cold start. Iterating is what the single-tenant build does,
+// and it is fine for two people; here it would be one Telegram call per customer per cold
+// start, growing with the customer base and mostly for people who are not even active.
+// This way the cost falls only on people actually using the bot.
+const chatMenuSet = new Set<number>();
+async function setChatMenuForUser(user: any): Promise<void> {
+  const id = Number(user?.telegram_id);
+  if (!id || chatMenuSet.has(id)) return;
+  const lang = viewerLang(undefined, user);
+  const list = id === SUPERADMIN_TELEGRAM_ID
+    ? [...commandsIn(PUBLIC_COMMANDS, lang), ...SUPERADMIN_EXTRA]
+    : commandsIn(PUBLIC_COMMANDS, lang);
+  // Mark it done regardless of outcome: a failure retries on the next cold start, and
+  // retrying every message would turn a Telegram outage into a per-message API storm.
+  chatMenuSet.add(id);
+  await setMyCommands(list, { type: "chat", chat_id: id });
+}
+
+// A card's example sentence, chosen on evidence rather than on chronology. Ported from
+// telegram-bot; see migrations-saas/20260801060000_pick_example_message_tenant.sql.
+//
+// Cards used to take example_message_id = first_seen_message_id, with nothing checking
+// that the card's taught translation survives into that message -- it often does not,
+// because good translation is idiomatic. The RPC checks both sides and falls back to
+// first_seen_message_id, so this can only improve a card or leave it as it was.
+//
+// The tenant argument is not optional bookkeeping: unscoped, a customer's flashcard could
+// take its example from another couple's conversation, and it would look like the feature
+// working rather than a leak.
+//
+// A failure must not block adding the card -- the deck entry is what the user asked for,
+// the example is decoration on it -- so an error leaves every card on the old behaviour.
+async function pickExamples(tenantId: string, vocabIds: string[]): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  if (vocabIds.length === 0) return out;
+  const { data, error } = await dbAdmin.rpc("pick_example_messages", {
+    p_tenant_id: tenantId,
+    p_vocabulary_ids: vocabIds,
+  });
+  if (error) { console.error("pick_example_messages failed, falling back to first_seen:", error); return out; }
+  for (const r of (data ?? []) as any[]) out.set(r.vocabulary_id, r.message_id ?? null);
+  return out;
 }
 
 let commandsRegistered = false;
@@ -1627,48 +3464,34 @@ let commandsRegistered = false;
 // transient failure retries on the next request rather than waiting for a cold start.
 async function ensureCommandsRegistered(): Promise<void> {
   if (commandsRegistered) return;
-  let ok = true;
-
-  // English goes up with NO language_code -- that is Telegram's fallback set, served to
-  // every app language without one of its own. Each other language then gets its own
-  // set. Telegram matches on the reader's Telegram app language, which is the only
-  // signal available: the menu renders client-side before any handler runs, so there is
-  // no request from which to look a user row up.
-  ok = await setMyCommands(commandsIn(PUBLIC_COMMANDS, "en")) && ok;
+  // English goes up with NO language_code -- Telegram's fallback set, served to every app
+  // language without one of its own. Each other language then gets its own set.
+  let okPublic = await setMyCommands(commandsIn(PUBLIC_COMMANDS, "en"));
   for (const lang of LANGS) {
     if (lang === "en") continue;
-    ok = await setMyCommands(commandsIn(PUBLIC_COMMANDS, lang), undefined, lang) && ok;
+    okPublic = await setMyCommands(commandsIn(PUBLIC_COMMANDS, lang), undefined, lang) && okPublic;
   }
-
-  // Then one chat-scoped list per registered partner, in THAT PERSON'S native_language.
-  //
-  // This is the part the language_code sets above cannot do. Telegram matches
-  // language_code against the reader's Telegram APP language -- so a Ukrainian speaker
-  // running Telegram in English or Russian was served the English fallback no matter how
-  // correctly the Ukrainian set was registered. That is precisely what happened: /help
-  // arrived in Ukrainian (resolved from her user row) while the menu above it was in
-  // English (resolved from her phone), from one bot, in the same chat.
-  //
-  // We hold better information than Telegram does: she told us her language at setup.
-  // A chat scope outranks the default one, and within a scope a list with NO
-  // language_code applies whatever the app language is -- so putting her language's copy
-  // in that slot makes the menu follow her user row, the same signal every message body
-  // already follows.
-  //
-  // The default sets above still matter: they serve anyone with no user row, which on
-  // this build is a stranger who has messaged the bot but is not registered.
-  ok = await registerPerUserMenus() && ok;
-
-  ok = await setChatMenuButtonToDefault() && ok;
-  ok = await ensureWebhookAllowsCallbacks() && ok;
-  if (ok) commandsRegistered = true;
+  // The operator's own chat. A chat scope REPLACES the default rather than adding to it,
+  // so this must carry the public commands too or /start and /help vanish for them.
+  let okAdmin = true;
+  if (!Number.isNaN(SUPERADMIN_TELEGRAM_ID)) {
+    okAdmin = await setMyCommands(
+      [...commandsIn(PUBLIC_COMMANDS, "en"), ...SUPERADMIN_EXTRA],
+      { type: "chat", chat_id: SUPERADMIN_TELEGRAM_ID },
+    );
+  }
+  const okMenuButton = await setChatMenuButtonToDefault();
+  const okWebhook = await ensureWebhookAllowsCallbacks();
+  if (okPublic && okAdmin && okMenuButton && okWebhook) commandsRegistered = true;
 }
 
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
-  const partner = await lookupPartner(sender.id);
+  const db = tenantDb(sender.tenant_id);
+  const partner = await lookupPartner(db, sender.id);
   if (!partner) return;
   const senderName = sender.display_name;
-  // The partner is the one reading this, so the furniture is in THEIR language.
+  // The partner is the one reading this, so the furniture is in THEIR language --
+  // viewerLang off the partner row, not the sender's.
   const pLang = viewerLang(undefined, partner);
   await sendMessage(partner.telegram_id,
     `${t(pLang, "fwd_says", { name: escapeHtml(senderName), lang: transLang })}\n${escapeHtml(translated)}\n\n${t(pLang, "original_label", { lang: origLang })}\n${escapeHtml(original)}`,
@@ -1676,7 +3499,8 @@ async function forwardToPartner(sender: any, original: string, translated: strin
 }
 
 async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcript: string, translated: string, origLang: string, transLang: string) {
-  const partner = await lookupPartner(sender.id);
+  const db = tenantDb(sender.tenant_id);
+  const partner = await lookupPartner(db, sender.id);
   if (!partner) return;
   const senderName = sender.display_name;
   await sendVoice(partner.telegram_id, voiceFileId);
@@ -1691,7 +3515,8 @@ async function forwardVoiceToPartner(sender: any, voiceFileId: string, transcrip
 // from the phone gallery. Forwarding by file_id works at any size, so there is no
 // download/Whisper step and no 20 MB bot-download limit to worry about.
 async function handleVideoMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   const senderName = user.display_name;
 
   if (msg.video_note) {
@@ -1720,7 +3545,8 @@ async function handleVideoMessage(msg: any, user: any) {
 // the same approach as handleVideoMessage. Telegram sends msg.photo as an array of
 // the same image at increasing resolutions, so the largest is the last entry.
 async function handlePhotoMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🖼️" }));
     return;
@@ -1734,7 +3560,8 @@ async function handlePhotoMessage(msg: any, user: any) {
 // msg.document, not msg.photo) are forwarded as-is by file_id, the same approach as
 // handlePhotoMessage / handleVideoMessage: no download, translation, or corpus storage.
 async function handleDocumentMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "📎" }));
     return;
@@ -1759,15 +3586,16 @@ async function translateAndForwardCaption(msg: any, user: any, caption: string) 
 // gender agreement, shows the sender the translation, forwards a bilingual note to the
 // partner, and stores the caption as a study-corpus message (input_type "text").
 async function translateCaptionToPartner(user: any, senderChatId: number, caption: string, telegramMessageId: number | null) {
+  const db = tenantDb(user.tenant_id);
   const originalLang = await classifyLanguage(caption, user.native_language, user.learning_language);
   const translationTargetLang = otherLang(originalLang, user);
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   const persons = buildPersonMap(user, partner);
   const translated = await translate(caption, originalLang, translationTargetLang, persons[originalLang], partner ? persons[translationTargetLang] : undefined);
   const translationOk = translated !== null;
 
-  const { data: inserted, error: insertErr } = await supabase.from("messages").insert({
-    conversation_id: DEFAULT_CONVERSATION_ID,
+  const { data: inserted, error: insertErr } = await db.from("messages").insert({
+    conversation_id: await conversationIdFor(db),
     sender_id: user.id,
     telegram_message_id: telegramMessageId,
     original_text: caption,
@@ -1782,13 +3610,14 @@ async function translateCaptionToPartner(user: any, senderChatId: number, captio
     await sendMessage(senderChatId, `${t(viewerLang(undefined, user), "caption_translation_header", { lang: translationTargetLang })}\n${escapeHtml(translated)}`, "HTML");
     await forwardToPartner(user, caption, translated!, originalLang, translationTargetLang);
   } else {
-    await sendMessage(senderChatId, t(viewerLang(undefined, user), "caption_translation_failed", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) }));
+    await sendMessage(senderChatId,
+      t(viewerLang(undefined, user), "caption_translation_failed", { err: friendlyTranslateError(LAST_TRANSLATE_ERROR) }));
   }
 
   if (inserted) {
-    scheduleAnnotation(inserted.id, caption, originalLang, translationTargetLang, "caption-original", translationOk ? translated! : undefined);
-    if (ANNOTATE_TRANSLATION_SIDE && translationOk) scheduleAnnotation(inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
-    scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(inserted.id, caption, originalLang));
+    scheduleAnnotation(db, inserted.id, caption, originalLang, translationTargetLang, "caption-original", translationOk ? translated! : undefined);
+    if (annotatesBothSides(user.plan) && translationOk) scheduleAnnotation(db, inserted.id, translated!, translationTargetLang, originalLang, "caption-translation", caption);
+    scheduleBackgroundWork(`embedMessage (${inserted.id})`, embedMessageBackground(db.tenantId, inserted.id, caption, originalLang));
   }
 }
 
@@ -1809,7 +3638,8 @@ async function finishMediaForward(msg: any, user: any, partner: any, noCaptionAt
 
 // Audio files (music / non-voice audio). Caption translated + corpus'd like a photo.
 async function handleAudioMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎵" }));
     return;
@@ -1821,7 +3651,8 @@ async function handleAudioMessage(msg: any, user: any) {
 // Animations / GIFs. Telegram also sets msg.document on an animation, so the dispatch
 // checks msg.animation BEFORE msg.document.
 async function handleAnimationMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎞️" }));
     return;
@@ -1832,7 +3663,8 @@ async function handleAnimationMessage(msg: any, user: any) {
 
 // Stickers are forwarded as-is; they never carry a caption, so there is no translation.
 async function handleStickerMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "🎭" }));
     return;
@@ -1845,7 +3677,8 @@ async function handleStickerMessage(msg: any, user: any) {
 // Location or venue. A venue message ALSO carries msg.location, so the dispatch and
 // this handler check venue first, else the title/address would be dropped. No translation.
 async function handleLocationMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "📍" }));
     return;
@@ -1864,7 +3697,8 @@ async function handleLocationMessage(msg: any, user: any) {
 
 // Shared contact card. No translation.
 async function handleContactMessage(msg: any, user: any) {
-  const partner = await lookupPartner(user.id);
+  const db = tenantDb(user.tenant_id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "fwd_no_partner", { icon: "👤" }));
     return;
@@ -1917,10 +3751,11 @@ async function forwardMediaGroupFallback(msg: any, user: any) {
 }
 
 async function handleMediaGroupItem(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const item = mediaGroupItemOf(msg);
   if (!item) { await forwardMediaGroupFallback(msg, user); return; }
   const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
-  const { error } = await supabase.from("pending_media_group").insert({
+  const { error } = await db.from("pending_media_group").insert({
     media_group_id: String(msg.media_group_id),
     sender_id: user.id,
     chat_id: msg.chat.id,
@@ -1936,12 +3771,13 @@ async function handleMediaGroupItem(msg: any, user: any) {
 }
 
 async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
+  const db = tenantDb(user.tenant_id);
   await new Promise((r) => setTimeout(r, ALBUM_DEBOUNCE_MS));
   // Atomic single-flush claim: the first flusher's DELETE drains the group; concurrent
   // flushers get 0 rows and return. The same DELETE also sweeps rows older than
   // ALBUM_STALE_MS (orphans from an instance that died mid-debounce) so nothing lingers.
   const staleCutoff = new Date(Date.now() - ALBUM_STALE_MS).toISOString();
-  const { data: rows, error } = await supabase
+  const { data: rows, error } = await db
     .from("pending_media_group")
     .delete()
     .or(`media_group_id.eq.${mediaGroupId},created_at.lt.${staleCutoff}`)
@@ -1952,7 +3788,7 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   groupRows.sort((a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
 
   const senderChatId = groupRows[0].chat_id;
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
     await sendMessage(senderChatId, t(viewerLang(undefined, user), "fwd_no_partner", { icon: "🖼️" }));
     return;
@@ -1976,7 +3812,7 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   if (caption) {
     const allVideo = groupRows.every((r: any) => r.item.type === "video");
     if (allVideo) {
-      await sendMessage(partner.telegram_id, t(viewerLang(undefined, partner), "fwd_partner_caption", { icon: "🎥", name: user.display_name, text: caption }));
+      await sendMessage(partner.telegram_id, `🎥 ${user.display_name}: ${caption}`);
     } else {
       await translateCaptionToPartner(user, senderChatId, caption, null);
     }
@@ -1994,6 +3830,15 @@ function csvEscape(value: string | null | undefined): string {
 // grows. Run it in the background so it can never approach the window Telegram waits
 // before retrying an update: a retry would re-run the whole build and deliver the file
 // twice. The user gets an immediate acknowledgement instead of a silent pause.
+async function handleExport(msg: any, user: any) {
+  // "/export new" limits the file to cards added since the last completed export. Anki
+  // matches on the first field and UPDATES rather than duplicating, so a full re-import is
+  // harmless -- this is about being able to see what is new, not about avoiding damage.
+  const onlyNew = /^\/export(@\S+)?\s+new\b/i.test((msg.text ?? "").trim());
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "export_building"));
+  scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user, onlyNew));
+}
+
 // Replaces `word` in `sentence` with a blank, matching it as a WHOLE word. JavaScript's
 // \b is ASCII-only, so it cannot be used here: a Cyrillic "довго" would otherwise match
 // inside "довгого" and blank only the stem, leaking "го" onto the card front. The
@@ -2001,9 +3846,9 @@ function csvEscape(value: string | null | undefined): string {
 // present as a standalone token, so the caller can fall back rather than emit a
 // half-blanked sentence.
 //
-// At module scope because /export and /mistakes build the same fill-in-the-blank card.
-// Two copies would drift, and the drift would be invisible: a card that blanks the stem
-// still looks like a card.
+// At module scope because /export and /mistakes both build the same fill-in-the-blank
+// card from a grammar correction. Two copies of this would drift, and the drift would be
+// invisible: a card that blanks the stem still looks like a card.
 function blankWord(sentence: string, word: string): string | null {
   const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   let re: RegExp;
@@ -2017,93 +3862,49 @@ function blankWord(sentence: string, word: string): string | null {
 
 // The parenthetical that makes a blanked sentence answerable. "Я дуже _____ тобою." could
 // take any of several verbs, so the front names the word by dictionary form and meaning,
-// leaving only the inflection to produce -- which is the skill being tested.
+// leaving only the inflection to produce -- which is the skill being tested. The category
+// rides along only when the word does: on its own it names the KIND of mistake rather than
+// the missing word, which reads as a hint and leads nowhere.
 function clozeClue(g: any): string {
   const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
   return word ? `  (${[word, g.category].filter(Boolean).join(" · ")})` : "";
 }
 
-// Your own recent mistakes, as fill-in-the-blank, in the chat.
-//
-// Ported from telegram-bot-saas (saas-v27). The corrections have been collected since the
-// grammar assistant shipped and, until now, only ever left through /export -- so they were
-// useful if you set up Anki and invisible otherwise. One indexed read, no model call.
-//
-// Answers hide behind Telegram's spoiler formatting rather than a button: the whole set
-// arrives in one message, with no callback round-trip, no state to keep, and no way to be
-// left half-way through a review the bot has forgotten about.
-async function handleMistakes(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
-  const { data, error } = await supabase
-    .from("grammar_corrections")
-    .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
-    .eq("user_id", user.id)
-    .order("created_at", { ascending: false })
-    .limit(5);
-  if (error) {
-    console.error("mistakes read failed:", error);
-    await sendMessage(msg.chat.id, t(lang, "mistakes_failed"));
-    return;
-  }
-  const rows = data ?? [];
-  if (rows.length === 0) {
-    await sendMessage(msg.chat.id, t(lang, user.grammar_assist ? "mistakes_none" : "mistakes_off"));
-    return;
-  }
+async function exportRun(chatId: number, user: any, onlyNew = false) {
+  const db = tenantDb(user.tenant_id);
+  // Only meaningful once something has been exported before; on a first run "new" is
+  // everything, which is also what the user would want.
+  const since: string | null = onlyNew ? (user.last_exported_at ?? null) : null;
 
-  const blocks = rows.map((g: any, i: number) => {
-    // Blank the corrected word out of the CORRECTED sentence, so you never re-read your
-    // own error before recalling. The wrong form appears afterwards, as contrast.
-    const cloze = g.correction_focus ? blankWord(g.corrected_text ?? "", g.correction_focus) : null;
-    const n = `${i + 1}.`;
-    if (cloze) {
-      const answer = escapeHtml(String(g.correction_focus));
-      const wrote = g.error_focus ? ` ${t(lang, "mistakes_you_wrote", { wrote: escapeHtml(String(g.error_focus)) })}` : "";
-      const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
-      return `${n} ${escapeHtml(cloze)}${escapeHtml(clozeClue(g))}\n   <tg-spoiler><b>${answer}</b>${why}${wrote}</tg-spoiler>`;
-    }
-    const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
-    return `${n} ${escapeHtml(String(g.original_text ?? ""))}\n   <tg-spoiler><b>${escapeHtml(String(g.corrected_text ?? ""))}</b>${why}</tg-spoiler>`;
-  });
-
-  await sendMessage(msg.chat.id,
-    `${t(lang, "mistakes_header")}\n\n${blocks.join("\n\n")}\n\n${t(lang, "mistakes_footer")}`,
-    "HTML");
-}
-
-async function handleExport(msg: any, user: any) {
-  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "export_building"));
-  scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user));
-}
-
-async function exportRun(chatId: number, user: any) {
-  // exportRun is scheduled as background work, so there is no `msg` here -- the user
-  // row is the authority for their language anyway.
-  const lang = viewerLang(undefined, user);
-  const { data: cards, error } = await supabase
+  let cardQuery = db
     .from("flashcards")
     .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
     .order("created_at", { ascending: true });
+  if (since) cardQuery = cardQuery.gt("created_at", since);
+  const { data: cards, error } = await cardQuery;
 
   if (error) {
     console.error("export query failed:", error);
-    await sendMessage(chatId, t(lang, "export_failed"));
+    await sendMessage(chatId, t(viewerLang(undefined, user), "export_failed"));
     return;
   }
 
   // Grammar corrections ride in the same file as a third deck. They are personal, so
   // only the requester's own rows are exported. A read failure here degrades to a
   // vocabulary-only export rather than losing the whole thing.
-  const { data: corrections, error: corrError } = await supabase
+  let corrQuery = db
     .from("grammar_corrections")
     .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
     .eq("user_id", user.id)
     .order("created_at", { ascending: true });
+  if (since) corrQuery = corrQuery.gt("created_at", since);
+  const { data: corrections, error: corrError } = await corrQuery;
   if (corrError) console.error("export: grammar_corrections read failed:", corrError);
   const grammarRows = corrections ?? [];
 
   if ((!cards || cards.length === 0) && grammarRows.length === 0) {
-    await sendMessage(chatId, t(lang, "export_empty"));
+    await sendMessage(chatId, t(viewerLang(undefined, user),
+      since ? "export_no_new" : "export_empty"));
     return;
   }
 
@@ -2201,7 +4002,7 @@ async function exportRun(chatId: number, user: any) {
   const grammarCount = rows.length - Object.values(deckCounts).reduce((a, b) => a + b, 0);
 
   if (rows.length === 0) {
-    await sendMessage(chatId, t(lang, "export_no_rows"));
+    await sendMessage(chatId, t(viewerLang(undefined, user), "export_nothing"));
     return;
   }
 
@@ -2246,54 +4047,135 @@ async function exportRun(chatId: number, user: any) {
       : "") +
     blankedNote;
   await sendDocument(chatId, filename, csv, "text/csv", caption);
+
+  // Recorded only after the file is actually sent. Marking the export before delivery
+  // would advance the "new" cutoff past cards the user never received, so a failed send
+  // would silently drop them from the next incremental export too.
+  //
+  // Fire-and-forget on failure: the customer has their file, and losing a counter is not
+  // worth an error message about something that, from their side, worked.
+  const { error: markErr } = await dbAdmin.from("users")
+    .update({ last_exported_at: new Date().toISOString(), export_count: (user.export_count ?? 0) + 1 })
+    .eq("id", user.id);
+  if (markErr) console.error("export: failed to record run:", markErr);
 }
 
-async function refreshVocabularyCounts() {
-  const { error } = await supabase.rpc("refresh_vocabulary_counts");
+// Your own recent mistakes, as fill-in-the-blank, in the chat.
+//
+// The data has been collected since the grammar assistant shipped and, until now, only
+// ever left through /export -- which means the corrections were useful to the small number
+// of people who set up Anki and invisible to everyone else. This costs nothing to serve
+// (one indexed read, no model call) and makes /capybara feel like it is FOR something
+// rather than a thing that comments on a message and moves on.
+//
+// Answers are hidden behind Telegram's spoiler formatting rather than a button, so the
+// whole set arrives in one message with no callback round-trip, no state to keep, and no
+// way to end up half-way through a review that the bot has forgotten about.
+async function handleMistakes(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
+  const lang = viewerLang(msg.from, user);
+  const { data, error } = await db
+    .from("grammar_corrections")
+    .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: false })
+    .limit(5);
+  if (error) {
+    console.error("mistakes read failed:", error);
+    await sendMessage(msg.chat.id, t(lang, "mistakes_failed"));
+    return;
+  }
+  const rows = data ?? [];
+  if (rows.length === 0) {
+    await sendMessage(msg.chat.id, t(lang, user.grammar_assist ? "mistakes_none" : "mistakes_off"), "HTML");
+    return;
+  }
+
+  const blocks = rows.map((g: any, i: number) => {
+    // Same preferred shape as the exported card: blank the corrected word out of the
+    // CORRECTED sentence, so the learner never re-reads their own error before recalling.
+    const cloze = g.correction_focus ? blankWord(g.corrected_text ?? "", g.correction_focus) : null;
+    const n = `${i + 1}.`;
+    if (cloze) {
+      const answer = escapeHtml(String(g.correction_focus));
+      const wrote = g.error_focus ? ` ${t(lang, "mistakes_you_wrote", { wrote: escapeHtml(String(g.error_focus)) })}` : "";
+      const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
+      return `${n} ${escapeHtml(cloze)}${escapeHtml(clozeClue(g))}\n   <tg-spoiler><b>${answer}</b>${why}${wrote}</tg-spoiler>`;
+    }
+    // No single word to blank (word order, a missing word). Show what they wrote, with the
+    // correction hidden -- still a recall step rather than a read.
+    const why = g.explanation ? ` ${escapeHtml(String(g.explanation))}` : "";
+    return `${n} ${escapeHtml(String(g.original_text ?? ""))}\n   <tg-spoiler><b>${escapeHtml(String(g.corrected_text ?? ""))}</b>${why}</tg-spoiler>`;
+  });
+
+  await sendMessage(msg.chat.id,
+    `${t(lang, "mistakes_header")}\n\n${blocks.join("\n\n")}\n\n${t(lang, "mistakes_footer")}`,
+    "HTML");
+}
+
+async function refreshVocabularyCounts(db: TenantDb) {
+  const { error } = await db.rpc("refresh_vocabulary_counts");
   if (error) throw error;
 }
 
 async function handleHelp(msg: any, user: any) {
-  const isAdmin = msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID;
+  const db = tenantDb(user.tenant_id);
+  const isAdmin = isSuperadmin(msg.from?.id);
   const lang = viewerLang(msg.from, user);
-  const partner = await lookupPartner(user.id);
-  const a = langLabel(user.native_language);
-  const b = langLabel(user.learning_language);
+  const solo = !(await lookupPartner(db, user.id));
+
+  // Built from the user's ACTUAL pair. The previous version hardcoded "a Ukrainian deck
+  // and an English deck" with fixed flags, which is simply wrong for any of the other
+  // fifty-five pairs the picker offers -- a Ukrainian speaker learning Polish was told
+  // they had an English deck.
+  const a = `${langMeta(user.native_language).flag} ${langLabel(user.native_language)}`;
+  const b = `${langMeta(user.learning_language).flag} ${langLabel(user.learning_language)}`;
 
   const lines: string[] = [
     t(lang, "help_header"),
     "",
-    partner
-      ? t(lang, "help_translate_pair", { a, b, name: escapeHtml(partner.display_name) })
-      : t(lang, "help_translate_solo", { a, b }),
-    partner ? t(lang, "help_media_pair") : t(lang, "help_media_solo"),
+    t(lang, "help_decks", { a, b }),
     "",
-    t(lang, "help_hubs"),
+    `• ${t(lang, solo ? "help_write_solo" : "help_write_partner")}`,
+    `• ${t(lang, solo ? "start_media_solo" : "start_media_partner")}`,
+    `• /vocab — ${t(lang, "cmd_vocab")}`,
+    `• /learn &lt;word&gt; — ${t(lang, "cmd_learn")}`,
+    `• /learn top N — ${t(lang, "cmd_learn_top")}`,
+    `• /forget &lt;word&gt; — ${t(lang, "cmd_forget")}`,
+    `• /export — ${t(lang, "cmd_export")}`,
+    `• /capybara — ${t(lang, "cmd_capybara")}`,
     "",
-    partner ? t(lang, "help_corpus_pair") : t(lang, "help_corpus_solo"),
+    t(lang, "help_memory_header"),
+    "",
+    `• /ask &lt;question&gt; — ${t(lang, "cmd_ask")}`,
+    `• /note &lt;note&gt; — ${t(lang, "cmd_note")}`,
+    `• /reconcile — ${t(lang, "cmd_reconcile")}`,
+    `• /restore — ${t(lang, "cmd_restore")}`,
+    `• /pin — ${t(lang, "cmd_pin")}`,
+    `• /unpin — ${t(lang, "cmd_unpin")}`,
+    `• /pinned — ${t(lang, "cmd_pinned")}`,
+    "",
+    `• /billing — ${t(lang, "cmd_billing")}`,
+    `• /delete_account — ${t(lang, "cmd_delete_account")}`,
   ];
 
-  // The admin block stays English on purpose: it is an operator surface, and on this
-  // build the operator is whoever set the instance up -- one person, who reads English.
+  // Operator tools stay English and stay out of a customer's help: one person reads them.
   if (isAdmin) {
     lines.push(
       "",
-      "<i>Admin:</i>",
-      "\u2022 /management \u2014 Usage, storage, diagnostics, deploys",
-      "\u2022 /backfill \u2014 Annotate one batch of unprocessed messages",
-      "\u2022 /backfill_translations \u2014 Fill lemma_translation for one batch",
-      "\u2022 /backfill_senses \u2014 Re-fix flashcard translations to match their example sentence",
-      "\u2022 /backfill_grammar \u2014 Fill in card fields for older grammar corrections",
-      "\u2022 /annotate_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)",
-      "\u2022 /recap_backfill \u2014 Embed one batch of messages for /recap",
+      "<b>Operator</b>",
+      "• /tenants — service-wide view",
+      "• /diag — diagnostics",
+      "• /annotate_ab — annotation model comparison",
+      "• /backfill, /backfill_translations, /backfill_senses, /backfill_grammar, /recap_backfill",
     );
   }
   await sendMessage(msg.chat.id, lines.join("\n"), "HTML");
 }
 
-async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
+async function fetchTopUnlearned(db: TenantDb, lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
   if (!learnerId) return [];
-  const { data, error } = await supabase.rpc("vocab_top_unlearned", {
+  const { data, error } = await db.rpc("vocab_top_unlearned", {
     p_language: lang,
     p_user_id: learnerId,
     p_limit: limit,
@@ -2330,18 +4212,19 @@ function formatVocabSection(
 }
 
 async function handleVocab(msg: any, user: any) {
-  try { await refreshVocabularyCounts(); }
+  const db = tenantDb(user.tenant_id);
+  try { await refreshVocabularyCounts(db); }
   catch (e) { console.error("refreshVocabularyCounts failed:", e); }
   // Show both instance-language decks, the user's own learning deck first.
   const learnLang = user.learning_language;
   const nativeLang = user.native_language;
   const [learnLearner, nativeLearner] = await Promise.all([
-    lookupLearnerOfLanguage(learnLang),
-    lookupLearnerOfLanguage(nativeLang),
+    lookupLearnerOfLanguage(db, learnLang),
+    lookupLearnerOfLanguage(db, nativeLang),
   ]);
   const [learnWords, nativeWords] = await Promise.all([
-    fetchTopUnlearned(learnLang, learnLearner?.id ?? null, 10),
-    fetchTopUnlearned(nativeLang, nativeLearner?.id ?? null, 10),
+    fetchTopUnlearned(db, learnLang, learnLearner?.id ?? null, 10),
+    fetchTopUnlearned(db, nativeLang, nativeLearner?.id ?? null, 10),
   ]);
   const sections: string[] = [];
   sections.push(...formatVocabSection(learnLang, learnWords, user, learnLearner));
@@ -2380,8 +4263,8 @@ async function lemmatize(word: string, language: LangCode): Promise<string | nul
   } catch (e) { console.error("lemmatize JSON parse failed:", block.text); return null; }
 }
 
-async function lookupVocabByLemma(lemma: string, language: LangCode): Promise<any[]> {
-  const { data, error } = await supabase.from("vocabulary")
+async function lookupVocabByLemma(db: TenantDb, lemma: string, language: LangCode): Promise<any[]> {
+  const { data, error } = await db.from("vocabulary")
     .select("id, lemma, part_of_speech, gloss, first_seen_message_id, language")
     .eq("language", language)
     .ilike("lemma", lemma);
@@ -2389,49 +4272,23 @@ async function lookupVocabByLemma(lemma: string, language: LangCode): Promise<an
   return data ?? [];
 }
 
-// A card's example sentence. Cards used to be created with
-// example_message_id = first_seen_message_id -- the first message the word ever appeared
-// in -- with nothing checking that the card's own taught translation survives into it.
-// Often it does not, because good translation is idiomatic: "Enjoy work" becomes
-// "Гарної роботи", and a card teaching насолоджуватися then shows a sentence that does
-// not contain it. Measured on the live deck, ~12% of cards were in that state, and 66.5%
-// of all examples came from the corpus's first week.
-//
-// pick_example_messages checks BOTH sides and falls back to first_seen_message_id when it
-// finds nothing, so this can only improve a card or leave it as it was. One batched call,
-// because /learn top N adds up to 50 at once.
-//
-// A failure here must not block adding the card: the deck entry is what the user asked
-// for and the example is decoration on it, so an error leaves every card on the old
-// behaviour rather than refusing the command.
-async function pickExamples(vocabIds: string[]): Promise<Map<string, string | null>> {
-  const out = new Map<string, string | null>();
-  if (vocabIds.length === 0) return out;
-  const { data, error } = await supabase.rpc("pick_example_messages", { p_vocabulary_ids: vocabIds });
-  if (error) { console.error("pick_example_messages failed, falling back to first_seen:", error); return out; }
-  for (const r of (data ?? []) as any[]) out.set(r.vocabulary_id, r.message_id ?? null);
-  return out;
-}
-
 async function handleLearnTop(msg: any, user: any, arg: string) {
   const lang = viewerLang(msg.from, user);
-  // The accepted language tokens come from the instance's own pair, not a hardcoded
-  // "uk|en" -- this file ships unchanged to couples with a different pair.
-  const codes = `${user.learning_language}|${user.native_language}`;
+  const db = tenantDb(user.tenant_id);
   const match = arg.match(/^top\s*(\d+)?(?:\s+(\S+))?$/i);
   if (!match) {
-    await sendMessage(msg.chat.id, t(lang, "learn_top_usage", { codes }), "HTML");
+    await sendMessage(msg.chat.id, t(lang, "learn_top_usage", { codes: deckCodes(user) }), "HTML");
     return;
   }
   const nRaw = match[1];
   const langTokenRaw = match[2];
   if (!nRaw) {
-    await sendMessage(msg.chat.id, t(lang, "learn_top_how_many", { codes }), "HTML");
+    await sendMessage(msg.chat.id, `${t(lang, "learn_how_many")}\n\n${t(lang, "learn_top_usage", { codes: deckCodes(user) })}`, "HTML");
     return;
   }
   const n = parseInt(nRaw, 10);
   if (!Number.isFinite(n) || n <= 0) {
-    await sendMessage(msg.chat.id, t(lang, "learn_top_n_positive"));
+    await sendMessage(msg.chat.id, t(lang, "learn_n_positive"));
     return;
   }
   const N = Math.min(n, 50);
@@ -2440,7 +4297,9 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   if (langTokenRaw) {
     const parsed = parseLangArg(langTokenRaw);
     if (!parsed) {
-      await sendMessage(msg.chat.id, t(lang, "learn_lang_unrecognized", { token: escapeHtml(langTokenRaw), codes }), "HTML");
+      await sendMessage(msg.chat.id,
+      t(viewerLang(msg.from, user), "learn_lang_unrecognized",
+        { token: escapeHtml(langTokenRaw), codes: deckCodes(user) }), "HTML");
       return;
     }
     targetLang = parsed;
@@ -2456,39 +4315,41 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
     targetUser = user;
     isOwnDeck = true;
   } else {
-    const learner = await lookupLearnerOfLanguage(targetLang);
+    const learner = await lookupLearnerOfLanguage(db, targetLang);
     if (!learner) {
-      await sendMessage(msg.chat.id, t(lang, "learn_no_learner", { lang: targetLangLabel }));
+      await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "learn_no_learner", { lang: targetLangLabel }));
       return;
     }
     targetUser = learner;
     isOwnDeck = false;
   }
-  try { await refreshVocabularyCounts(); }
+  const deckOwnerLabel = isOwnDeck ? "your" : `${targetUser.display_name}'s`;
+
+  try { await refreshVocabularyCounts(db); }
   catch (e) { console.error("refreshVocabularyCounts (learn top) failed:", e); }
-  const unlearned = await fetchTopUnlearned(targetLang, targetUser.id, N);
+  const unlearned = await fetchTopUnlearned(db, targetLang, targetUser.id, N);
   if (unlearned.length === 0) {
     await sendMessage(msg.chat.id, isOwnDeck
-      ? t(lang, "learn_none_unlearned_own", { lang: targetLangLabel })
-      : t(lang, "learn_none_unlearned_partner", { lang: targetLangLabel, name: targetUser.display_name }));
+      ? t(viewerLang(msg.from, user), "learn_none_unlearned_own", { lang: targetLangLabel })
+      : t(viewerLang(msg.from, user), "learn_none_unlearned_partner", { lang: targetLangLabel, name: targetUser.display_name }));
     return;
   }
-  const examples = await pickExamples(unlearned.map((v: any) => v.id));
+  const examples = await pickExamples(user.tenant_id, unlearned.map((v: any) => v.id));
   const newCards = unlearned.map((v: any) => ({
     user_id: targetUser.id,
     vocabulary_id: v.id,
     example_message_id: examples.get(v.id) ?? v.first_seen_message_id,
   }));
-  const { error: insertErr } = await supabase.from("flashcards")
+  const { error: insertErr } = await db.from("flashcards")
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true });
   if (insertErr) {
     console.error("learn top flashcard insert failed:", insertErr);
-    await sendMessage(msg.chat.id, t(lang, "deck_add_failed"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "deck_update_failed"));
     return;
   }
-  // HTML, not Markdown. A lemma or gloss containing _ or * silently mangles a legacy
-  // Markdown message and there is no escape for it; HTML has one, and escapeHtml is
-  // applied to every value that came out of the corpus.
+  // HTML rather than Markdown: lemmas and glosses are model output interpolated into
+  // the message, and an unbalanced * or _ makes Telegram reject the whole send. HTML has
+  // a defined escape, so escapeHtml makes this safe by construction.
   const lines = unlearned.map((v: any, i: number) => {
     const pos = v.part_of_speech ? ` <i>(${escapeHtml(String(v.part_of_speech))})</i>` : "";
     const gloss = escapeHtml(String(v.gloss ?? "?"));
@@ -2505,34 +4366,32 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${truncatedNote}${exportHint}`, "HTML");
 }
 
-// Returns the pieces of the failure rather than a rendered sentence, so the caller --
-// which knows the reader's language -- does the wording. Returning English text from
-// here was the one site that could not be localized without changing this signature.
 async function resolveLearnTarget(user: any, word: string): Promise<
   | { targetUser: any; targetLang: LangCode; isPartnerDeck: boolean }
-  | { error: { word: string; lang: string } }
+  | { error: string }
 > {
+  const db = tenantDb(user.tenant_id);
   // A bare word is the hardest case for a same-script pair, so bias toward the asker's
   // learning language (the usual intent of /learn) by passing it as the default.
   const detected = await classifyLanguage(word, user.learning_language, user.native_language);
   if (detected === user.learning_language) {
     return { targetUser: user, targetLang: detected, isPartnerDeck: false };
   }
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   if (!partner) {
-    return { error: { word, lang: langLabel(detected) } };
+    return { error: `Detected "${word}" as ${langLabel(detected)}, but couldn't find a partner to add the card for.` };
   }
   return { targetUser: partner, targetLang: detected, isPartnerDeck: true };
 }
 
 async function handleLearn(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
+  const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const arg = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
-  const lang = viewerLang(msg.from, user);
-  const codes = `${user.learning_language}|${user.native_language}`;
   if (!arg) {
-    await sendMessage(msg.chat.id, t(lang, "learn_usage", { codes }), "HTML");
+    await sendMessage(msg.chat.id, t(lang, "learn_usage", { codes: deckCodes(user) }), "HTML");
     return;
   }
   if (arg.toLowerCase().startsWith("top")) {
@@ -2540,47 +4399,48 @@ async function handleLearn(msg: any, user: any) {
     return;
   }
   if (arg.includes(" ")) {
-    await sendMessage(msg.chat.id, t(lang, "learn_one_at_a_time", { codes }), "HTML");
+    await sendMessage(msg.chat.id, t(lang, "learn_one_at_a_time", { codes: deckCodes(user) }), "HTML");
     return;
   }
   const resolved = await resolveLearnTarget(user, arg);
   if ("error" in resolved) {
-    await sendMessage(msg.chat.id, t(lang, "learn_no_partner_for_lang", resolved.error));
+    await sendMessage(msg.chat.id, resolved.error);
     return;
   }
   const { targetUser, targetLang, isPartnerDeck } = resolved;
   const targetLangLabel = langLabel(targetLang);
-  let vocabRows = await lookupVocabByLemma(arg, targetLang);
+  let vocabRows = await lookupVocabByLemma(db, arg, targetLang);
   let lemmaUsed = arg;
   if (vocabRows.length === 0) {
     const lemma = await lemmatize(arg, targetLang);
     if (lemma && lemma.toLowerCase() !== arg.toLowerCase()) {
-      const retry = await lookupVocabByLemma(lemma, targetLang);
+      const retry = await lookupVocabByLemma(db, lemma, targetLang);
       if (retry.length > 0) { vocabRows = retry; lemmaUsed = lemma; }
     }
   }
   if (vocabRows.length === 0) {
-    await sendMessage(msg.chat.id, t(lang, "vocab_word_not_found", { word: arg, lang: targetLangLabel }));
+    await sendMessage(msg.chat.id,
+      t(viewerLang(msg.from, user), "vocab_word_not_found", { word: escapeHtml(arg), lang: targetLangLabel }), "HTML");
     return;
   }
-  const examples = await pickExamples(vocabRows.map((v: any) => v.id));
+  const examples = await pickExamples(user.tenant_id, vocabRows.map((v: any) => v.id));
   const newCards = vocabRows.map((v: any) => ({
     user_id: targetUser.id,
     vocabulary_id: v.id,
     example_message_id: examples.get(v.id) ?? v.first_seen_message_id,
   }));
-  const { data: inserted, error: insertErr } = await supabase.from("flashcards")
+  const { data: inserted, error: insertErr } = await db.from("flashcards")
     .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true })
     .select("vocabulary_id");
   if (insertErr) {
     console.error("learn flashcard insert failed:", insertErr);
-    await sendMessage(msg.chat.id, t(lang, "deck_add_failed"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "deck_update_failed"));
     return;
   }
   const insertedIds = new Set((inserted ?? []).map((r: any) => r.vocabulary_id));
   const toAdd = vocabRows.filter((v: any) => insertedIds.has(v.id));
-  const ownerName = escapeHtml(targetUser.display_name);
   const deckLabel = `${langFlag(targetLang)} ${targetLangLabel}`;
+  const ownerName = escapeHtml(targetUser.display_name);
   if (toAdd.length === 0) {
     await sendMessage(msg.chat.id, isPartnerDeck
       ? t(lang, "learn_already_partner", { word: escapeHtml(lemmaUsed), deck: deckLabel, name: ownerName })
@@ -2603,51 +4463,53 @@ async function handleLearn(msg: any, user: any) {
 }
 
 async function handleForget(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const arg = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
-  const lang = viewerLang(msg.from, user);
   if (!arg) {
-    await sendMessage(msg.chat.id, t(lang, "forget_usage"), "HTML");
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "forget_usage"), "HTML");
     return;
   }
   if (arg.includes(" ")) {
-    await sendMessage(msg.chat.id, t(lang, "forget_one_at_a_time"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "forget_one_at_a_time"));
     return;
   }
   const resolved = await resolveLearnTarget(user, arg);
   if ("error" in resolved) {
-    await sendMessage(msg.chat.id, t(lang, "learn_no_partner_for_lang", resolved.error));
+    await sendMessage(msg.chat.id, resolved.error);
     return;
   }
   const { targetUser, targetLang, isPartnerDeck } = resolved;
   const targetLangLabel = langLabel(targetLang);
-  let vocabRows = await lookupVocabByLemma(arg, targetLang);
+  let vocabRows = await lookupVocabByLemma(db, arg, targetLang);
   let lemmaUsed = arg;
   if (vocabRows.length === 0) {
     const lemma = await lemmatize(arg, targetLang);
     if (lemma && lemma.toLowerCase() !== arg.toLowerCase()) {
-      const retry = await lookupVocabByLemma(lemma, targetLang);
+      const retry = await lookupVocabByLemma(db, lemma, targetLang);
       if (retry.length > 0) { vocabRows = retry; lemmaUsed = lemma; }
     }
   }
   if (vocabRows.length === 0) {
-    await sendMessage(msg.chat.id, t(lang, "vocab_word_not_found_short", { word: arg, lang: targetLangLabel }));
+    await sendMessage(msg.chat.id,
+      t(viewerLang(msg.from, user), "vocab_word_not_found_short", { word: escapeHtml(arg), lang: targetLangLabel }), "HTML");
     return;
   }
   const vocabIds = vocabRows.map((v: any) => v.id);
-  const { data: deleted, error } = await supabase.from("flashcards")
+  const { data: deleted, error } = await db.from("flashcards")
     .delete()
     .eq("user_id", targetUser.id)
     .in("vocabulary_id", vocabIds)
     .select("vocabulary_id");
   if (error) {
     console.error("forget delete failed:", error);
-    await sendMessage(msg.chat.id, t(lang, "deck_update_failed"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "deck_update_failed"));
     return;
   }
-  const ownerName = escapeHtml(targetUser.display_name);
+  const lang = viewerLang(msg.from, user);
   const deckLabel = `${langFlag(targetLang)} ${targetLangLabel}`;
+  const ownerName = escapeHtml(targetUser.display_name);
   if (!deleted || deleted.length === 0) {
     await sendMessage(msg.chat.id, isPartnerDeck
       ? t(lang, "forget_not_in_partner", { word: escapeHtml(lemmaUsed), deck: deckLabel, name: ownerName })
@@ -2666,13 +4528,15 @@ async function handleForget(msg: any, user: any) {
     : t(lang, "forget_removed_own", { n: removed.length, deck: deckLabel });
   const lemmatized = lemmaUsed.toLowerCase() !== arg.toLowerCase()
     ? t(lang, "learn_matched_as", { lemma: escapeHtml(lemmaUsed), arg: escapeHtml(arg) }) : "";
-  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${t(lang, "forget_anki_note")}`, "HTML");
+  const note = t(lang, "forget_anki_note");
+  await sendMessage(msg.chat.id, `${header}\n${lines.join("\n")}${lemmatized}${note}`, "HTML");
 }
 
 async function handleBackfill(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  const db = tenantDb(user.tenant_id);
+  if (await denyUnlessSuperadmin(msg)) return;
   // 1-row probe so an empty backlog replies instantly without kicking off a background run.
-  const { data: probe, error: probeErr } = await supabase.rpc("backfill_pending_sides", { p_batch_size: 1 });
+  const { data: probe, error: probeErr } = await db.rpc("backfill_pending_sides", { p_batch_size: 1 });
   if (probeErr) {
     console.error("backfill_pending_sides error:", probeErr);
     await sendMessage(msg.chat.id, "Backfill query failed. Check logs.");
@@ -2686,23 +4550,25 @@ async function handleBackfill(msg: any, user: any) {
   // would time out the webhook and get retried -> duplicate runs). One tap clears as much
   // as the time budget allows; the run reports done / re-tap-to-continue at the end.
   await sendMessage(msg.chat.id, "\u23f3 Backfilling in the background \u2014 I'll report when this run finishes. (Avoid tapping again until then.)");
-  scheduleBackgroundWork("backfillGrind", backfillGrind(msg.chat.id));
+  scheduleBackgroundWork("backfillGrind", backfillGrind(db, msg.chat.id));
 }
 
 // Time-boxed background grind. backfill_pending_sides already returns only annotatable
 // sides (wrong-script/letterless ones are filtered in SQL), so each wave is annotated
 // directly in small concurrent batches. Idempotent across runs \u2014 annotated sides drop out
 // of the pending set \u2014 so a partial/killed run is safely resumed by another /backfill.
-async function backfillGrind(chatId: number) {
+async function backfillGrind(db: TenantDb, chatId: number) {
   const startedAt = Date.now();
   let succeeded = 0; let failed = 0;
   // The "other language" for annotation is the opposite instance language.
-  const { data: uRows } = await supabase.from("users").select("native_language");
-  const instanceLangs = [...new Set((uRows ?? []).map((u: any) => u.native_language as string))];
+  const { data: uRows } = await db.from("users").select("native_language");
+  // Typed explicitly: uRows is `any` off the query builder, and without the annotation
+  // the Set spread widens to unknown[] and otherOf's `string` return stops checking.
+  const instanceLangs: string[] = [...new Set(((uRows ?? []) as Array<{ native_language: string }>).map((u) => u.native_language))];
   const otherOf = (lang: string): string => instanceLangs.find((l) => l !== lang) ?? lang;
   try {
     while (Date.now() - startedAt < BACKFILL_BUDGET_MS) {
-      const { data: rows, error } = await supabase
+      const { data: rows, error } = await db
         .rpc("backfill_pending_sides", { p_batch_size: BACKFILL_CONCURRENCY });
       if (error) {
         console.error("backfill_pending_sides error mid-run:", error);
@@ -2712,7 +4578,7 @@ async function backfillGrind(chatId: number) {
       if (!rows || rows.length === 0) break;
       const results = await Promise.allSettled(
         (rows as Array<{ message_id: string; text: string; language: LangCode }>)
-          .map((w) => annotateMessage(w.message_id, w.text, w.language, otherOf(w.language))),
+          .map((w) => annotateMessage(db, w.message_id, w.text, w.language, otherOf(w.language))),
       );
       for (const r of results) {
         if (r.status === "fulfilled") succeeded++;
@@ -2722,7 +4588,7 @@ async function backfillGrind(chatId: number) {
   } catch (e) {
     console.error("backfillGrind crashed:", e);
   }
-  const { data: still } = await supabase.rpc("backfill_pending_sides", { p_batch_size: 1 });
+  const { data: still } = await db.rpc("backfill_pending_sides", { p_batch_size: 1 });
   const done = !still || still.length === 0;
   const tail = failed > 0 ? ` (${failed} failed \u2014 check logs)` : "";
   await sendMessage(chatId, done
@@ -2793,8 +4659,9 @@ async function translateLemmasBatch(
 }
 
 async function handleBackfillTranslations(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
-  const { data: rows, error } = await supabase
+  const db = tenantDb(user.tenant_id);
+  if (await denyUnlessSuperadmin(msg)) return;
+  const { data: rows, error } = await db
     .from("vocabulary")
     .select("id, lemma, part_of_speech, gloss, language")
     .is("lemma_translation", null)
@@ -2821,7 +4688,7 @@ async function handleBackfillTranslations(msg: any, user: any) {
   let failed = 0;
   if (updates.length > 0) {
     const upsertRows = updates.map(([id, translation]) => ({ id, lemma_translation: translation }));
-    const { error: upsertErr } = await supabase
+    const { error: upsertErr } = await db
       .from("vocabulary")
       .upsert(upsertRows, { onConflict: "id" });
     if (upsertErr) {
@@ -2832,7 +4699,7 @@ async function handleBackfillTranslations(msg: any, user: any) {
     }
   }
   const untranslated = rows.length - (ukMap.size + enMap.size);
-  const { count: stillRemaining } = await supabase
+  const { count: stillRemaining } = await db
     .from("vocabulary")
     .select("id", { count: "exact", head: true })
     .is("lemma_translation", null);
@@ -2893,11 +4760,11 @@ async function resenseCard(it: {
   }
 }
 
-async function resenseGrind(chatId: number) {
+async function resenseGrind(db: TenantDb, chatId: number) {
   const startedAt = Date.now();
   // Studied deck = vocabulary rows referenced by a flashcard (cards are created with
   // example_message_id = first_seen_message_id, so that message is the card's example).
-  const { data: cardRows, error: cErr } = await supabase
+  const { data: cardRows, error: cErr } = await db
     .from("flashcards")
     .select("vocabulary(id, lemma, part_of_speech, language, first_seen_message_id, lemma_translation)");
   if (cErr) { console.error("resense: flashcards fetch failed:", cErr); await sendMessage(chatId, "Couldn't fetch the deck. Check logs."); return; }
@@ -2911,7 +4778,7 @@ async function resenseGrind(chatId: number) {
   const msgIds = [...new Set(vocab.map((v) => v.first_seen_message_id))];
   const msgById = new Map<string, any>();
   for (let i = 0; i < msgIds.length; i += 100) {
-    const { data: ms } = await supabase.from("messages")
+    const { data: ms } = await db.from("messages")
       .select("id, original_text, translated_text, original_language, translated_language")
       .in("id", msgIds.slice(i, i + 100));
     for (const m of (ms ?? []) as any[]) msgById.set(m.id, m);
@@ -2940,7 +4807,7 @@ async function resenseGrind(chatId: number) {
       if (res.lemma_translation === it.oldTranslation) { unchanged++; return; }
       const patch: Record<string, string> = { lemma_translation: res.lemma_translation };
       if (res.gloss) patch.gloss = res.gloss;
-      const { error: uErr } = await supabase.from("vocabulary").update(patch).eq("id", it.id);
+      const { error: uErr } = await db.from("vocabulary").update(patch).eq("id", it.id);
       if (uErr) { failed++; console.error("resense update failed:", uErr); } else { corrected++; }
     }));
   }
@@ -2957,9 +4824,10 @@ async function resenseGrind(chatId: number) {
 }
 
 async function handleBackfillSenses(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  const db = tenantDb(user.tenant_id);
+  if (await denyUnlessSuperadmin(msg)) return;
   await sendMessage(msg.chat.id, "⏳ Re-deriving flashcard translations against each card's example sentence — I'll report when this run finishes.");
-  scheduleBackgroundWork("resenseGrind", resenseGrind(msg.chat.id));
+  scheduleBackgroundWork("resenseGrind", resenseGrind(db, msg.chat.id));
 }
 
 // --- /backfill_grammar: fill in the card fields older corrections never captured -----
@@ -2970,9 +4838,9 @@ async function handleBackfillSenses(msg: any, user: any) {
 // Every derived field is rewritten together rather than patched individually: a fresh
 // correction_focus has to be locatable in the corrected_text it came from, so mixing a
 // new focus word with an old sentence could leave a row whose cloze silently fails.
-async function grammarBackfillGrind(chatId: number) {
+async function grammarBackfillGrind(db: TenantDb, chatId: number) {
   const startedAt = Date.now();
-  const { data: rows, error } = await supabase
+  const { data: rows, error } = await db
     .from("grammar_corrections")
     .select("id, user_id, language, original_text")
     .or("correction_focus.is.null,correction_lemma.is.null,correction_gloss.is.null")
@@ -2988,7 +4856,7 @@ async function grammarBackfillGrind(chatId: number) {
   // The correction stores the language being learned; the explanation language comes
   // from the author's own row, so corrections stay per-user correct in both directions.
   const userIds = [...new Set(pending.map((r) => r.user_id))];
-  const { data: users } = await supabase.from("users").select("id, native_language, learning_language").in("id", userIds);
+  const { data: users } = await db.from("users").select("id, native_language, learning_language").in("id", userIds);
   const userById = new Map<string, any>((users ?? []).map((u: any) => [u.id, u]));
 
   let updated = 0, skipped = 0;
@@ -3002,7 +4870,7 @@ async function grammarBackfillGrind(chatId: number) {
       // A re-run that fails, or now judges the sentence correct, leaves the row alone --
       // the stored correction is still better than nothing.
       if (verdict === null || verdict.correct) return "skip";
-      const { error: upErr } = await supabase.from("grammar_corrections").update({
+      const { error: upErr } = await db.from("grammar_corrections").update({
         corrected_text: verdict.corrected,
         explanation: verdict.explanation || null,
         error_focus: verdict.errorFocus,
@@ -3025,9 +4893,10 @@ async function grammarBackfillGrind(chatId: number) {
 }
 
 async function handleBackfillGrammar(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  const db = tenantDb(user.tenant_id);
+  if (await denyUnlessSuperadmin(msg)) return;
   await sendMessage(msg.chat.id, "⏳ Re-deriving card fields for stored corrections — I'll report when this run finishes.");
-  scheduleBackgroundWork("grammarBackfillGrind", grammarBackfillGrind(msg.chat.id));
+  scheduleBackgroundWork("grammarBackfillGrind", grammarBackfillGrind(db, msg.chat.id));
 }
 
 // --- /annotate_ab: compare annotation models before switching ANNOTATION_MODEL ------
@@ -3127,14 +4996,15 @@ function lemmaSummary(run: AnnotationRun, max = 8): string {
 // Telegram waits before retrying the webhook, so acknowledge first and grind in the
 // background (same shape as /backfill_senses).
 async function handleAnnotateAb(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  if (await denyUnlessSuperadmin(msg)) return;
   const arg = msg.text.replace(/^\/annotate_ab(@\S+)?/i, "").trim();
   const sampleSize = Math.min(Math.max(parseInt(arg, 10) || 5, 1), 15);
   scheduleBackgroundWork("annotateAbRun", annotateAbRun(msg.chat.id, user, sampleSize));
 }
 
 async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
-  const { data: rows, error } = await supabase
+  const db = tenantDb(user.tenant_id);
+  const { data: rows, error } = await db
     .from("messages")
     .select("id, original_text, original_language, translated_text")
     .not("original_text", "is", null)
@@ -3184,7 +5054,7 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
   // Project steady-state spend from the last 30 days of real traffic. Annotation runs
   // once per side, so a message costs two passes.
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-  const { count: monthlyMessages } = await supabase
+  const { count: monthlyMessages } = await db
     .from("messages").select("id", { count: "exact", head: true }).gte("created_at", since);
 
   const summary: string[] = ["— Totals —"];
@@ -3207,274 +5077,64 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
   await sendChunked(chatId, [...blocks, summary.join("\n")]);
 }
 
-// --- /update: check GitHub for a newer build, and (admin) deploy it with one tap ---
-
-// The version a deploy would actually ship is the BUILD_VERSION literal in the
-// committed index.ts on the deploy branch (deploy.yml runs `supabase functions
-// deploy` on that file \u2014 there is no separate build artifact). So we read it
-// straight from raw.githubusercontent, mirroring deploy.yml's own sed extraction.
-// Git tags lag (created manually post-deploy), so they'd under-report. Returns the
-// version string, or null on any failure (network / non-200 / no regex match).
-async function fetchLatestVersion(): Promise<string | null> {
-  if (!GITHUB_REPO) return null;
-  // Cache-bust + no-store: raw.githubusercontent is CDN-cached up to a few minutes.
-  const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_DEPLOY_BRANCH}/supabase/functions/telegram-bot/index.ts?t=${Date.now()}`;
-  try {
-    const resp = await fetch(url, { cache: "no-store" });
-    if (!resp.ok) { console.error(`fetchLatestVersion HTTP ${resp.status}`); return null; }
-    const src = await resp.text();
-    const m = src.match(/const BUILD_VERSION = "([^"]+)"/);
-    return m ? m[1] : null;
-  } catch (e) {
-    console.error("fetchLatestVersion failed:", e);
-    return null;
-  }
-}
-
-// "v45" -> 45; anything not of the form vN returns null (caller falls back to
-// string comparison so a non-numeric scheme never offers a bogus deploy).
-function parseVersion(v: string): number | null {
-  const m = v.match(/^v(\d+)$/);
-  return m ? Number(m[1]) : null;
-}
-
-// Trigger the same gated deploy.yml workflow a human would run from the Actions
-// tab. The workflow's job gate requires inputs.confirm == "deploy". A successful
-// dispatch returns HTTP 204 (no content); anything else is a failure.
-async function triggerDeploy(): Promise<{ ok: boolean; status: number; body?: string }> {
-  const url = `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${GITHUB_DEPLOY_WORKFLOW}/dispatches`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${GITHUB_DEPLOY_TOKEN}`,
-      "Accept": "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "capybara-bot", // GitHub's REST API rejects requests without a User-Agent
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      ref: GITHUB_DEPLOY_BRANCH,
-      // Target THIS instance's project; omit when unparseable so the workflow falls
-      // back to its default SUPABASE_PROJECT_REF secret (prior single-project behavior).
-      inputs: { confirm: "deploy", ...(SELF_PROJECT_REF ? { project_ref: SELF_PROJECT_REF } : {}) },
-    }),
-  });
-  if (resp.status === 204) return { ok: true, status: 204 };
-  const body = await resp.text().catch(() => "<no body>");
-  console.error(`triggerDeploy non-204: status=${resp.status} body=${body.slice(0, 300)}`);
-  return { ok: false, status: resp.status, body };
-}
-
-async function handleUpdateCommand(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
-
-  const running = BUILD_VERSION;
-  if (!GITHUB_REPO) {
-    await sendMessage(msg.chat.id, `Running ${running}. Update check isn't configured (GITHUB_REPO unset).`);
-    return;
-  }
-  const latest = await fetchLatestVersion();
-  if (latest === null) {
-    await sendMessage(msg.chat.id, `Running ${running}. Couldn't read the latest version from GitHub (network/parse error). Try again later.`);
-    return;
-  }
-
-  const runN = parseVersion(running);
-  const latN = parseVersion(latest);
-  const deployEnabled = !!(GITHUB_DEPLOY_TOKEN && GITHUB_REPO);
-
-  // Non-numeric on either side: we can't order them, so compare by exact string.
-  if (runN === null || latN === null) {
-    await sendMessage(msg.chat.id,
-      latest === running
-        ? `Up to date \u2014 running ${running}.`
-        : `Running ${running}; latest on GitHub is ${latest}. (Non-numeric versions \u2014 can't offer one-tap deploy.)`);
-    return;
-  }
-
-  if (latN <= runN) {
-    await sendMessage(msg.chat.id, `Up to date \u2014 running ${running}, latest is ${latest}.`);
-    return;
-  }
-
-  // A newer build exists on the branch.
-  const statusText = `\u2b06\ufe0f Update available: running ${running}, latest is ${latest}.`;
-  if (!deployEnabled) {
-    await sendMessage(msg.chat.id, `${statusText}\nDeploy isn't configured (GITHUB_DEPLOY_TOKEN unset) \u2014 deploy manually.`);
-    return;
-  }
-  const keyboard = { inline_keyboard: [[{ text: `Deploy ${latest}`, callback_data: `deploy:${latest}` }]] };
-  await sendMessage(msg.chat.id, `${statusText}\nTap to deploy:`, undefined, keyboard);
-}
+// ---------------------------------------------------------------------------- Callbacks
+//
+// The single-tenant bot carried a /update command that dispatched deploy.yml from inside
+// Telegram. It is deliberately absent here.
+//
+// It was already superadmin-gated, so no customer could reach it -- but the blast radius
+// is what changed. On the personal bot a deploy affects one couple who chose to run it.
+// Here one tap redeploys the function serving EVERY tenant, so a bug in the gate, a
+// mistyped SUPERADMIN_TELEGRAM_ID, or a leaked GITHUB_DEPLOY_TOKEN stops being a private
+// mistake and becomes an outage for people who are paying. A capability that valuable and
+// that rarely used does not belong on a customer-facing surface; deploys go through the
+// Actions workflow, where the human is already in the loop.
 
 async function handleCallbackQuery(cq: any) {
-  const data: string = cq.data ?? "";
+  // Onboarding taps come from people who are not yet in the users table and are
+  // certainly not the operator, so they are routed before any superadmin check. Their
+  // authorisation is the pairing code, which handleOnboardingCallback revalidates
+  // against the database on every step rather than trusting the callback payload.
+  if ((cq.data ?? "").startsWith("ob|")) { await handleOnboardingCallback(cq); return; }
 
-  // The /education and /memory buttons belong to BOTH partners, so they are gated on
-  // being a registered user rather than on being the admin. Everything below this block
-  // is still admin-only -- the blanket admin check that used to sit at the top of this
-  // function now sits just past it, so adding a non-admin button cannot accidentally
-  // open a deploy button to the same audience.
-  if (data.startsWith("ed:") || data.startsWith("mem:")) {
+  // Trial taps come from strangers -- no tenant, no subscription, nothing to authorise
+  // against. There is nothing to protect here: the worst a forged tap can do is set the
+  // forger's own language pair. The spending is gated later, by consume_trial_message.
+  if ((cq.data ?? "").startsWith("tr|")) { await handleTrialCallback(cq); return; }
+
+  // Account deletion is confirmed by the tenant OWNER, who is not the operator either.
+  // handleDeleteAccountConfirm re-resolves the sender and re-checks ownership rather than
+  // trusting the button.
+  if ((cq.data ?? "") === "del|confirm") { await handleDeleteAccountConfirm(cq); return; }
+  if ((cq.data ?? "") === "lv|confirm") { await handleLeaveConfirm(cq); return; }
+  if ((cq.data ?? "").startsWith("mg|rm|")) { await handleRemovePartnerConfirm(cq, (cq.data ?? "").slice(6)); return; }
+  if ((cq.data ?? "").startsWith("mg|rmy|")) { await handleRemovePartnerDo(cq, (cq.data ?? "").slice(7)); return; }
+
+  // The hub buttons. Gated on being a registered user rather than on anything stronger:
+  // they only ever run read-only commands the tapper could type anyway. The shim calls the
+  // real handlers rather than keeping a second copy of each that can drift.
+  const hub = cq.data ?? "";
+  if (hub.startsWith("ed|") || hub.startsWith("mem|")) {
     const actor = await lookupUser(cq.from);
-    if (!actor) { await answerCallbackQuery(cq.id, "Not registered."); return; }
+    if (!actor) { await answerCallbackQuery(cq.id); return; }
     await answerCallbackQuery(cq.id);
-    // Same shim as the /management buttons: call the real handler rather than keeping a
-    // second copy of it that can drift.
     const shim = { chat: { id: cq.message?.chat?.id }, from: cq.from, text: "" };
-    if (data === "ed:vocab") await handleVocab(shim, actor);
-    else if (data === "ed:export") await handleExport(shim, actor);
-    else if (data === "ed:mistakes") await handleMistakes(shim, actor);
-    else if (data === "mem:pinned") await handlePinned(shim, actor);
+    if (hub === "ed|vocab") await handleVocab(shim, actor);
+    else if (hub === "ed|export") await handleExport(shim, actor);
+    else if (hub === "ed|mistakes") await handleMistakes(shim, actor);
+    else if (hub === "mem|pinned") await handlePinned(shim, actor);
     return;
   }
 
-  // Auth by Telegram sender id, independent of the users table. The buttons below are
-  // only ever shown in the admin's own chat, but we re-check here for defense in depth.
-  if (cq.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) {
-    await answerCallbackQuery(cq.id, "Not authorized.");
-    return;
-  }
-
-  // /management's two buttons. They call the same handlers the commands do, with a
-  // synthesised message shape -- the alternative is a second copy of each, and a second
-  // copy of /diag would drift from the one that gets used when something is actually
-  // broken.
-  if (data === "mg:diag" || data === "mg:update") {
-    await answerCallbackQuery(cq.id, "…");
-    const shim = { chat: { id: cq.message?.chat?.id }, from: cq.from, text: "" };
-    const actor = await lookupUser(cq.from);
-    if (data === "mg:diag") await handleDiag(shim, actor);
-    else await handleUpdateCommand(shim, actor);
-    return;
-  }
-
-  if (!data.startsWith("deploy:")) { await answerCallbackQuery(cq.id); return; }
-  const target = data.slice("deploy:".length);
-
-  const chatId = cq.message?.chat?.id;
-  const messageId = cq.message?.message_id;
-
-  if (!GITHUB_DEPLOY_TOKEN || !GITHUB_REPO) {
-    await answerCallbackQuery(cq.id, "Deploy not configured.");
-    return;
-  }
-
-  await answerCallbackQuery(cq.id, `Dispatching deploy ${target}\u2026`);
-  // Retire the button before dispatching so a slow request can't be double-tapped.
-  if (chatId && messageId) await editMessageReplyMarkup(chatId, messageId);
-
-  // The dispatch always ships branch HEAD (which is >= the button's target), so a
-  // stale button still deploys current code \u2014 acceptable.
-  const res = await triggerDeploy();
-  if (chatId) {
-    if (res.ok) {
-      await sendMessage(chatId, `\ud83d\ude80 Deploy ${target} dispatched. The GitHub Actions "deploy" workflow is running (predeploy gate + health smoke test); /update will report ${target} once it lands.`);
-    } else {
-      await sendMessage(chatId, `Deploy dispatch failed (HTTP ${res.status}). Check the GITHUB_DEPLOY_TOKEN scope (needs Actions: write) and try again, or deploy manually.`);
-    }
-  }
+  // Nothing else issues buttons. Acknowledge so Telegram stops showing a spinner on a
+  // stale keyboard from an older build, and do nothing.
+  await answerCallbackQuery(cq.id);
 }
 
-// ---------------------------------------------------------------------------- /management
-//
-// The operator view, and the reason /diag and /update left the command menu. Three admin
-// entries for two rarely-used tools is most of the menu's clutter for the one person who
-// has an admin menu at all; one entry that opens onto both is the same capability with a
-// quieter surface. Both still work when typed, so muscle memory is not punished.
-//
-// Admin-only. On this build "admin" is one half of a couple rather than an operator role,
-// which is exactly why the copy is localized: which half it is depends on the instance.
-const FREE_TIER_BYTES = 500 * 1024 * 1024 + 1024 * 1024 * 1024; // 500 MB database + 1 GB storage
-
-// Measured, not modelled: derived from real spend divided by real message count after the
-// annotation work, and it is the number the /export and quota economics were sized on.
-// A constant here rather than a token ledger because per-call accounting would need a
-// table, a write on every model call, and reconciliation -- for a figure whose only job is
-// to answer "roughly what is this costing me this month".
-const EST_USD_PER_MESSAGE = 0.007;
-
-function formatBytes(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return "0 MB";
-  const mb = n / (1024 * 1024);
-  return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.round(mb)} MB`;
-}
-
-// The /education and /memory hubs. Both are printed indexes with buttons only for the
-// commands that take no argument -- see the note above edu_header in strings.ts.
-async function handleEducation(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
-  await sendMessage(msg.chat.id, `${t(lang, "edu_header")}\n\n${t(lang, "edu_body")}`, "HTML", {
-    inline_keyboard: [[
-      { text: t(lang, "edu_btn_vocab"), callback_data: "ed:vocab" },
-      { text: t(lang, "edu_btn_export"), callback_data: "ed:export" },
-      { text: t(lang, "edu_btn_mistakes"), callback_data: "ed:mistakes" },
-    ]],
-  });
-}
-
-async function handleMemory(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
-  await sendMessage(msg.chat.id, `${t(lang, "mem_header")}\n\n${t(lang, "mem_body")}`, "HTML", {
-    inline_keyboard: [[
-      { text: t(lang, "mem_btn_pinned"), callback_data: "mem:pinned" },
-    ]],
-  });
-}
-
-async function handleManagement(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) {
-    await sendMessage(msg.chat.id, t(lang, "mgmt_not_admin"));
-    return;
-  }
-
-  const { data, error } = await supabase.rpc("instance_usage");
-  const u = Array.isArray(data) ? data[0] : data;
-  if (error || !u) {
-    console.error("instance_usage failed:", error);
-    await sendMessage(msg.chat.id, t(lang, "mgmt_usage_failed"));
-    return;
-  }
-
-  const msgs = Number(u.messages_period ?? 0);
-  const voiceBytes = Number(u.voice_bytes ?? 0);
-  const dbBytes = Number(u.db_bytes ?? 0);
-  const since = new Date(u.period_start).toLocaleDateString(lang, { day: "numeric", month: "long" });
-
-  const body = [
-    t(lang, "mgmt_header"),
-    "",
-    t(lang, "mgmt_usage", {
-      since,
-      msgs,
-      annos: Number(u.annotations_period ?? 0),
-      spend: `$${(msgs * EST_USD_PER_MESSAGE).toFixed(2)}`,
-    }),
-    "",
-    t(lang, "mgmt_storage", {
-      files: Number(u.voice_files ?? 0),
-      voice: formatBytes(voiceBytes),
-      db: formatBytes(dbBytes),
-      total: formatBytes(voiceBytes + dbBytes),
-      limit: formatBytes(FREE_TIER_BYTES),
-    }),
-    "",
-    t(lang, "mgmt_corpus", { total: Number(u.messages_total ?? 0) }),
-    "",
-    t(lang, "mgmt_spend_note"),
-  ].join("\n");
-
-  await sendMessage(msg.chat.id, body, "HTML", {
-    inline_keyboard: [[
-      { text: t(lang, "mgmt_btn_diag"), callback_data: "mg:diag" },
-      { text: t(lang, "mgmt_btn_update"), callback_data: "mg:update" },
-    ]],
-  });
-}
 
 async function handleDiag(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  const db = tenantDb(user.tenant_id);
+  if (await denyUnlessSuperadmin(msg)) return;
   const lines: string[] = ["\ud83d\udd0d Diagnostic check..."];
 
   const anthropicStart = Date.now();
@@ -3531,7 +5191,7 @@ async function handleDiag(msg: any, user: any) {
     lines.push(`\u274c OpenAI Embeddings transport FAIL: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  const { data: lastMsg } = await supabase.from("messages")
+  const { data: lastMsg } = await db.from("messages")
     .select("created_at").order("created_at", { ascending: false }).limit(1).maybeSingle();
   if (lastMsg) {
     const ageSec = Math.floor((Date.now() - new Date(lastMsg.created_at).getTime()) / 1000);
@@ -3609,13 +5269,14 @@ function vectorLiteral(emb: number[]): string {
 }
 
 async function insertEmbedding(
+  db: TenantDb,
   sourceType: "message" | "note",
   sourceId: string,
   content: string,
   language: LangCode,
   embedding: number[],
 ): Promise<void> {
-  const { error } = await supabase.rpc("upsert_recap_embedding", {
+  const { error } = await db.rpc("upsert_recap_embedding", {
     p_source_type: sourceType,
     p_source_id: sourceId,
     p_content: content,
@@ -3625,16 +5286,18 @@ async function insertEmbedding(
   if (error) console.error(`insertEmbedding (${sourceType}/${sourceId}) failed:`, error);
 }
 
-async function embedMessageBackground(messageId: string, text: string, language: LangCode): Promise<void> {
+async function embedMessageBackground(tenantId: string, messageId: string, text: string, language: LangCode): Promise<void> {
+  const db = tenantDb(tenantId);
   const emb = await embedText(text);
   if (!emb) { console.error(`embedMessageBackground skipped (${messageId}): embedding failed`); return; }
-  await insertEmbedding("message", messageId, text, language, emb);
+  await insertEmbedding(db, "message", messageId, text, language, emb);
 }
 
-async function embedNoteBackground(noteId: string, text: string, language: LangCode): Promise<void> {
+async function embedNoteBackground(tenantId: string, noteId: string, text: string, language: LangCode): Promise<void> {
+  const db = tenantDb(tenantId);
   const emb = await embedText(text);
   if (!emb) { console.error(`embedNoteBackground skipped (${noteId}): embedding failed`); return; }
-  await insertEmbedding("note", noteId, text, language, emb);
+  await insertEmbedding(db, "note", noteId, text, language, emb);
 }
 
 type CorpusMessageRow = {
@@ -3646,8 +5309,8 @@ type CorpusMessageRow = {
   created_at: string;
 };
 
-async function findMessageByTelegramId(telegramMessageId: number): Promise<CorpusMessageRow | null> {
-  const { data, error } = await supabase
+async function findMessageByTelegramId(db: TenantDb, telegramMessageId: number): Promise<CorpusMessageRow | null> {
+  const { data, error } = await db
     .from("messages")
     .select("id, sender_id, original_text, original_language, telegram_message_id, created_at")
     .eq("telegram_message_id", telegramMessageId)
@@ -3657,130 +5320,132 @@ async function findMessageByTelegramId(telegramMessageId: number): Promise<Corpu
 }
 
 async function handleReconcile(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
+  const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, t(lang, "reconcile_usage"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "reconcile_usage"));
     return;
   }
-  const target = await findMessageByTelegramId(replyTo.message_id);
+  const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, t(lang, "reconcile_not_found"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "reconcile_not_found"));
     return;
   }
-  const { data: inserted, error } = await supabase
+  const { data: inserted, error } = await db
     .from("message_reconciles")
     .upsert({ message_id: target.id, reconciled_by: user.id }, { onConflict: "message_id", ignoreDuplicates: true })
     .select("message_id");
   if (error) {
     console.error("reconcile upsert failed:", error);
-    await sendMessage(msg.chat.id, t(lang, "reconcile_failed"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "reconcile_failed"));
     return;
   }
   const wasNew = (inserted ?? []).length > 0;
-  await sendMessage(msg.chat.id, t(lang, wasNew ? "reconcile_ok" : "reconcile_already"));
+  await sendMessage(msg.chat.id, wasNew
+    ? "\u2705 Reconciled. This message won't appear in /recap results."
+    : "Already reconciled.");
 }
 
 async function handleRestore(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
+  const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, t(lang, "restore_usage"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "restore_usage"));
     return;
   }
-  const target = await findMessageByTelegramId(replyTo.message_id);
+  const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, t(lang, "msg_not_in_corpus"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "msg_not_in_corpus"));
     return;
   }
-  const { data: deleted, error } = await supabase
+  const { data: deleted, error } = await db
     .from("message_reconciles")
     .delete()
     .eq("message_id", target.id)
     .select("message_id");
   if (error) {
     console.error("restore delete failed:", error);
-    await sendMessage(msg.chat.id, t(lang, "restore_failed"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "restore_failed"));
     return;
   }
   if (!deleted || deleted.length === 0) {
-    await sendMessage(msg.chat.id, t(lang, "restore_not_reconciled"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "restore_not_reconciled"));
     return;
   }
-  await sendMessage(msg.chat.id, t(lang, "restore_ok"));
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "restore_ok"));
 }
 
 async function handlePin(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
+  const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, t(lang, "pin_usage"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "pin_usage"));
     return;
   }
-  const target = await findMessageByTelegramId(replyTo.message_id);
+  const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, t(lang, "msg_not_in_corpus"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "msg_not_in_corpus"));
     return;
   }
-  const { data: inserted, error } = await supabase
+  const { data: inserted, error } = await db
     .from("message_pins")
     .upsert({ message_id: target.id, pinned_by: user.id }, { onConflict: "message_id", ignoreDuplicates: true })
     .select("message_id");
   if (error) {
     console.error("pin upsert failed:", error);
-    await sendMessage(msg.chat.id, t(lang, "pin_failed"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "pin_failed"));
     return;
   }
   const wasNew = (inserted ?? []).length > 0;
-  await sendMessage(msg.chat.id, t(lang, wasNew ? "pin_ok" : "pin_already"));
+  await sendMessage(msg.chat.id, wasNew ? "\ud83d\udccc Pinned." : "Already pinned.");
 }
 
 async function handleUnpin(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
+  const db = tenantDb(user.tenant_id);
   const replyTo = msg.reply_to_message;
   if (!replyTo) {
-    await sendMessage(msg.chat.id, t(lang, "unpin_usage"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unpin_usage"));
     return;
   }
-  const target = await findMessageByTelegramId(replyTo.message_id);
+  const target = await findMessageByTelegramId(db, replyTo.message_id);
   if (!target) {
-    await sendMessage(msg.chat.id, t(lang, "msg_not_in_corpus"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "msg_not_in_corpus"));
     return;
   }
-  const { data: deleted, error } = await supabase
+  const { data: deleted, error } = await db
     .from("message_pins")
     .delete()
     .eq("message_id", target.id)
     .select("message_id");
   if (error) {
     console.error("unpin delete failed:", error);
-    await sendMessage(msg.chat.id, t(lang, "unpin_failed"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unpin_failed"));
     return;
   }
   if (!deleted || deleted.length === 0) {
-    await sendMessage(msg.chat.id, t(lang, "unpin_not_pinned"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unpin_not_pinned"));
     return;
   }
-  await sendMessage(msg.chat.id, t(lang, "unpin_ok"));
+  await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "unpin_ok"));
 }
 
 async function handlePinned(msg: any, user: any) {
-  const lang = viewerLang(msg.from, user);
-  const { data, error } = await supabase
+  const db = tenantDb(user.tenant_id);
+  const { data, error } = await db
     .from("message_pins")
     .select("pinned_at, message:message_id (id, original_text, original_language, created_at)")
     .order("pinned_at", { ascending: true })
     .limit(50);
   if (error) {
     console.error("pinned query failed:", error);
-    await sendMessage(msg.chat.id, t(lang, "pinned_fetch_failed"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "pinned_fetch_failed"));
     return;
   }
   if (!data || data.length === 0) {
-    await sendMessage(msg.chat.id, t(lang, "pinned_empty"));
+    await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "pinned_empty"));
     return;
   }
-  const persons = buildPersonMap(user, await lookupPartner(user.id));
+  const persons = buildPersonMap(user, await lookupPartner(db, user.id));
   const rows: string[] = [];
   for (const r of data as any[]) {
     const m = r.message;
@@ -3791,11 +5456,12 @@ async function handlePinned(msg: any, user: any) {
     const snippet = raw.length > 160 ? raw.slice(0, 157) + "\u2026" : raw;
     rows.push(`\u2022 ${date} \u2014 ${sender}: \u00ab${snippet}\u00bb`);
   }
-  const header = t(lang, "pinned_header", { n: rows.length });
+  const header = `\ud83d\udccc Pinned messages (${rows.length}):`;
   await sendMessage(msg.chat.id, [header, "", ...rows].join("\n"));
 }
 
 async function handleRemember(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const note = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
@@ -3804,7 +5470,7 @@ async function handleRemember(msg: any, user: any) {
     return;
   }
   const language = await classifyLanguage(note, user.native_language, user.learning_language);
-  const { data: inserted, error } = await supabase
+  const { data: inserted, error } = await db
     .from("notes")
     .insert({ author_id: user.id, content: note, language })
     .select("id")
@@ -3814,7 +5480,7 @@ async function handleRemember(msg: any, user: any) {
     await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "note_save_failed"));
     return;
   }
-  scheduleBackgroundWork(`embedNote (${inserted.id})`, embedNoteBackground(inserted.id, note, language));
+  scheduleBackgroundWork(`embedNote (${inserted.id})`, embedNoteBackground(db.tenantId, inserted.id, note, language));
   await sendMessage(msg.chat.id, t(viewerLang(msg.from, user), "note_saved"));
 }
 
@@ -3891,6 +5557,7 @@ type RetrievedItem = {
 };
 
 async function retrieveCandidates(
+  db: TenantDb,
   question: string,
   queryEmbedding: number[],
   timeWindow: { start: string; end: string } | null,
@@ -3900,8 +5567,8 @@ async function retrieveCandidates(
   const p_limit = RECAP_CANDIDATE_POOL;
   const p_embedding = vectorLiteral(queryEmbedding);
   const [semResp, kwResp] = await Promise.all([
-    supabase.rpc("recap_semantic_search", { p_query_embedding: p_embedding, p_limit, p_start, p_end }),
-    supabase.rpc("recap_keyword_search", { p_query: question, p_limit, p_start, p_end }),
+    db.rpc("recap_semantic_search", { p_query_embedding: p_embedding, p_limit, p_start, p_end }),
+    db.rpc("recap_keyword_search", { p_query: question, p_limit, p_start, p_end }),
   ]);
   if (semResp.error) console.error("recap_semantic_search failed:", semResp.error);
   if (kwResp.error) console.error("recap_keyword_search failed:", kwResp.error);
@@ -4035,6 +5702,7 @@ async function sendChatAction(chatId: number, action: string): Promise<void> {
 }
 
 async function handleRecap(msg: any, user: any) {
+  const db = tenantDb(user.tenant_id);
   const text = (msg.text ?? "").trim();
   const firstSpace = text.indexOf(" ");
   const question = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
@@ -4057,7 +5725,7 @@ async function handleRecap(msg: any, user: any) {
     return;
   }
 
-  const { semantic, keyword } = await retrieveCandidates(question, qEmb, parsed.time_window);
+  const { semantic, keyword } = await retrieveCandidates(db, question, qEmb, parsed.time_window);
   const merged = rrfMerge(semantic, keyword);
   const top = filterAndRank(merged, user.id, parsed.k);
   if (top.length === 0) {
@@ -4067,7 +5735,7 @@ async function handleRecap(msg: any, user: any) {
     return;
   }
 
-  const partner = await lookupPartner(user.id);
+  const partner = await lookupPartner(db, user.id);
   const coupleIdentity = buildCoupleIdentity(user, partner);
   const answer = await synthesizeAnswer(question, top, user.display_name, coupleIdentity, parsed.language);
   if (!answer) {
@@ -4079,8 +5747,8 @@ async function handleRecap(msg: any, user: any) {
   await sendMessage(msg.chat.id, answer);
 }
 
-async function recapBackfillRemaining(): Promise<number | null> {
-  const { data, error } = await supabase.rpc("recap_backfill_remaining");
+async function recapBackfillRemaining(db: TenantDb): Promise<number | null> {
+  const { data, error } = await db.rpc("recap_backfill_remaining");
   if (error) { console.error("recap_backfill_remaining failed:", error); return null; }
   if (Array.isArray(data)) {
     const row = data[0];
@@ -4093,13 +5761,14 @@ async function recapBackfillRemaining(): Promise<number | null> {
 }
 
 async function handleRecapBackfill(msg: any, user: any) {
-  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  const db = tenantDb(user.tenant_id);
+  if (await denyUnlessSuperadmin(msg)) return;
 
-  const remaining = await recapBackfillRemaining();
+  const remaining = await recapBackfillRemaining(db);
   if (remaining === null) { await sendMessage(msg.chat.id, "Couldn't query backfill remaining. Check logs."); return; }
   if (remaining === 0) { await sendMessage(msg.chat.id, "\u2705 Recap backfill complete. 0 messages remaining."); return; }
 
-  const { data: batchData, error: batchErr } = await supabase.rpc("recap_backfill_batch", { p_limit: RECAP_BACKFILL_BATCH_SIZE });
+  const { data: batchData, error: batchErr } = await db.rpc("recap_backfill_batch", { p_limit: RECAP_BACKFILL_BATCH_SIZE });
   if (batchErr) {
     console.error("recap_backfill_batch failed:", batchErr);
     await sendMessage(msg.chat.id, "Couldn't fetch backfill batch. Check logs.");
@@ -4121,7 +5790,7 @@ async function handleRecapBackfill(msg: any, user: any) {
     if (!emb) { failed++; continue; }
     const item = batch[i];
     try {
-      await insertEmbedding("message", item.id, item.original_text, item.original_language, emb);
+      await insertEmbedding(db, "message", item.id, item.original_text, item.original_language, emb);
       succeeded++;
     } catch (e) {
       console.error("recap_backfill insertEmbedding failed for", item.id, e);
@@ -4129,7 +5798,7 @@ async function handleRecapBackfill(msg: any, user: any) {
     }
   }
 
-  const after = await recapBackfillRemaining();
+  const after = await recapBackfillRemaining(db);
   const afterStr = after === null ? "unknown" : String(after);
   const reply =
     `\u2705 Batch done.\n` +
