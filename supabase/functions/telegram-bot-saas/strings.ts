@@ -580,6 +580,122 @@ export const STRINGS: Record<string, Row> = {
     pt: "Conversa comigo para praticar (a solo)",
     pl: "Rozmawiaj ze mną, by ćwiczyć (solo)",
   },
+  // -------------------------------------------------- /education and /memory hubs
+  //
+  // The "/" menu had seventeen entries and no shape. Grouping ported from telegram-bot.
+  // Each hub is a printed INDEX, not a launcher: only the commands that take no argument
+  // get a button, because a button cannot carry the word /learn needs or the reply /pin
+  // needs, so offering one would produce a usage error on tap. Everything still works
+  // typed out -- only the menu shrank.
+
+  edu_header: {
+    en: "📚 <b>Study</b>",
+    uk: "📚 <b>Навчання</b>",
+    es: "📚 <b>Estudio</b>",
+    fr: "📚 <b>Étude</b>",
+    de: "📚 <b>Lernen</b>",
+    it: "📚 <b>Studio</b>",
+    pt: "📚 <b>Estudo</b>",
+    pl: "📚 <b>Nauka</b>",
+  },
+
+  mem_header: {
+    en: "🧠 <b>Memory</b>",
+    uk: "🧠 <b>Пам'ять</b>",
+    es: "🧠 <b>Memoria</b>",
+    fr: "🧠 <b>Mémoire</b>",
+    de: "🧠 <b>Gedächtnis</b>",
+    it: "🧠 <b>Memoria</b>",
+    pt: "🧠 <b>Memória</b>",
+    pl: "🧠 <b>Pamięć</b>",
+  },
+
+  edu_btn_vocab: {
+    en: "Top words",
+    uk: "Топ слів",
+    es: "Palabras top",
+    fr: "Mots fréquents",
+    de: "Top-Wörter",
+    it: "Parole top",
+    pt: "Palavras top",
+    pl: "Top słowa",
+  },
+
+  edu_btn_export: {
+    en: "Export to Anki",
+    uk: "Експорт в Anki",
+    es: "Exportar a Anki",
+    fr: "Exporter vers Anki",
+    de: "Nach Anki exportieren",
+    it: "Esporta in Anki",
+    pt: "Exportar para Anki",
+    pl: "Eksport do Anki",
+  },
+
+  edu_btn_mistakes: {
+    en: "My mistakes",
+    uk: "Мої помилки",
+    es: "Mis errores",
+    fr: "Mes fautes",
+    de: "Meine Fehler",
+    it: "I miei errori",
+    pt: "Os meus erros",
+    pl: "Moje błędy",
+  },
+
+  mem_btn_pinned: {
+    en: "Pinned messages",
+    uk: "Закріплені",
+    es: "Mensajes fijados",
+    fr: "Messages épinglés",
+    de: "Angeheftete",
+    it: "Messaggi fissati",
+    pt: "Mensagens fixadas",
+    pl: "Przypięte",
+  },
+
+  edu_body: {
+    en: "<b>Tap to run</b>\n• /vocab — the top words from your conversations you haven't learned yet\n• /export — both decks plus your mistakes, as a CSV for Anki\n• /mistakes — your last five corrections, blurred so you can test yourself\n\n<b>Type these</b>\n• <code>/learn &lt;word&gt;</code> — add one word to a deck\n• <code>/learn top N</code> — add the N most frequent unlearned words at once\n• <code>/forget &lt;word&gt;</code> — take a word back out\n• /capybara — turn grammar coaching on or off\n• /practice — chat with me to practise, if you have no partner",
+    uk: "<b>Натисни, щоб запустити</b>\n• /vocab — найчастіші слова з ваших розмов, які ти ще не вивчив(ла)\n• /export — обидві колоди й твої помилки у форматі CSV для Anki\n• /mistakes — п'ять останніх виправлень, розмиті, щоб перевірити себе\n\n<b>Це треба набрати</b>\n• <code>/learn &lt;слово&gt;</code> — додати одне слово до колоди\n• <code>/learn top N</code> — додати N найчастіших невивчених слів одразу\n• <code>/forget &lt;слово&gt;</code> — прибрати слово з колоди\n• /capybara — увімкнути або вимкнути допомогу з граматикою\n• /practice — розмовляти зі мною для практики, якщо немає партнера",
+    es: "<b>Pulsa para ejecutar</b>\n• /vocab — las palabras más frecuentes de tus conversaciones que aún no has aprendido\n• /export — ambos mazos y tus errores, en CSV para Anki\n• /mistakes — tus cinco últimas correcciones, difuminadas para autoevaluarte\n\n<b>Escribe estos</b>\n• <code>/learn &lt;palabra&gt;</code> — añadir una palabra al mazo\n• <code>/learn top N</code> — añadir de golpe las N palabras más frecuentes\n• <code>/forget &lt;palabra&gt;</code> — quitar una palabra\n• /capybara — activar o desactivar la ayuda de gramática\n• /practice — charla conmigo para practicar, si no tienes pareja",
+    fr: "<b>Appuie pour lancer</b>\n• /vocab — les mots les plus fréquents de tes conversations que tu n'as pas encore appris\n• /export — les deux paquets et tes fautes, en CSV pour Anki\n• /mistakes — tes cinq dernières corrections, floutées pour t'auto-tester\n\n<b>À taper</b>\n• <code>/learn &lt;mot&gt;</code> — ajouter un mot au paquet\n• <code>/learn top N</code> — ajouter d'un coup les N mots les plus fréquents\n• <code>/forget &lt;mot&gt;</code> — retirer un mot\n• /capybara — activer ou désactiver l'aide grammaticale\n• /practice — discuter avec moi pour t'entraîner, si tu n'as pas de partenaire",
+    de: "<b>Zum Ausführen tippen</b>\n• /vocab — die häufigsten Wörter aus euren Gesprächen, die du noch nicht gelernt hast\n• /export — beide Stapel und deine Fehler, als CSV für Anki\n• /mistakes — deine letzten fünf Korrekturen, verdeckt zum Selbsttest\n\n<b>Diese eintippen</b>\n• <code>/learn &lt;Wort&gt;</code> — ein Wort zum Stapel hinzufügen\n• <code>/learn top N</code> — die N häufigsten Wörter auf einmal hinzufügen\n• <code>/forget &lt;Wort&gt;</code> — ein Wort wieder entfernen\n• /capybara — Grammatikhilfe ein- oder ausschalten\n• /practice — mit mir üben, wenn du keinen Partner hast",
+    it: "<b>Tocca per eseguire</b>\n• /vocab — le parole più frequenti delle vostre conversazioni che non hai ancora imparato\n• /export — entrambi i mazzi e i tuoi errori, in CSV per Anki\n• /mistakes — le tue ultime cinque correzioni, sfocate per metterti alla prova\n\n<b>Da scrivere</b>\n• <code>/learn &lt;parola&gt;</code> — aggiungere una parola al mazzo\n• <code>/learn top N</code> — aggiungere in blocco le N parole più frequenti\n• <code>/forget &lt;parola&gt;</code> — togliere una parola\n• /capybara — attivare o disattivare l'aiuto di grammatica\n• /practice — chiacchierare con me per esercitarti, se non hai un partner",
+    pt: "<b>Toca para executar</b>\n• /vocab — as palavras mais frequentes das vossas conversas que ainda não aprendeste\n• /export — ambos os baralhos e os teus erros, em CSV para o Anki\n• /mistakes — as tuas últimas cinco correções, desfocadas para te testares\n\n<b>Escreve estes</b>\n• <code>/learn &lt;palavra&gt;</code> — adicionar uma palavra ao baralho\n• <code>/learn top N</code> — adicionar de uma vez as N palavras mais frequentes\n• <code>/forget &lt;palavra&gt;</code> — retirar uma palavra\n• /capybara — ligar ou desligar a ajuda de gramática\n• /practice — conversar comigo para praticar, se não tiveres parceiro",
+    pl: "<b>Naciśnij, aby uruchomić</b>\n• /vocab — najczęstsze słowa z waszych rozmów, których jeszcze nie znasz\n• /export — obie talie i twoje błędy, w CSV do Anki\n• /mistakes — pięć ostatnich poprawek, rozmytych do autotestu\n\n<b>Te trzeba wpisać</b>\n• <code>/learn &lt;słowo&gt;</code> — dodać słowo do talii\n• <code>/learn top N</code> — dodać naraz N najczęstszych słów\n• <code>/forget &lt;słowo&gt;</code> — usunąć słowo\n• /capybara — włączyć lub wyłączyć pomoc z gramatyką\n• /practice — rozmawiać ze mną dla ćwiczeń, jeśli nie masz partnera",
+  },
+
+  mem_body: {
+    en: "<b>Tap to run</b>\n• /pinned — everything you've pinned, oldest first\n\n<b>Type these</b>\n• <code>/ask &lt;question&gt;</code> — search everything you've said to each other\n• <code>/note &lt;note&gt;</code> — save a private note only your own /ask will find\n\n<b>Reply to a message with these</b>\n• /pin — mark it as meaningful, so /ask weighs it more\n• /unpin — remove that mark\n• /reconcile — keep it out of /ask results\n• /restore — put a reconciled message back",
+    uk: "<b>Натисни, щоб запустити</b>\n• /pinned — усе закріплене, від найстарішого\n\n<b>Це треба набрати</b>\n• <code>/ask &lt;питання&gt;</code> — шукати в усьому, що ви казали одне одному\n• <code>/note &lt;нотатка&gt;</code> — приватна нотатка, яку знайде лише твій /ask\n\n<b>Відповідай на повідомлення цими</b>\n• /pin — позначити як важливе, щоб /ask враховував його більше\n• /unpin — зняти позначку\n• /reconcile — виключити з результатів /ask\n• /restore — повернути виключене повідомлення",
+    es: "<b>Pulsa para ejecutar</b>\n• /pinned — todo lo que has fijado, de lo más antiguo a lo más nuevo\n\n<b>Escribe estos</b>\n• <code>/ask &lt;pregunta&gt;</code> — busca en todo lo que os habéis dicho\n• <code>/note &lt;nota&gt;</code> — guarda una nota privada que solo tu /ask encontrará\n\n<b>Responde a un mensaje con estos</b>\n• /pin — marcarlo como importante, para que /ask lo pondere más\n• /unpin — quitar esa marca\n• /reconcile — excluirlo de los resultados de /ask\n• /restore — devolverlo a /ask",
+    fr: "<b>Appuie pour lancer</b>\n• /pinned — tout ce que tu as épinglé, du plus ancien au plus récent\n\n<b>À taper</b>\n• <code>/ask &lt;question&gt;</code> — cherche dans tout ce que vous vous êtes dit\n• <code>/note &lt;note&gt;</code> — enregistre une note privée que seul ton /ask trouvera\n\n<b>Réponds à un message avec ceux-ci</b>\n• /pin — le marquer comme important, pour que /ask lui donne plus de poids\n• /unpin — enlever cette marque\n• /reconcile — l'exclure des résultats de /ask\n• /restore — le remettre dans /ask",
+    de: "<b>Zum Ausführen tippen</b>\n• /pinned — alles Angeheftete, älteste zuerst\n\n<b>Diese eintippen</b>\n• <code>/ask &lt;Frage&gt;</code> — durchsucht alles, was ihr einander gesagt habt\n• <code>/note &lt;Notiz&gt;</code> — speichert eine private Notiz, die nur dein /ask findet\n\n<b>Auf eine Nachricht damit antworten</b>\n• /pin — als wichtig markieren, damit /ask sie stärker gewichtet\n• /unpin — Markierung entfernen\n• /reconcile — aus den /ask-Ergebnissen heraushalten\n• /restore — wieder in /ask aufnehmen",
+    it: "<b>Tocca per eseguire</b>\n• /pinned — tutto ciò che hai fissato, dal più vecchio\n\n<b>Da scrivere</b>\n• <code>/ask &lt;domanda&gt;</code> — cerca in tutto quello che vi siete detti\n• <code>/note &lt;nota&gt;</code> — salva una nota privata che troverà solo il tuo /ask\n\n<b>Rispondi a un messaggio con questi</b>\n• /pin — segnarlo come importante, così /ask lo pesa di più\n• /unpin — togliere il segno\n• /reconcile — escluderlo dai risultati di /ask\n• /restore — rimetterlo in /ask",
+    pt: "<b>Toca para executar</b>\n• /pinned — tudo o que fixaste, do mais antigo\n\n<b>Escreve estes</b>\n• <code>/ask &lt;pergunta&gt;</code> — procura em tudo o que disseram um ao outro\n• <code>/note &lt;nota&gt;</code> — guarda uma nota privada que só o teu /ask encontra\n\n<b>Responde a uma mensagem com estes</b>\n• /pin — marcar como importante, para o /ask lhe dar mais peso\n• /unpin — retirar a marca\n• /reconcile — manter fora dos resultados do /ask\n• /restore — devolver ao /ask",
+    pl: "<b>Naciśnij, aby uruchomić</b>\n• /pinned — wszystko przypięte, od najstarszego\n\n<b>Te trzeba wpisać</b>\n• <code>/ask &lt;pytanie&gt;</code> — przeszukaj wszystko, co do siebie napisaliście\n• <code>/note &lt;notatka&gt;</code> — zapisz prywatną notatkę, którą znajdzie tylko twój /ask\n\n<b>Odpowiedz na wiadomość tymi</b>\n• /pin — oznacz jako ważne, by /ask bardziej je ważył\n• /unpin — usuń oznaczenie\n• /reconcile — wyklucz z wyników /ask\n• /restore — przywróć do /ask",
+  },
+
+  cmd_education: {
+    en: "Study: words, decks, mistakes, Anki",
+    uk: "Навчання: слова, колоди, помилки, Anki",
+    es: "Estudio: palabras, mazos, errores, Anki",
+    fr: "Étude : mots, paquets, fautes, Anki",
+    de: "Lernen: Wörter, Stapel, Fehler, Anki",
+    it: "Studio: parole, mazzi, errori, Anki",
+    pt: "Estudo: palavras, baralhos, erros, Anki",
+    pl: "Nauka: słowa, talie, błędy, Anki",
+  },
+  cmd_memory: {
+    en: "Memory: ask, notes, pins",
+    uk: "Пам'ять: запити, нотатки, закріплення",
+    es: "Memoria: preguntas, notas, fijados",
+    fr: "Mémoire : questions, notes, épingles",
+    de: "Gedächtnis: Fragen, Notizen, Pins",
+    it: "Memoria: domande, note, fissati",
+    pt: "Memória: perguntas, notas, fixados",
+    pl: "Pamięć: pytania, notatki, przypięcia",
+  },
   cmd_delete_account: {
     en: "Delete the account and all its data (permanent)", uk: "Видалити акаунт і всі дані (назавжди)",
     es: "Borrar la cuenta y todos sus datos (permanente)", fr: "Supprimer le compte et toutes ses données (définitif)",

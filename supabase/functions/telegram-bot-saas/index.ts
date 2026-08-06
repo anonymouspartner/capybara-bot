@@ -12,7 +12,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!.trim();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "saas-v31";
+const BUILD_VERSION = "saas-v32";
 // This bot's @username, without the @. Used to build the partner invite deep link. The
 // bot cannot discover it reliably at boot (getMe would need a call on every cold start),
 // and onboarding degrades to "send them this code" if it is unset rather than failing.
@@ -580,7 +580,10 @@ async function handleUpdate(update: any) {
              "leave", "help", "start", "vocab", "learn", "forget", "pin", "unpin", "pinned",
              // Turning practice OFF must work at the cap -- otherwise the setting that is
              // spending the allowance is the one you cannot reach to stop.
-             "practice")) {
+             "practice",
+             // Printing a list of commands is a pure read; billing a message for it
+             // charges the customer for our own menu.
+             "education", "study", "memory")) {
     const verdict = await consumeQuota(user.tenant_id);
     if (!verdict.allowed) {
       await sendMessage(msg.chat.id, quotaRefusalText(viewerLang(msg.from, user), verdict), "HTML");
@@ -632,6 +635,8 @@ async function handleUpdate(update: any) {
     { match: t => isCmd(t, "promo", "code"),                                            handle: handlePromo },
     { match: t => isCmd(t, "delete_account"),                                           handle: handleDeleteAccount },
     { match: t => isCmd(t, "leave"),                                                    handle: handleLeave },
+    { match: t => isCmd(t, "education", "study"),                                        handle: handleEducation },
+    { match: t => isCmd(t, "memory"),                                                    handle: handleMemory },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
@@ -2623,6 +2628,29 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
 
 // /capybara [on|off] -- per-user toggle for the grammar assistant. Bare /capybara
 // flips the current state.
+// The /education and /memory hubs. Printed indexes, not launchers: only argument-free
+// commands get a button, because a button cannot carry the word /learn needs or the reply
+// /pin needs. Ported from telegram-bot.
+async function handleEducation(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
+  await sendMessage(msg.chat.id, `${t(lang, "edu_header")}\n\n${t(lang, "edu_body")}`, "HTML", {
+    inline_keyboard: [[
+      { text: t(lang, "edu_btn_vocab"), callback_data: "ed|vocab" },
+      { text: t(lang, "edu_btn_export"), callback_data: "ed|export" },
+      { text: t(lang, "edu_btn_mistakes"), callback_data: "ed|mistakes" },
+    ]],
+  });
+}
+
+async function handleMemory(msg: any, user: any) {
+  const lang = viewerLang(msg.from, user);
+  await sendMessage(msg.chat.id, `${t(lang, "mem_header")}\n\n${t(lang, "mem_body")}`, "HTML", {
+    inline_keyboard: [[
+      { text: t(lang, "mem_btn_pinned"), callback_data: "mem|pinned" },
+    ]],
+  });
+}
+
 // /practice [on|off] -- the solo conversation partner. Bare /practice flips it.
 async function handlePractice(msg: any, user: any) {
   const db = tenantDb(user.tenant_id);
@@ -3222,31 +3250,26 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
 // Descriptions are catalog keys, not literals. They were hardcoded English, so the "/"
 // menu -- the first thing a customer reads, and the list of what the product does -- was
 // in the wrong language whichever one they had picked. Ported from telegram-bot.
+// Eight entries, not seventeen. The study and memory commands moved behind /education and
+// /memory, which print them WITH their arguments -- a menu entry can only send the bare
+// command, so /learn and /note appeared in the menu as things you tap and then get a usage
+// error from.
+//
+// What stays is what someone must be able to find without being told: /ask because it is
+// the one people reach for most, /management because a lapsed card and an exhausted
+// allowance both dead-end there, /plans because the default scope is what a stranger sees
+// before they have ever spoken to the bot, and /leave because a partner who wants out
+// should not have to ask the account owner how.
+//
+// Every command still works typed out; only the menu shrank.
 const PUBLIC_COMMANDS: { command: string; key: string }[] = [
   { command: "start",      key: "cmd_start" },
   { command: "help",       key: "cmd_help" },
-  { command: "vocab",      key: "cmd_vocab" },
-  { command: "learn",      key: "cmd_learn" },
-  { command: "forget",     key: "cmd_forget" },
-  { command: "export",     key: "cmd_export" },
-  { command: "mistakes",   key: "cmd_mistakes" },
-  { command: "capybara",   key: "cmd_capybara" },
-  // In the menu despite only applying to solo customers: otherwise nobody finds it. A
-  // paired customer who taps it gets a one-line explanation of what it is and why it is
-  // not for them, which is a better outcome than an undiscoverable feature.
-  { command: "practice",   key: "cmd_practice" },
+  { command: "education",  key: "cmd_education" },
+  { command: "memory",     key: "cmd_memory" },
   { command: "ask",        key: "cmd_ask" },
-  { command: "note",       key: "cmd_note" },
-  { command: "pin",        key: "cmd_pin" },
-  { command: "unpin",      key: "cmd_unpin" },
-  { command: "pinned",     key: "cmd_pinned" },
-  // Last in the list but the one a customer needs findable without asking: a lapsed card
-  // or an exhausted allowance both dead-end here. Reuses cmd_billing, which already reads
-  // "Subscription, usage and payment" in all eight.
   { command: "management", key: "cmd_billing" },
   { command: "leave",      key: "cmd_leave" },
-  // The default menu scope is what a stranger sees before they have ever spoken to the
-  // bot, so this is the one entry aimed at someone who is not a customer yet.
   { command: "plans",      key: "cmd_plans" },
 ];
 
@@ -5086,6 +5109,22 @@ async function handleCallbackQuery(cq: any) {
   if ((cq.data ?? "") === "lv|confirm") { await handleLeaveConfirm(cq); return; }
   if ((cq.data ?? "").startsWith("mg|rm|")) { await handleRemovePartnerConfirm(cq, (cq.data ?? "").slice(6)); return; }
   if ((cq.data ?? "").startsWith("mg|rmy|")) { await handleRemovePartnerDo(cq, (cq.data ?? "").slice(7)); return; }
+
+  // The hub buttons. Gated on being a registered user rather than on anything stronger:
+  // they only ever run read-only commands the tapper could type anyway. The shim calls the
+  // real handlers rather than keeping a second copy of each that can drift.
+  const hub = cq.data ?? "";
+  if (hub.startsWith("ed|") || hub.startsWith("mem|")) {
+    const actor = await lookupUser(cq.from);
+    if (!actor) { await answerCallbackQuery(cq.id); return; }
+    await answerCallbackQuery(cq.id);
+    const shim = { chat: { id: cq.message?.chat?.id }, from: cq.from, text: "" };
+    if (hub === "ed|vocab") await handleVocab(shim, actor);
+    else if (hub === "ed|export") await handleExport(shim, actor);
+    else if (hub === "ed|mistakes") await handleMistakes(shim, actor);
+    else if (hub === "mem|pinned") await handlePinned(shim, actor);
+    return;
+  }
 
   // Nothing else issues buttons. Acknowledge so Telegram stops showing a spinner on a
   // stale keyboard from an older build, and do nothing.

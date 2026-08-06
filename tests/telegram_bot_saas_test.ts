@@ -66,9 +66,9 @@ Deno.test('the "/" menu is keyed, and every key resolves in all eight languages'
   assert(!/command: "start", description:/.test(SRC), "no literal descriptions");
   const block = SRC.slice(SRC.indexOf("const PUBLIC_COMMANDS"), SRC.indexOf("const SUPERADMIN_EXTRA"));
   const keys = [...block.matchAll(/key: "([a-z_]+)"/g)].map((m) => m[1]);
-  // A ratchet, not a target: the menu was curated down deliberately, so growing it should
-  // be a decision someone made on purpose. 17 since /practice was added.
-  assert(keys.length === 17, `expected 17 menu entries, got ${keys.length}`);
+  // A ratchet, not a target: the menu was curated down to eight deliberately, so growing
+  // it should be a decision someone made on purpose rather than a drift.
+  assert(keys.length === 8, `expected 8 menu entries, got ${keys.length}`);
   for (const k of keys) {
     assert(k in STRINGS, `${k} missing from the catalog`);
     for (const l of LANGS) {
@@ -169,6 +169,30 @@ Deno.test("the picker migration scopes by tenant and stays caller-rights", () =>
   assert(/COALESCE\(best\.id, s\.first_seen_message_id\)/.test(ddl), "must fall back, never return null");
   assert(/GRANT {2}EXECUTE ON FUNCTION public\.pick_example_messages\(uuid, uuid\[\]\) TO service_role/.test(SQL_PICK), "granted");
   assert(/REVOKE EXECUTE ON FUNCTION public\.pick_example_messages\(uuid, uuid\[\]\) FROM PUBLIC/.test(SQL_PICK), "revoked");
+});
+
+Deno.test("the hubs group the menu without removing any command", () => {
+  assert(/isCmd\(t, "education", "study"\)/.test(SRC) && /isCmd\(t, "memory"\)/.test(SRC), "hubs dispatch");
+  // The grouping is a discoverability change, not a capability change. Every command that
+  // left the menu must still work typed out.
+  for (const c of ["vocab", "learn", "forget", "export", "mistakes", "capybara", "practice",
+                   "pin", "unpin", "pinned", "reconcile", "restore"]) {
+    assert(new RegExp(`"/${c}"|isCmd\\(t, "${c}"`).test(SRC), `/${c} must still dispatch`);
+  }
+  // Buttons call the real handlers rather than a second copy that can drift.
+  for (const h of ["handleVocab", "handleExport", "handleMistakes", "handlePinned"]) {
+    assert(new RegExp(`await ${h}\\(shim, actor\\)`).test(SRC), `${h} should be reused`);
+  }
+  // Only argument-free commands get buttons: a button cannot carry the word /learn needs.
+  assert(!/callback_data: "ed\|learn"/.test(SRC) && !/callback_data: "mem\|ask"/.test(SRC), "no arg buttons");
+  // Opening an index is a pure read; billing a message for it charges for our own menu.
+  const gate = SRC.slice(SRC.indexOf('"leave", "help", "start"'), SRC.indexOf('const verdict = await consumeQuota'));
+  assert(/"education", "study", "memory"/.test(gate), "hubs must be exempt from the quota gate");
+  // The commercially load-bearing entries must survive the cut: a lapsed card dead-ends at
+  // /management, and /plans is the only entry aimed at someone who is not a customer yet.
+  for (const k of ["cmd_billing", "cmd_plans", "cmd_leave", "cmd_ask"]) {
+    assert(new RegExp(`key: "${k}"`).test(SRC), `${k} must stay in the menu`);
+  }
 });
 
 Deno.test("solo practice: the bot's words never reach the study corpus", () => {
