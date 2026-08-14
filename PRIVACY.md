@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Capybara Bot** — effective date: 2026-06-26
+**Capybara Bot** — effective date: 2026-08-14
 
 ---
 
@@ -100,29 +100,21 @@ There is no need to make a request to anyone to exercise these rights — you al
 
 ---
 
-## 8. Data retention and automatic deletion
+## 8. Data retention
 
-**All personally identifiable information (PII) is automatically deleted 30 days after it is created.** This is enforced by a scheduled database job (`pg_cron`) installed on your Supabase project as part of the standard setup.
+**Data is retained until you delete it.** There is no automatic expiry and no scheduled deletion job. Everything listed in Section 3 — message text, voice recordings and transcriptions, personal notes, annotations, embeddings, pins, vocabulary and flashcards — stays in your Supabase project indefinitely, because the bot's `/recap`, `/pinned` and vocabulary features are built on that accumulated history.
 
-PII subject to the 30-day deletion schedule includes:
+Earlier versions of this software installed a `pg_cron` job that deleted message-level data 30 days after it was created. **That job has been removed.** If your instance was provisioned before this change, applying the current migrations unschedules the job and drops its deletion function; until you apply them, your instance continues to expire data on the old 30-day schedule.
 
-- Message text (originals and translations)
-- Voice note audio files (deleted from the `voice-messages` storage bucket)
-- Voice transcriptions
-- Personal notes created with `/remember`
-- Message-level metadata (sender, timestamp, input type)
-- Vector embeddings derived from messages and notes
-- Vocabulary annotations linked to specific messages
-- Pin and reconcile flags attached to messages
+Deletion is entirely in your hands, as described in Section 7. You own the Supabase project, so you can at any time:
 
-The following derived data is **not** PII and is retained beyond 30 days:
+- delete individual messages, notes, or voice files;
+- delete whole tables, or empty the `voice-messages` storage bucket;
+- delete the entire Supabase project, which destroys all of it at once.
 
-- Anonymised vocabulary lemmas and grammar statistics (not linked to individual messages once the source messages are deleted)
-- Flashcard decks you have explicitly saved to study
+If you prefer an automatic retention window, you can reinstate one yourself: the removed job is preserved in the repository's migration history (`supabase/migrations/20260626000000_pii_retention_30days.sql`) and can be re-applied, with the retention period set to any number of days you choose.
 
-The deletion job runs once daily at midnight UTC. You can inspect, pause, or modify the schedule at any time via the Supabase Dashboard under **Database → Extensions → pg_cron**. You may also delete any record earlier than the 30-day window using the Supabase Dashboard or SQL — 30 days is a ceiling, not a floor.
-
-The retention clock starts at the moment a record is written to the database (`created_at`). Records created before this policy was applied to your instance will be cleaned up by the scheduled job within 30 days of the job being installed.
+Because data is now kept indefinitely, both partners should understand that messages sent through the bot remain searchable via `/recap` for as long as the instance exists. If you set up the instance, you are responsible for making sure your partner knows this (see Section 6).
 
 ---
 
