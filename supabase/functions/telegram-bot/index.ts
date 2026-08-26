@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v80";
+const BUILD_VERSION = "v81";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -78,8 +78,9 @@ const CYRILLIC_SKIP_THRESHOLD = 0.5;
 // two seeded users' native_language values (resolved via lookupPartner); this
 // registry supplies the per-language metadata that used to live in hardcoded en/uk
 // ternaries. To support a new language, add an entry here. Unknown codes are a
-// provisioning error, never a runtime path. Prompt-heavy fields (translationNotes,
-// grammarExamples, helpText) are filled in by later phases as those paths generalize.
+// provisioning error, never a runtime path. grammarExamples is now carried by every
+// registered language; translationNotes stays per-language and opt-in (only Ukrainian
+// needs one so far), and helpText is filled in by a later phase as that path generalizes.
 type LangCode = string;
 type Script = "latin" | "cyrillic";
 type LangMeta = {
@@ -108,12 +109,12 @@ const UK_TRANSLATION_NOTES =
 const LANGUAGES: Record<string, LangMeta> = {
   en: { code: "en", englishName: "English",    nativeName: "English",     flag: "🇬🇧", script: "latin",    whisperName: "english",    whisperCode: "en", marksSpeakerGender: false, synonyms: ["eng", "english", "англ", "англійська"], grammarExamples: `"past perfect tense", "phrasal verb", "conditional", "passive voice"` },
   uk: { code: "uk", englishName: "Ukrainian",  nativeName: "Українська", flag: "🇺🇦", script: "cyrillic", whisperName: "ukrainian",  whisperCode: "uk", marksSpeakerGender: true,  synonyms: ["ua", "ukr", "ukrainian", "укр", "українська"], translationNotes: UK_TRANSLATION_NOTES, grammarExamples: `"instrumental case", "imperfective aspect", "diminutive form"` },
-  es: { code: "es", englishName: "Spanish",    nativeName: "Español",  flag: "🇪🇸", script: "latin",    whisperName: "spanish",    whisperCode: "es", marksSpeakerGender: true,  synonyms: ["spa", "spanish", "espanol", "español"] },
-  fr: { code: "fr", englishName: "French",     nativeName: "Français", flag: "🇫🇷", script: "latin",    whisperName: "french",     whisperCode: "fr", marksSpeakerGender: true,  synonyms: ["fra", "fre", "french", "francais", "français"] },
-  de: { code: "de", englishName: "German",     nativeName: "Deutsch",     flag: "🇩🇪", script: "latin",    whisperName: "german",     whisperCode: "de", marksSpeakerGender: false, synonyms: ["ger", "deu", "german", "deutsch"] },
-  it: { code: "it", englishName: "Italian",    nativeName: "Italiano",    flag: "🇮🇹", script: "latin",    whisperName: "italian",    whisperCode: "it", marksSpeakerGender: true,  synonyms: ["ita", "italian", "italiano"] },
-  pt: { code: "pt", englishName: "Portuguese", nativeName: "Português", flag: "🇵🇹", script: "latin",    whisperName: "portuguese", whisperCode: "pt", marksSpeakerGender: true,  synonyms: ["por", "portuguese", "portugues", "português"] },
-  pl: { code: "pl", englishName: "Polish",     nativeName: "Polski",      flag: "🇵🇱", script: "latin",    whisperName: "polish",     whisperCode: "pl", marksSpeakerGender: true,  synonyms: ["pol", "polish", "polski"] },
+  es: { code: "es", englishName: "Spanish",    nativeName: "Español",  flag: "🇪🇸", script: "latin",    whisperName: "spanish",    whisperCode: "es", marksSpeakerGender: true,  synonyms: ["spa", "spanish", "espanol", "español"], grammarExamples: `"preterite tense", "subjunctive mood", "reflexive verb", "diminutive form"` },
+  fr: { code: "fr", englishName: "French",     nativeName: "Français", flag: "🇫🇷", script: "latin",    whisperName: "french",     whisperCode: "fr", marksSpeakerGender: true,  synonyms: ["fra", "fre", "french", "francais", "français"], grammarExamples: `"compound past tense", "subjunctive mood", "partitive article", "pronominal verb"` },
+  de: { code: "de", englishName: "German",     nativeName: "Deutsch",     flag: "🇩🇪", script: "latin",    whisperName: "german",     whisperCode: "de", marksSpeakerGender: false, synonyms: ["ger", "deu", "german", "deutsch"], grammarExamples: `"dative case", "separable verb", "modal verb", "subordinate clause word order"` },
+  it: { code: "it", englishName: "Italian",    nativeName: "Italiano",    flag: "🇮🇹", script: "latin",    whisperName: "italian",    whisperCode: "it", marksSpeakerGender: true,  synonyms: ["ita", "italian", "italiano"], grammarExamples: `"compound past tense", "subjunctive mood", "clitic pronoun", "reflexive verb"` },
+  pt: { code: "pt", englishName: "Portuguese", nativeName: "Português", flag: "🇵🇹", script: "latin",    whisperName: "portuguese", whisperCode: "pt", marksSpeakerGender: true,  synonyms: ["por", "portuguese", "portugues", "português"], grammarExamples: `"preterite tense", "personal infinitive", "subjunctive mood", "reflexive verb"` },
+  pl: { code: "pl", englishName: "Polish",     nativeName: "Polski",      flag: "🇵🇱", script: "latin",    whisperName: "polish",     whisperCode: "pl", marksSpeakerGender: true,  synonyms: ["pol", "polish", "polski"], grammarExamples: `"instrumental case", "perfective aspect", "diminutive form", "verbal noun"` },
 };
 // Total accessor: never throws, so label helpers stay safe even for an unexpected code.
 function langMeta(code: string): LangMeta {
