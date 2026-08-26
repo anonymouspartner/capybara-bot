@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v81";
+const BUILD_VERSION = "v82";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -270,6 +270,7 @@ async function handleUpdate(update: any) {
     { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
+    { match: t => t === "/backfill_examples",                                             handle: handleBackfillExamples },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
     { match: t => t === "/diag",                                                         handle: handleDiag },
     { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
@@ -957,14 +958,16 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
   const grammarExamples = langMeta(language).grammarExamples ?? `"tense", "case", "aspect", "mood"`;
   return (
     `Analyze the ${langName} text and return a JSON object with these keys:\n` +
-    `- "vocabulary": array of {lemma, part_of_speech, gloss, lemma_translation} for content words only.\n` +
+    `- "vocabulary": array of {lemma, part_of_speech, gloss, lemma_translation, example, example_translation} for content words only.\n` +
     `  * lemma MUST be the dictionary form (nominative singular for nouns, infinitive for verbs, base form for adjectives).\n` +
     `  * part_of_speech MUST be one of: "noun", "verb", "adjective", "adverb", "phrase".\n` +
     `  * gloss is 1-4 words in ${otherLangName} (the learner's language), disambiguating the word's specific sense as used in this text, not just the most generic/literal meaning.\n` +
-    `  * lemma_translation is the dictionary form of the word in ${otherLangName} (the OPPOSITE language), translated IN THE SAME SENSE the word is used in this text — it MUST agree with gloss (e.g. English "hard" used to mean difficult → "важкий", NOT "твердий"). For ${langName} lemmas, return the ${otherLangName} translation; this becomes the "answer" on a flashcard whose example sentence is this text, so a wrong-sense translation makes a wrong card.\n` +
+    `  * lemma_translation is the dictionary form of the word in ${otherLangName} (the OPPOSITE language), translated IN THE SAME SENSE the word is used in this text \u2014 it MUST agree with gloss (e.g. English "hard" used to mean difficult \u2192 "важкий", NOT "твердий"). For ${langName} lemmas, return the ${otherLangName} translation; this becomes the "answer" on a flashcard whose example is "example", so a wrong-sense translation makes a wrong card.\n` +
     `    - Give the dictionary form (infinitive for verbs, nominative singular for nouns).\n` +
     `    - One word only when possible; a short phrase if the language has no single-word equivalent.\n` +
     `    - The gloss and lemma_translation may be identical; that's fine \u2014 return both.\n` +
+    `  * example is the ONE sentence from the input text \u2014 copied verbatim, character-for-character, never paraphrased or shortened \u2014 in which the word appears in the form actually used. Use two consecutive sentences only if the word's sense is unrecoverable from one alone. This becomes the front of a flashcard, so it must never be the whole input.\n` +
+    `  * example_translation is the sentence from the accepted translation (given below under SENSE ANCHOR, if present) that corresponds to "example" \u2014 copied verbatim from that translation, never invented or back-translated. If the translation renders that stretch idiomatically and no sentence there actually contains a recognizable form of lemma_translation, return null rather than a sentence that doesn't support the answer. Return null whenever no SENSE ANCHOR translation is given below.\n` +
     `  * SKIP: prepositions, conjunctions, particles, interjections, pronouns, numerals, proper nouns (names of people/places).\n` +
     `  * For homographs (same lemma, different part of speech), return separate entries.\n` +
     `- "grammar": array of grammatical features used (e.g., ${grammarExamples})\n` +
@@ -1034,6 +1037,8 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
       part_of_speech: v.part_of_speech,
       gloss: v.gloss ?? null,
       lemma_translation: v.lemma_translation ?? null,
+      example: typeof v.example === "string" && v.example ? v.example : null,
+      example_translation: typeof v.example_translation === "string" && v.example_translation ? v.example_translation : null,
       first_seen_message_id: messageId,
       language: language,
     }));
@@ -1232,7 +1237,7 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
 ];
 // Only the two commands an admin uses on a live instance appear in the menu. The
 // one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
-// /recap_backfill) and the reply-based /reconcile & /restore are intentionally omitted
+// /backfill_examples, /recap_backfill) and the reply-based /reconcile & /restore are intentionally omitted
 // to keep the menu clean -- they remain fully functional when typed, and /help still
 // lists them.
 const ADMIN_COMMANDS: { command: string; description: string }[] = [
@@ -1612,7 +1617,7 @@ async function handleExport(msg: any, user: any) {
 async function exportRun(chatId: number, user: any) {
   const { data: cards, error } = await supabase
     .from("flashcards")
-    .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
+    .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation, example, example_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
     .order("created_at", { ascending: true });
 
   if (error) {
@@ -1643,16 +1648,22 @@ async function exportRun(chatId: number, user: any) {
   for (const card of (cards ?? []) as any[]) {
     const v = card.vocabulary;
     if (!v) continue;
-    const m = card.example_message;
-    let exampleSentence = "";
-    let exampleTranslation = "";
-    if (m) {
-      if (m.original_language === v.language) {
-        exampleSentence = m.original_text ?? "";
-        exampleTranslation = m.translated_text ?? "";
-      } else if (m.translated_language === v.language) {
-        exampleSentence = m.translated_text ?? "";
-        exampleTranslation = m.original_text ?? "";
+    // Prefer the short, model-extracted sentence pair stored on the vocabulary row.
+    // Rows annotated before that column existed (or backfilled without one -- an
+    // idiomatic translation with no locatable counterpart) fall back to the whole
+    // linked message, same as export always did.
+    let exampleSentence = v.example ?? "";
+    let exampleTranslation = v.example_translation ?? "";
+    if (!exampleSentence) {
+      const m = card.example_message;
+      if (m) {
+        if (m.original_language === v.language) {
+          exampleSentence = m.original_text ?? "";
+          exampleTranslation = m.translated_text ?? "";
+        } else if (m.translated_language === v.language) {
+          exampleSentence = m.translated_text ?? "";
+          exampleTranslation = m.original_text ?? "";
+        }
       }
     }
     if (exampleSentence && !exampleScriptMatchesLanguage(exampleSentence, v.language)) {
@@ -1875,6 +1886,7 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /backfill \u2014 Annotate one batch of unprocessed messages");
     lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
     lines.push("\u2022 /backfill\\_senses \u2014 Re-fix flashcard translations to match their example sentence");
+    lines.push("\u2022 /backfill\\_examples \u2014 Fill short example/example\\_translation for older vocabulary rows");
     lines.push("\u2022 /backfill\\_grammar \u2014 Fill in card fields for older grammar corrections");
     lines.push("\u2022 /annotate\\_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)");
     lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
@@ -2507,6 +2519,120 @@ async function handleBackfillSenses(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   await sendMessage(msg.chat.id, "⏳ Re-deriving flashcard translations against each card's example sentence — I'll report when this run finishes.");
   scheduleBackgroundWork("resenseGrind", resenseGrind(msg.chat.id));
+}
+
+// --- /backfill_examples: retroactively fill the short example/example_translation pair
+// for vocabulary rows annotated before those columns existed -- see #53: without them,
+// /export fell back to the WHOLE first-seen message as a card's example (often a
+// paragraph), with no guarantee the translated side actually used the answer word.
+// Incremental like /backfill_translations (a row already carrying an example is never
+// revisited), but each row needs its first-seen message for context, so it runs as a
+// time-boxed background grind like /backfill_senses rather than one batch call.
+
+async function backfillExampleForCard(it: {
+  lemma: string; part_of_speech: string | null; lemmaTranslation: string | null; language: LangCode; otherLanguage: LangCode;
+  sourceText: string; targetText: string;
+}): Promise<{ example: string; example_translation: string | null } | null> {
+  const langName = langMeta(it.language).englishName;
+  const otherName = langMeta(it.otherLanguage).englishName;
+  const answer = it.lemmaTranslation ?? it.lemma;
+  const system =
+    `A ${langName} message was translated into ${otherName}:\n` +
+    `${langName}: "${it.sourceText}"\n` +
+    `${otherName}: "${it.targetText}"\n\n` +
+    `The ${langName} word "${it.lemma}" (${it.part_of_speech ?? "word"}, dictionary translation "${answer}") appears somewhere in the ${langName} text above.\n` +
+    `Return ONLY raw JSON: {"example": "<sentence>", "example_translation": "<sentence or null>"}.\n` +
+    `- "example": the ONE sentence from the ${langName} text — copied verbatim, character-for-character, never paraphrased — in which the word appears. Two consecutive sentences only if its sense is unrecoverable from one alone. Never the whole text.\n` +
+    `- "example_translation": the sentence from the ${otherName} text that corresponds to "example" — copied verbatim, never invented or back-translated. Return null if no sentence there actually contains a recognizable form of "${answer}".\n` +
+    `No markdown fences, no preamble.`;
+  try {
+    const result = await withRetry(() => anthropic.messages.create({
+      model: CLAUDE_MODEL, max_tokens: 400, thinking: { type: "disabled" },
+      system, messages: [{ role: "user", content: it.lemma }],
+    }));
+    const block = result.content.find((b) => b.type === "text");
+    if (block?.type !== "text") return null;
+    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    const parsed = JSON.parse(cleaned);
+    const example = typeof parsed?.example === "string" ? parsed.example.trim() : "";
+    if (!example) return null;
+    const exampleTranslation = typeof parsed?.example_translation === "string" ? parsed.example_translation.trim() : "";
+    return { example, example_translation: exampleTranslation || null };
+  } catch (e) {
+    console.error("backfillExampleForCard failed:", e);
+    return null;
+  }
+}
+
+async function exampleBackfillGrind(chatId: number) {
+  const startedAt = Date.now();
+  const { data: rows, error } = await supabase
+    .from("vocabulary")
+    .select("id, lemma, part_of_speech, language, lemma_translation, first_seen_message_id")
+    .is("example", null)
+    .not("first_seen_message_id", "is", null)
+    .order("created_at", { ascending: true });
+  if (error) {
+    console.error("backfill_examples fetch failed:", error);
+    await sendMessage(chatId, "Couldn't fetch vocabulary rows. Check logs.");
+    return;
+  }
+  const pending = (rows ?? []) as any[];
+  if (pending.length === 0) { await sendMessage(chatId, "✅ No more rows to backfill."); return; }
+
+  const msgIds = [...new Set(pending.map((v) => v.first_seen_message_id))];
+  const msgById = new Map<string, any>();
+  for (let i = 0; i < msgIds.length; i += 100) {
+    const { data: ms } = await supabase.from("messages")
+      .select("id, original_text, translated_text, original_language, translated_language")
+      .in("id", msgIds.slice(i, i + 100));
+    for (const m of (ms ?? []) as any[]) msgById.set(m.id, m);
+  }
+
+  type Item = { id: string; lemma: string; part_of_speech: string | null; lemmaTranslation: string | null; language: LangCode; otherLanguage: LangCode; sourceText: string; targetText: string };
+  const items: Item[] = [];
+  let skippedNoMessage = 0;
+  for (const v of pending) {
+    const m = msgById.get(v.first_seen_message_id);
+    if (!m || !m.translated_language || !m.translated_text) { skippedNoMessage++; continue; }
+    const isOrig = m.original_language === v.language;
+    const sourceText = isOrig ? m.original_text : m.translated_text;
+    const targetText = isOrig ? m.translated_text : m.original_text;
+    const otherLanguage = isOrig ? m.translated_language : m.original_language;
+    if (!sourceText || !targetText || !otherLanguage) { skippedNoMessage++; continue; }
+    items.push({ id: v.id, lemma: v.lemma, part_of_speech: v.part_of_speech, lemmaTranslation: v.lemma_translation, language: v.language, otherLanguage, sourceText, targetText });
+  }
+
+  let processed = 0, filled = 0, failed = 0;
+  for (let i = 0; i < items.length; i += BACKFILL_CONCURRENCY) {
+    if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
+    const chunk = items.slice(i, i + BACKFILL_CONCURRENCY);
+    await Promise.allSettled(chunk.map(async (it) => {
+      const res = await backfillExampleForCard(it);
+      processed++;
+      if (!res) { failed++; return; }
+      const { error: uErr } = await supabase.from("vocabulary")
+        .update({ example: res.example, example_translation: res.example_translation })
+        .eq("id", it.id);
+      if (uErr) { failed++; console.error("backfill_examples update failed:", uErr); } else { filled++; }
+    }));
+  }
+  const remaining = items.length - processed;
+  await sendMessage(chatId,
+    `✅ Example backfill run done.\n` +
+    `Rows checked: ${processed}/${items.length}\n` +
+    `Filled: ${filled}\n` +
+    (failed > 0 ? `Failed: ${failed}\n` : "") +
+    (skippedNoMessage > 0 ? `Skipped (no usable linked message): ${skippedNoMessage}\n` : "") +
+    (remaining > 0
+      ? `\nRan out of time with ${remaining} left — send /backfill_examples again to finish.`
+      : `\n🎉 Whole deck checked. Run /export and re-import into Anki (update existing notes when the first field matches) to refresh the cards — your study progress is kept.`));
+}
+
+async function handleBackfillExamples(msg: any, user: any) {
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  await sendMessage(msg.chat.id, "⏳ Filling in short example sentences for older vocabulary rows — I'll report when this run finishes.");
+  scheduleBackgroundWork("exampleBackfillGrind", exampleBackfillGrind(msg.chat.id));
 }
 
 // --- /backfill_grammar: fill in the card fields older corrections never captured -----
