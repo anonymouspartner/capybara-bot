@@ -83,6 +83,12 @@ Optional (enable the admin `/update` self-deploy command; the feature is inert i
 `/update` only reports version status, no deploy button), `GITHUB_REPO` (`owner/name`),
 `GITHUB_DEPLOY_BRANCH` (defaults to `main`).
 
+Optional (enable the `/bug` report command; inert if unset): `GITHUB_ISSUE_TOKEN` (GitHub PAT
+with `Issues: write` — files issues on `GITHUB_REPO`). Falls back to `GITHUB_DEPLOY_TOKEN`, which
+then needs both `Issues: write` and `Actions: write`; keeping them separate means the issue-filing
+token can't dispatch a production deploy. `/bug` sends only the text the reporter types — never
+conversation content — but that text does leave the instance for GitHub.
+
 ## Environment notes (this laptop)
 
 These notes describe the maintainer's local setup — relevant for the **fallback** local-script deploy path

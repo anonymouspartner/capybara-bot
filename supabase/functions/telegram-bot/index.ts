@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v82";
+const BUILD_VERSION = "v83";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -57,6 +57,15 @@ const GITHUB_DEPLOY_TOKEN = Deno.env.get("GITHUB_DEPLOY_TOKEN") ?? "";
 const GITHUB_REPO = Deno.env.get("GITHUB_REPO") ?? ""; // "owner/name"
 const GITHUB_DEPLOY_BRANCH = Deno.env.get("GITHUB_DEPLOY_BRANCH") ?? "main";
 const GITHUB_DEPLOY_WORKFLOW = "deploy.yml";
+// /bug files a GitHub issue, which needs "Issues: write" -- a different permission from
+// the deploy token's "Actions: write". Kept as its own optional secret so an instance can
+// grant issue-filing without widening the token that can dispatch a production deploy;
+// falls back to GITHUB_DEPLOY_TOKEN for an instance that would rather use one PAT with
+// both permissions. /bug is inert unless one of them (plus GITHUB_REPO) is set.
+const GITHUB_ISSUE_TOKEN = Deno.env.get("GITHUB_ISSUE_TOKEN") ?? GITHUB_DEPLOY_TOKEN;
+// Telegram messages run long and GitHub caps an issue body at 65536 chars; keep well
+// under both so a pasted log can never fail the create call.
+const BUG_REPORT_MAX_CHARS = 8000;
 // This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
 // (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
 // deploys to THIS couple's project — not whatever single project the repo's default
@@ -266,6 +275,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
     { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
+    { match: t => isCmd(t, "bug"),                                                       handle: handleBug },
     { match: t => isCmd(t, "backfill_grammar"),                                          handle: handleBackfillGrammar },
     { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
@@ -1234,6 +1244,7 @@ const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "pin", description: "Pin a message to memory" },
   { command: "unpin", description: "Unpin a message" },
   { command: "pinned", description: "List pinned messages" },
+  { command: "bug", description: "Report a bug to the developers" },
 ];
 // Only the two commands an admin uses on a live instance appear in the menu. The
 // one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
@@ -1848,6 +1859,8 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /pin \u2014 \u041f\u043e\u0437\u043d\u0430\u0447\u0438\u0442\u0438 \u044f\u043a \u0432\u0430\u0436\u043b\u0438\u0432\u0435",
       "\u2022 /unpin \u2014 \u0417\u043d\u044f\u0442\u0438 \u043f\u043e\u0437\u043d\u0430\u0447\u043a\u0443",
       "\u2022 /pinned \u2014 \u0421\u043f\u0438\u0441\u043e\u043a \u0437\u0430\u043a\u0440\u0456\u043f\u043b\u0435\u043d\u0438\u0445",
+      "",
+      "\u2022 /bug <\u043e\u043f\u0438\u0441> \u2014 \u041f\u043e\u0432\u0456\u0434\u043e\u043c\u0438\u0442\u0438 \u043f\u0440\u043e \u043f\u043e\u043c\u0438\u043b\u043a\u0443 \u0432 \u0431\u043e\u0442\u0456",
     );
   } else {
     lines.push(
@@ -1878,6 +1891,8 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /pin \u2014 Reply to a message to mark it meaningful (small /ask boost)",
       "\u2022 /unpin \u2014 Reply to a pinned message to remove the pin",
       "\u2022 /pinned \u2014 List all pinned messages chronologically",
+      "",
+      "\u2022 /bug <what went wrong> \u2014 Report a bug (files a GitHub issue)",
     );
   }
   if (isAdmin) {
@@ -2815,6 +2830,100 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
   summary.push("Rates are standard (post-introductory). Switch by setting ANNOTATION_MODEL in index.ts, then redeploy.");
 
   await sendChunked(chatId, [...blocks, summary.join("\n")]);
+}
+
+// --- /bug: file a GitHub issue from inside Telegram ---------------------------------
+// Bugs get noticed while using the bot, not while sitting at a terminal, and the detail
+// that makes one reproducible (what was just sent, which direction, what came back) is
+// freshest right then. This posts exactly what the reporter typed -- no conversation
+// history, no message IDs, nothing scraped from the corpus -- because an issue leaves
+// the couple's private instance for GitHub, where it is subject to that repo's
+// visibility rather than this policy. Available to both partners: either can hit a bug.
+
+// Create one issue via the REST API. Returns the issue's html_url, or an error string.
+async function createGitHubIssue(title: string, body: string): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  // The webhook swallows a handler throw and still answers Telegram 200 (so a failed
+  // update is never retried into a duplicate issue) -- which also means an uncaught
+  // network error here would leave the reporter with no reply at all. Catch it and
+  // turn it into something the reporter can act on.
+  let resp: Response;
+  try {
+    resp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/issues`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${GITHUB_ISSUE_TOKEN}`,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "capybara-bot", // GitHub's REST API rejects requests without a User-Agent
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ title, body }),
+    });
+  } catch (e) {
+    console.error("createGitHubIssue fetch failed:", e);
+    return { ok: false, error: "Couldn't reach GitHub (network error). Try again in a minute." };
+  }
+  if (resp.status === 201) {
+    const json = await resp.json().catch(() => null);
+    const url = json?.html_url;
+    if (typeof url === "string") return { ok: true, url };
+    return { ok: false, error: "created, but GitHub returned no issue URL" };
+  }
+  const detail = await resp.text().catch(() => "<no body>");
+  console.error(`createGitHubIssue non-201: status=${resp.status} body=${detail.slice(0, 300)}`);
+  // 403/404 on a repo that exists is almost always a token missing "Issues: write" --
+  // GitHub 404s rather than 403s an unauthorized repo read, so say so for both.
+  if (resp.status === 401 || resp.status === 403 || resp.status === 404) {
+    return { ok: false, error: "GitHub rejected the request. The token likely lacks \"Issues: write\" on this repo (or GITHUB_REPO is wrong)." };
+  }
+  if (resp.status === 410) return { ok: false, error: "Issues are disabled on this repository." };
+  return { ok: false, error: `GitHub returned HTTP ${resp.status}.` };
+}
+
+// First line (or first 72 chars) becomes the title so the issue list stays scannable;
+// the whole report is repeated in the body, so nothing is lost to the split.
+function bugTitleFrom(report: string): string {
+  const firstLine = report.split("\n")[0].trim();
+  const base = firstLine || report.trim();
+  return base.length <= 72 ? base : `${base.slice(0, 69).trimEnd()}...`;
+}
+
+async function handleBug(msg: any, user: any) {
+  const text = (msg.text ?? "").trim();
+  const firstSpace = text.indexOf(" ");
+  let report = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
+  if (!report) {
+    await sendMessage(msg.chat.id,
+      "Usage: `/bug <what went wrong>`\n\n" +
+      "Files a GitHub issue on the bot's repo. Say what you did, what you expected, and what happened instead.\n\n" +
+      "⚠️ Only the text you type is sent — no conversation history — but it does leave this chat for GitHub, so don't paste anything private.",
+      "Markdown");
+    return;
+  }
+  if (!GITHUB_REPO || !GITHUB_ISSUE_TOKEN) {
+    await sendMessage(msg.chat.id,
+      "Bug reporting isn't configured on this instance.\n\n" +
+      "The admin needs to set the GITHUB\\_REPO and GITHUB\\_ISSUE\\_TOKEN function secrets (the token needs \"Issues: write\").",
+      "Markdown");
+    return;
+  }
+  let truncated = false;
+  if (report.length > BUG_REPORT_MAX_CHARS) {
+    report = report.slice(0, BUG_REPORT_MAX_CHARS);
+    truncated = true;
+  }
+  // Reporter + running version are the two things that are always useful on a bug and
+  // always missing from a report written by hand.
+  const body =
+    `${report}${truncated ? "\n\n_(report truncated at " + BUG_REPORT_MAX_CHARS + " characters)_" : ""}\n\n` +
+    `---\n` +
+    `Reported via \`/bug\` in Telegram by **${user.display_name}** — running \`${BUILD_VERSION}\`.`;
+  const result = await createGitHubIssue(bugTitleFrom(report), body);
+  if (!result.ok) {
+    await sendMessage(msg.chat.id, `Couldn't file that. ${result.error}`);
+    return;
+  }
+  await sendMessage(msg.chat.id, `🐛 Filed: ${result.url}`);
 }
 
 // --- /update: check GitHub for a newer build, and (admin) deploy it with one tap ---
