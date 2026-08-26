@@ -444,6 +444,12 @@ A few things keep a fresh instance reproducible from the committed files alone:
 Send **`/help`** in the bot for the full, language-aware list — the everyday commands
 also appear in Telegram's **`/` menu** (admin commands show only to the admin). Highlights:
 
+Commands are browsable from a **branched menu keyboard** under the compose box —
+`📚 Vocabulary`, `🧠 Memory`, `🎓 Grammar`, `⚙️ Admin` (admin only) — each opening a submenu
+with a back button. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
+open a reply prompt. Telegram's `/` list is deliberately trimmed to `/start` and `/help`,
+since `setMyCommands` is flat and can't express the tree; **every command still works typed.**
+
 | Command | Does |
 |---|---|
 | *(any text/voice)* | Translate between your two languages and forward to the other person (solo: just translate) |

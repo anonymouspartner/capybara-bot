@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v83";
+const BUILD_VERSION = "v84";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -266,9 +266,13 @@ async function handleUpdate(update: any) {
         const tail = solo
           ? `Everything is saved as your personal study corpus, searchable with /recap.\n\nType /help to see what I can do.`
           : `Everything is saved as a study corpus.\n\nType /help to see what I can do.`;
+        // Attach the menu here: a reply keyboard only appears once a message carries it,
+        // and /start is the one command every user runs first.
         await sendMessage(m.chat.id,
           `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
-          media + tail); } },
+          media + tail,
+          undefined,
+          buildMenuKeyboard("main", m.from?.id === BACKFILL_ADMIN_TELEGRAM_ID)); } },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
@@ -296,9 +300,36 @@ async function handleUpdate(update: any) {
     { match: t => t === "/recap_backfill" || t.startsWith("/recap_backfill@"),          handle: handleRecapBackfill },
     { match: t => isCmd(t, "recap", "ask"),                                             handle: handleRecap },
   ];
+  // Reply-keyboard taps and force_reply answers both arrive as ordinary text, so they
+  // are resolved into a command string HERE -- ahead of the dispatch table, and well
+  // ahead of handleTextMessage, which would otherwise translate a button label and
+  // forward it to the partner. `effective` is what the dispatch table then matches on.
+  let effective = msg;
   if (msg.text) {
+    const answered = commandFromForceReplyAnswer(msg);
+    if (answered) {
+      // The reply target was our own prompt, not a conversation message -- drop it so a
+      // reply-driven handler can never mistake the prompt for the message to act on.
+      const { reply_to_message: _prompt, ...rest } = msg;
+      effective = { ...rest, text: answered };
+    } else {
+      const tapped = await resolveMenuTap(msg, msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID);
+      if (tapped === "handled") return;
+      if (tapped) effective = { ...msg, text: tapped };
+    }
+  }
+  if (effective.text) {
     for (const cmd of COMMANDS) {
-      if (cmd.match(msg.text)) { await cmd.handle(msg, user); return; }
+      if (cmd.match(effective.text)) { await cmd.handle(effective, user); return; }
+    }
+    // A rewritten text is a button tap or a prompt answer, never something the user
+    // typed to their partner. If no command claimed it, the menu points at a command
+    // that no longer exists -- say so, rather than letting the fallthrough below
+    // translate the button's label and forward it as a message.
+    if (effective !== msg) {
+      console.error(`menu: no command matched rewritten text ${JSON.stringify(effective.text)}`);
+      await sendMessage(msg.chat.id, "That menu button is pointing at a command I don't have. Try typing the command instead.");
+      return;
     }
   }
   // Album items (media groups) arrive as separate webhooks — buffer + regroup them first.
@@ -1234,27 +1265,15 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
 const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "start", description: "What the bot does" },
   { command: "help", description: "Show all commands" },
-  { command: "vocab", description: "Top unlearned words in each deck" },
-  { command: "learn", description: "Add a word to study (or: top N)" },
-  { command: "forget", description: "Remove a word from a deck" },
-  { command: "export", description: "Download both decks as CSV for Anki" },
-  { command: "capybara", description: "Toggle grammar help for your learning language" },
-  { command: "ask", description: "Ask your shared conversation memory" },
-  { command: "note", description: "Save a private note to memory" },
-  { command: "pin", description: "Pin a message to memory" },
-  { command: "unpin", description: "Unpin a message" },
-  { command: "pinned", description: "List pinned messages" },
-  { command: "bug", description: "Report a bug to the developers" },
 ];
-// Only the two commands an admin uses on a live instance appear in the menu. The
-// one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
-// /backfill_examples, /recap_backfill) and the reply-based /reconcile & /restore are intentionally omitted
-// to keep the menu clean -- they remain fully functional when typed, and /help still
-// lists them.
+// The "/" list is deliberately just these two. Browsing lives on the branched reply
+// keyboard (see MENUS below), which the flat setMyCommands API cannot express; leaving
+// the full command list here as well would mean maintaining -- and showing -- the same
+// menu twice. Every command still works when typed, and /help still lists them all.
+// ADMIN_COMMANDS is registered against the admin's own chat scope; it carries nothing
+// extra today, since /diag and /update are reachable from the keyboard's admin branch.
 const ADMIN_COMMANDS: { command: string; description: string }[] = [
   ...PUBLIC_COMMANDS,
-  { command: "diag", description: "Admin: ping upstream APIs + DB" },
-  { command: "update", description: "Admin: check/deploy a new build" },
 ];
 
 async function setMyCommands(commands: { command: string; description: string }[], scope?: unknown): Promise<boolean> {
@@ -1295,6 +1314,168 @@ async function ensureCommandsRegistered(): Promise<void> {
   }
   const okMenuButton = await setChatMenuButtonToCommands();
   if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
+}
+
+// --- Branched reply-keyboard menu --------------------------------------------------
+// The "/" list (setMyCommands) is flat by design -- Telegram has no nesting in it -- so
+// the browsable menu is a ReplyKeyboardMarkup instead: persistent buttons under the
+// compose box, where a category button swaps the keyboard for its submenu. setMyCommands
+// is deliberately trimmed to /start + /help (see PUBLIC_COMMANDS): every command still
+// works when typed, the "/" list just stops duplicating the keyboard.
+//
+// The load-bearing detail: a reply-keyboard tap arrives as an ORDINARY TEXT MESSAGE
+// carrying the button's label -- there is no callback_data. In a translation bot that
+// means an unrecognised label would be translated and forwarded to the partner, so
+// handleUpdate resolves taps BEFORE handleTextMessage ever sees them. Labels carry an
+// emoji and a "uk · en" pair precisely so they cannot collide with real conversation.
+type MenuItem = {
+  label: string;
+  command?: string;   // dispatch this command text, exactly as if typed
+  menu?: string;      // open this submenu instead
+  prompt?: string;    // ask for an argument first; the answer completes `command`
+  adminOnly?: boolean;
+};
+
+// Force-reply prompts, keyed by the command they complete. The prompt text is the
+// lookup key on the way back (see commandFromForceReplyAnswer), so each must be unique
+// and must not be edited without the same edit here -- an in-flight prompt whose text
+// no longer matches simply falls through to being treated as a normal message.
+const ARG_PROMPTS: Record<string, string> = {
+  "/learn":  "✍️ Яке слово додати? · Which word to add?",
+  "/forget": "✍️ Яке слово прибрати? · Which word to remove?",
+  "/ask":    "✍️ Що запитати про ваші розмови? · What do you want to ask?",
+  "/note":   "✍️ Що записати? · What should I note?",
+  "/bug":    "✍️ Що пішло не так? · What went wrong?",
+};
+const PROMPT_TO_COMMAND: Map<string, string> = new Map(
+  Object.entries(ARG_PROMPTS).map(([cmd, prompt]) => [prompt, cmd]),
+);
+
+// Back buttons name their destination rather than all reading "Back": a reply keyboard
+// carries no state, so two identically-labelled buttons in different submenus would be
+// indistinguishable when the tap comes back as plain text.
+const BACK_TO_MAIN = "⬅️ Головне меню · Main menu";
+const BACK_TO_ADMIN = "⬅️ Адмін-меню · Admin menu";
+
+const MENUS: Record<string, MenuItem[][]> = {
+  main: [
+    [{ label: "📚 Словник · Vocabulary", menu: "vocab" },
+     { label: "🧠 Пам'ять · Memory", menu: "memory" }],
+    [{ label: "🎓 Граматика · Grammar", menu: "grammar" },
+     { label: "🐛 Повідомити ваду · Report a bug", command: "/bug", prompt: ARG_PROMPTS["/bug"] }],
+    [{ label: "❓ Довідка · Help", command: "/help" },
+     { label: "⚙️ Адмін · Admin", menu: "admin", adminOnly: true }],
+  ],
+  vocab: [
+    [{ label: "🔤 Топ слів · Top words", command: "/vocab" },
+     { label: "➕ Вивчити · Learn", command: "/learn", prompt: ARG_PROMPTS["/learn"] }],
+    [{ label: "➖ Забути · Forget", command: "/forget", prompt: ARG_PROMPTS["/forget"] },
+     { label: "📤 Експорт · Export", command: "/export" }],
+    [{ label: BACK_TO_MAIN, menu: "main" }],
+  ],
+  memory: [
+    [{ label: "❓ Запитати · Ask", command: "/ask", prompt: ARG_PROMPTS["/ask"] },
+     { label: "📝 Нотатка · Note", command: "/note", prompt: ARG_PROMPTS["/note"] }],
+    [{ label: "📌 Закріпити · Pin", command: "/pin" },
+     { label: "📋 Закріплені · Pinned", command: "/pinned" }],
+    [{ label: "🚫 Сховати · Hide", command: "/reconcile" },
+     { label: "♻️ Повернути · Restore", command: "/restore" }],
+    [{ label: BACK_TO_MAIN, menu: "main" }],
+  ],
+  grammar: [
+    [{ label: "🐹 Увімк/Вимк · Toggle", command: "/capybara" }],
+    [{ label: BACK_TO_MAIN, menu: "main" }],
+  ],
+  admin: [
+    [{ label: "🩺 Діагностика · Diag", command: "/diag", adminOnly: true },
+     { label: "⬆️ Оновлення · Update", command: "/update", adminOnly: true }],
+    [{ label: "🔄 Бекфіли · Backfills", menu: "backfills", adminOnly: true },
+     { label: "🧪 A/B анотацій · Annotate A/B", command: "/annotate_ab", adminOnly: true }],
+    [{ label: BACK_TO_MAIN, menu: "main" }],
+  ],
+  backfills: [
+    [{ label: "📝 Анотації · Annotate", command: "/backfill", adminOnly: true },
+     { label: "🌐 Переклади · Translations", command: "/backfill_translations", adminOnly: true }],
+    [{ label: "🎯 Сенси · Senses", command: "/backfill_senses", adminOnly: true },
+     { label: "✂️ Приклади · Examples", command: "/backfill_examples", adminOnly: true }],
+    [{ label: "📐 Граматика · Grammar", command: "/backfill_grammar", adminOnly: true },
+     { label: "🔍 Recap · Recap embed", command: "/recap_backfill", adminOnly: true }],
+    [{ label: BACK_TO_ADMIN, menu: "admin" }],
+  ],
+};
+
+// Flat label -> item index, built once. Labels are unique across the whole tree (the
+// two Back buttons name distinct destinations), so a tap resolves without knowing which
+// submenu the user is looking at -- which the keyboard itself never tells us.
+const MENU_ITEM_BY_LABEL: Map<string, MenuItem> = (() => {
+  const m = new Map<string, MenuItem>();
+  for (const rows of Object.values(MENUS)) {
+    for (const row of rows) {
+      for (const item of row) {
+        // One label may legitimately appear in several menus as long as it always does
+        // the same thing -- BACK_TO_MAIN is deliberately reused by every first-level
+        // submenu. Only a label bound to two DIFFERENT destinations is a real conflict,
+        // because the tap arrives as bare text with nothing to disambiguate it.
+        const prev = m.get(item.label);
+        if (prev && (prev.command !== item.command || prev.menu !== item.menu || prev.prompt !== item.prompt)) {
+          console.error(`menu: label ${JSON.stringify(item.label)} is bound to two different actions`);
+        }
+        m.set(item.label, item);
+      }
+    }
+  }
+  return m;
+})();
+
+// Render one menu as a reply keyboard, dropping admin-only buttons for everyone else so
+// the partner never sees (or can tap) the admin branch.
+function buildMenuKeyboard(menuName: string, isAdmin: boolean): any {
+  const rows = MENUS[menuName] ?? MENUS.main;
+  const keyboard = rows
+    .map((row) => row.filter((item) => !item.adminOnly || isAdmin).map((item) => ({ text: item.label })))
+    .filter((row) => row.length > 0);
+  return { keyboard, resize_keyboard: true, is_persistent: true };
+}
+
+const MENU_TITLES: Record<string, string> = {
+  main: "🏠 Головне меню · Main menu",
+  vocab: "📚 Словник · Vocabulary",
+  memory: "🧠 Пам'ять · Memory",
+  grammar: "🎓 Граматика · Grammar",
+  admin: "⚙️ Адмін-меню · Admin menu",
+  backfills: "🔄 Бекфіли · Backfills",
+};
+
+async function showMenu(chatId: number, menuName: string, isAdmin: boolean) {
+  await sendMessage(chatId, MENU_TITLES[menuName] ?? MENU_TITLES.main, undefined, buildMenuKeyboard(menuName, isAdmin));
+}
+
+// A reply to one of our force_reply prompts: rebuild the full command from the prompt
+// that was answered plus the answer text. Returns null for any other reply (notably a
+// /pin-style reply to a real conversation message, which must keep its reply_to_message).
+function commandFromForceReplyAnswer(msg: any): string | null {
+  const promptText = msg.reply_to_message?.text;
+  if (!promptText) return null;
+  const command = PROMPT_TO_COMMAND.get(promptText.trim());
+  if (!command) return null;
+  const answer = (msg.text ?? "").trim();
+  if (!answer) return null;
+  return `${command} ${answer}`;
+}
+
+// Resolve a reply-keyboard tap. Returns a command string to dispatch, "handled" when the
+// tap was fully served here (a submenu was opened or an argument prompt sent), or null
+// when the text is not a button at all and belongs on the normal message path.
+async function resolveMenuTap(msg: any, isAdmin: boolean): Promise<string | "handled" | null> {
+  const item = MENU_ITEM_BY_LABEL.get((msg.text ?? "").trim());
+  if (!item) return null;
+  if (item.adminOnly && !isAdmin) { await sendMessage(msg.chat.id, "Not authorized."); return "handled"; }
+  if (item.menu) { await showMenu(msg.chat.id, item.menu, isAdmin); return "handled"; }
+  if (item.prompt) {
+    await sendMessage(msg.chat.id, item.prompt, undefined, { force_reply: true, selective: true });
+    return "handled";
+  }
+  return item.command ?? null;
 }
 
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
@@ -1837,6 +2018,8 @@ async function handleHelp(msg: any, user: any) {
       "",
       "\u0414\u0432\u0456 \u043a\u043e\u043b\u043e\u0434\u0438: \ud83c\uddfa\ud83c\udde6 \u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0456 \ud83c\uddec\ud83c\udde7 \u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430.",
       "",
+      "\u041a\u043d\u043e\u043f\u043a\u0438 \u043c\u0435\u043d\u044e \u2014 \u0432\u043d\u0438\u0437\u0443 \u0435\u043a\u0440\u0430\u043d\u0430. \u0423\u0441\u0456 \u043a\u043e\u043c\u0430\u043d\u0434\u0438 \u0442\u0430\u043a\u043e\u0436 \u043f\u0440\u0430\u0446\u044e\u044e\u0442\u044c, \u044f\u043a\u0449\u043e \u0457\u0445 \u043d\u0430\u0431\u0440\u0430\u0442\u0438.",
+      "",
       solo
         ? "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u043c\u0456\u0436 \u0442\u0432\u043e\u0457\u043c\u0438 \u0434\u0432\u043e\u043c\u0430 \u043c\u043e\u0432\u0430\u043c\u0438"
         : "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0456 \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
@@ -1867,6 +2050,8 @@ async function handleHelp(msg: any, user: any) {
       "*Capybara commands*",
       "",
       "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
+      "",
+      "Menu buttons are at the bottom of the screen. Every command below also works typed.",
       "",
       solo
         ? "\u2022 Just type or send a voice message \u2014 I translate it between your two languages"
@@ -1908,7 +2093,9 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
     lines.push("\u2022 /update \u2014 Check GitHub for a newer build; deploy with one tap");
   }
-  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
+  // /help re-attaches the keyboard too, so it is the recovery path if the keyboard was
+  // ever dismissed (Telegram's "hide keyboard" is per-user and we never see it happen).
+  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown", buildMenuKeyboard("main", isAdmin));
 }
 
 async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
