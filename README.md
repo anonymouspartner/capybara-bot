@@ -445,8 +445,8 @@ Send **`/help`** in the bot for the full, language-aware list — the everyday c
 also appear in Telegram's **`/` menu** (admin commands show only to the admin). Highlights:
 
 Commands are browsable from a **branched menu keyboard** under the compose box —
-`📚 Vocabulary`, `🧠 Memory`, `🎓 Grammar`, `⚙️ Admin` (admin only) — each opening a submenu
-with a back button. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
+`🎓 Education`, `🧠 Memory`, and `⚙️ Admin` (admin only) — each opening a submenu with a
+back button. `/help` is deliberately not on it: it still works typed. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
 open a reply prompt. Telegram's `/` list is registered **empty** (`deleteMyCommands`, both
 scopes), since `setMyCommands` is flat and can't express the tree — and with nothing to list,
 clients have nothing to show behind the compose-box menu button, which Telegram otherwise

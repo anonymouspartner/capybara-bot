@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v88";
+const BUILD_VERSION = "v89";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1366,26 +1366,24 @@ const PROMPT_TO_COMMAND: Map<string, string> = new Map(
   Object.entries(ARG_PROMPTS).map(([cmd, prompt]) => [prompt, cmd]),
 );
 
-// Back buttons name their destination rather than all reading "Back": a reply keyboard
-// carries no state, so two identically-labelled buttons in different submenus would be
-// indistinguishable when the tap comes back as plain text.
+// The back button names its destination rather than reading "Back": a reply keyboard
+// carries no state, so a bare "Back" in two different submenus would be indistinguishable
+// when the tap arrives as plain text. There is one destination now that the tree is two
+// levels deep, but the label stays explicit so adding a third level cannot reintroduce that.
 const BACK_TO_MAIN = "⬅️ Головне меню · Main menu";
-const BACK_TO_ADMIN = "⬅️ Адмін-меню · Admin menu";
 
 const MENUS: Record<string, MenuItem[][]> = {
   main: [
-    [{ label: "📚 Словник · Vocabulary", menu: "vocab" },
+    [{ label: "🎓 Освіта · Education", menu: "education" },
      { label: "🧠 Пам'ять · Memory", menu: "memory" }],
-    [{ label: "🎓 Граматика · Grammar", menu: "grammar" },
-     { label: "🐛 Повідомити ваду · Report a bug", command: "/bug", prompt: ARG_PROMPTS["/bug"], adminOnly: true }],
-    [{ label: "❓ Довідка · Help", command: "/help" },
-     { label: "⚙️ Адмін · Admin", menu: "admin", adminOnly: true }],
+    [{ label: "⚙️ Адмін · Admin", menu: "admin", adminOnly: true }],
   ],
-  vocab: [
+  education: [
     [{ label: "🔤 Топ слів · Top words", command: "/vocab" },
      { label: "➕ Вивчити · Learn", command: "/learn", prompt: ARG_PROMPTS["/learn"] }],
     [{ label: "➖ Забути · Forget", command: "/forget", prompt: ARG_PROMPTS["/forget"] },
      { label: "📤 Експорт · Export", command: "/export" }],
+    [{ label: "🐹 Граматика · Grammar", command: "/capybara" }],
     [{ label: BACK_TO_MAIN, menu: "main" }],
   ],
   memory: [
@@ -1397,26 +1395,17 @@ const MENUS: Record<string, MenuItem[][]> = {
      { label: "♻️ Повернути · Restore", command: "/restore" }],
     [{ label: BACK_TO_MAIN, menu: "main" }],
   ],
-  grammar: [
-    [{ label: "🐹 Увімк/Вимк · Toggle", command: "/capybara" }],
-    [{ label: BACK_TO_MAIN, menu: "main" }],
-  ],
+  // Only the backfill that still has work keeps a button. The finished ones
+  // (/backfill, /backfill_translations, /backfill_senses, /backfill_glosses,
+  // /backfill_grammar, /recap_backfill) are archived from the menu but remain fully
+  // functional when typed -- the same treatment the one-time corpus tools already got.
   admin: [
     [{ label: "🩺 Діагностика · Diag", command: "/diag", adminOnly: true },
      { label: "⬆️ Оновлення · Update", command: "/update", adminOnly: true }],
-    [{ label: "🔄 Бекфіли · Backfills", menu: "backfills", adminOnly: true },
+    [{ label: "✂️ Приклади · Examples", command: "/backfill_examples", adminOnly: true },
      { label: "🧪 A/B анотацій · Annotate A/B", command: "/annotate_ab", adminOnly: true }],
+    [{ label: "🐛 Повідомити ваду · Report a bug", command: "/bug", prompt: ARG_PROMPTS["/bug"], adminOnly: true }],
     [{ label: BACK_TO_MAIN, menu: "main" }],
-  ],
-  backfills: [
-    [{ label: "📝 Анотації · Annotate", command: "/backfill", adminOnly: true },
-     { label: "🌐 Переклади · Translations", command: "/backfill_translations", adminOnly: true }],
-    [{ label: "🎯 Сенси · Senses", command: "/backfill_senses", adminOnly: true },
-     { label: "✂️ Приклади · Examples", command: "/backfill_examples", adminOnly: true }],
-    [{ label: "📐 Граматика · Grammar", command: "/backfill_grammar", adminOnly: true },
-     { label: "🔍 Recap · Recap embed", command: "/recap_backfill", adminOnly: true }],
-    [{ label: "🈯 Глоси · Glosses", command: "/backfill_glosses", adminOnly: true }],
-    [{ label: BACK_TO_ADMIN, menu: "admin" }],
   ],
 };
 
@@ -1455,11 +1444,9 @@ function buildMenuKeyboard(menuName: string, isAdmin: boolean): any {
 
 const MENU_TITLES: Record<string, string> = {
   main: "🏠 Головне меню · Main menu",
-  vocab: "📚 Словник · Vocabulary",
+  education: "🎓 Освіта · Education",
   memory: "🧠 Пам'ять · Memory",
-  grammar: "🎓 Граматика · Grammar",
   admin: "⚙️ Адмін-меню · Admin menu",
-  backfills: "🔄 Бекфіли · Backfills",
 };
 
 async function showMenu(chatId: number, menuName: string, isAdmin: boolean) {
