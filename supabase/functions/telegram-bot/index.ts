@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v86";
+const BUILD_VERSION = "v87";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -312,6 +312,13 @@ async function handleUpdate(update: any) {
       // reply-driven handler can never mistake the prompt for the message to act on.
       const { reply_to_message: _prompt, ...rest } = msg;
       effective = { ...rest, text: answered };
+      // Telegram dropped the menu keyboard when it showed the reply box; have this
+      // command's own reply carry it back, in the submenu the button was tapped from.
+      pendingKeyboardRestore = {
+        chatId: msg.chat.id,
+        isAdmin: msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID,
+        menu: menuContainingCommand(answered.split(" ")[0]),
+      };
     } else {
       const tapped = await resolveMenuTap(msg, msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID);
       if (tapped === "handled") return;
@@ -320,7 +327,12 @@ async function handleUpdate(update: any) {
   }
   if (effective.text) {
     for (const cmd of COMMANDS) {
-      if (cmd.match(effective.text)) { await cmd.handle(effective, user); return; }
+      if (cmd.match(effective.text)) {
+        // finally, not a trailing assignment: a handler that throws must not leave the
+        // restore armed for whatever this chat sends next.
+        try { await cmd.handle(effective, user); } finally { pendingKeyboardRestore = null; }
+        return;
+      }
     }
     // A rewritten text is a button tap or a prompt answer, never something the user
     // typed to their partner. If no command claimed it, the menu points at a command
@@ -1106,6 +1118,15 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
 }
 
 async function sendMessage(chatId: number, text: string, parseMode?: string, replyMarkup?: any) {
+  // A force_reply prompt occupies the same reply_markup slot as the menu keyboard, so
+  // Telegram swaps the keyboard out to show the reply box and never puts it back. The
+  // answered command's own reply has to carry it -- see pendingKeyboardRestore. Riding
+  // along on the first message the handler sends beats emitting a second "here's the
+  // menu" message after every /learn, /ask, /note.
+  if (!replyMarkup && pendingKeyboardRestore && pendingKeyboardRestore.chatId === chatId) {
+    replyMarkup = buildMenuKeyboard(pendingKeyboardRestore.menu, pendingKeyboardRestore.isAdmin);
+    pendingKeyboardRestore = null;
+  }
   const body: any = { chat_id: chatId, text };
   if (parseMode) body.parse_mode = parseMode;
   if (replyMarkup) body.reply_markup = replyMarkup;
@@ -1454,6 +1475,24 @@ function commandFromForceReplyAnswer(msg: any): string | null {
   const answer = (msg.text ?? "").trim();
   if (!answer) return null;
   return `${command} ${answer}`;
+}
+
+// Set for the duration of ONE dispatch, when the incoming message is the answer to a
+// force_reply prompt: the next sendMessage to that chat re-attaches the keyboard. Cleared
+// in a finally so it can never leak into a later turn, and matched on chat_id so a
+// concurrent request for a different chat cannot consume it.
+let pendingKeyboardRestore: { chatId: number; isAdmin: boolean; menu: string } | null = null;
+
+// Which submenu a command's button lives in, so answering a prompt puts the user back
+// where they were rather than bouncing them to the root (the keyboard carries no state,
+// so this static lookup is the only way to know).
+function menuContainingCommand(command: string): string {
+  for (const [name, rows] of Object.entries(MENUS)) {
+    for (const row of rows) {
+      for (const item of row) if (item.command === command) return name;
+    }
+  }
+  return "main";
 }
 
 // Resolve a reply-keyboard tap. Returns a command string to dispatch, "handled" when the
