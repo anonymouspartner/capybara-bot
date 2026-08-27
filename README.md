@@ -368,7 +368,7 @@ It relies on **two separate secret buckets** — mixing these up is the #1 sourc
 
 | Bucket | Where | Keys | Used by |
 |---|---|---|---|
-| **Supabase function secrets** | Supabase → Edge Functions → Secrets | `GITHUB_DEPLOY_TOKEN`, `GITHUB_REPO`, `GITHUB_DEPLOY_BRANCH` | the **bot** (to read the latest version + dispatch the deploy) |
+| **Supabase function secrets** | Supabase → Edge Functions → Secrets | `GITHUB_DEPLOY_TOKEN`, `GITHUB_REPO`, `GITHUB_DEPLOY_BRANCH`, `GITHUB_ISSUE_TOKEN` | the **bot** (to read the latest version, dispatch the deploy, and file `/bug` issues) |
 | **GitHub Actions repo secrets** | repo Settings → Secrets and variables → Actions | `SUPABASE_ACCESS_TOKEN`, `SUPABASE_PROJECT_REF` | the **workflow** (to authenticate to Supabase and deploy) |
 
 The three function secrets:
@@ -378,6 +378,18 @@ The three function secrets:
 - `GITHUB_REPO` — exactly `owner/name` (e.g. `anonymouspartner/capybara-bot`). No `https://`,
   no trailing slash, no spaces.
 - `GITHUB_DEPLOY_BRANCH` — the deploy branch whose `BUILD_VERSION` is "latest" (default `main`).
+
+**Bug reports from Telegram (`/bug`).** Either partner can run `/bug <what went wrong>` to open
+an issue on `GITHUB_REPO`. Filing an issue needs **Issues: write**, a *different* permission from
+the deploy token's **Actions: write**, so it reads a fourth, optional function secret:
+
+- `GITHUB_ISSUE_TOKEN` — a PAT with **Issues: write** on `GITHUB_REPO`. Falls back to
+  `GITHUB_DEPLOY_TOKEN` when unset, which then needs *both* permissions. Keeping them separate
+  is the safer default: the token that files issues then can't dispatch a production deploy.
+
+`/bug` sends only the text the reporter types — never conversation history — but that text does
+leave the instance for GitHub, where the issue takes on that repository's visibility. The command
+is inert (and says so) unless `GITHUB_REPO` and a usable token are both set.
 
 **Gotchas (learned the hard way):**
 - The bot fetches
@@ -432,6 +444,12 @@ A few things keep a fresh instance reproducible from the committed files alone:
 Send **`/help`** in the bot for the full, language-aware list — the everyday commands
 also appear in Telegram's **`/` menu** (admin commands show only to the admin). Highlights:
 
+Commands are browsable from a **branched menu keyboard** under the compose box —
+`📚 Vocabulary`, `🧠 Memory`, `🎓 Grammar`, `⚙️ Admin` (admin only) — each opening a submenu
+with a back button. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
+open a reply prompt. Telegram's `/` list is deliberately trimmed to `/start` and `/help`,
+since `setMyCommands` is flat and can't express the tree; **every command still works typed.**
+
 | Command | Does |
 |---|---|
 | *(any text/voice)* | Translate between your two languages and forward to the other person (solo: just translate) |
@@ -445,6 +463,7 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 | `/forget <word>` | Remove a word from the matching deck |
 | `/export` | Export vocabulary decks **and your grammar corrections** as a single Anki CSV |
 | `/capybara` · `/capybara on\|off` | Toggle a private grammar coach for your learning language (per person, off by default) |
+| `/bug <what went wrong>` | File a GitHub issue on the bot's repo (needs `GITHUB_ISSUE_TOKEN`; sends only what you type) |
 | `/help` · `/start` | Help / welcome |
 
 > `/recap` has a 24-hour cooling-off on **messages** (recent messages don't surface),
@@ -461,6 +480,8 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
   conversation), but `/recap` answers are generated per-asker.
 - **Your keys, your data.** You bring your own Anthropic and OpenAI keys; nothing is
   routed through a shared service.
+- **`/bug` is the one opt-in outbound path.** It sends only the text you type to GitHub,
+  never conversation content, and only when you run it. See `PRIVACY.md` §4.
 
 ## Admin & maintenance commands
 
@@ -473,6 +494,7 @@ an existing corpus** — new instances can ignore them.
 | `/backfill` | Annotate one batch of un-annotated messages |
 | `/backfill_translations` | Fill in missing cross-language lemma translations, one batch |
 | `/backfill_senses` | Re-derive flashcard translations so each matches its example sentence |
+| `/backfill_examples` | Fill in the short verbatim example sentence pair for older vocabulary rows |
 | `/backfill_grammar` | Fill in card fields (blank target, dictionary form, meaning) for older corrections |
 | `/recap_backfill` | Embed one batch of existing messages for `/recap` |
 | `/annotate_ab` | Compare annotation models on recent messages — reports quality, tokens, cost. Writes nothing |

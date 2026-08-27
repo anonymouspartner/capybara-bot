@@ -55,9 +55,17 @@ The bot makes API calls to three external services in the course of normal opera
 | **OpenAI** (Whisper + embeddings) | Voice transcription, semantic search embeddings | You are the API key holder and account holder. Data is sent under your OpenAI account's terms. |
 | **Telegram** | Message delivery and webhook | You are the bot owner registered with @BotFather. |
 
+One further service is contacted **only when you explicitly invoke it**, never during normal message handling:
+
+| Service | Purpose | Your relationship |
+|---|---|---|
+| **GitHub** | `/bug` files an issue on the repository named by your own `GITHUB_REPO` secret, using your own token | You are the token holder and the repository's owner or collaborator. |
+
+`/bug` sends **only the text you type in that command** — no messages, no translations, no vocabulary, no notes. It is the one path by which text you enter can leave your instance for a destination other than the three services above, and an issue is subject to the **visibility of that repository**: on a public repo it is world-readable. Don't paste anything private into a bug report. The command is inert unless `GITHUB_REPO` and an issue-capable token are both configured.
+
 No data is sent to any service using a key, account, or intermediary controlled by the authors of this repository.
 
-You should review the privacy policies and data processing agreements of Anthropic, OpenAI, and Telegram to understand how those services handle data sent to them directly under your account.
+You should review the privacy policies and data processing agreements of Anthropic, OpenAI, and Telegram — and of GitHub, if you enable `/bug` — to understand how those services handle data sent to them directly under your account.
 
 ---
 

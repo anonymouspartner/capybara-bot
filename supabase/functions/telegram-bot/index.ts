@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v81";
+const BUILD_VERSION = "v84";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -57,6 +57,15 @@ const GITHUB_DEPLOY_TOKEN = Deno.env.get("GITHUB_DEPLOY_TOKEN") ?? "";
 const GITHUB_REPO = Deno.env.get("GITHUB_REPO") ?? ""; // "owner/name"
 const GITHUB_DEPLOY_BRANCH = Deno.env.get("GITHUB_DEPLOY_BRANCH") ?? "main";
 const GITHUB_DEPLOY_WORKFLOW = "deploy.yml";
+// /bug files a GitHub issue, which needs "Issues: write" -- a different permission from
+// the deploy token's "Actions: write". Kept as its own optional secret so an instance can
+// grant issue-filing without widening the token that can dispatch a production deploy;
+// falls back to GITHUB_DEPLOY_TOKEN for an instance that would rather use one PAT with
+// both permissions. /bug is inert unless one of them (plus GITHUB_REPO) is set.
+const GITHUB_ISSUE_TOKEN = Deno.env.get("GITHUB_ISSUE_TOKEN") ?? GITHUB_DEPLOY_TOKEN;
+// Telegram messages run long and GitHub caps an issue body at 65536 chars; keep well
+// under both so a pasted log can never fail the create call.
+const BUG_REPORT_MAX_CHARS = 8000;
 // This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
 // (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
 // deploys to THIS couple's project — not whatever single project the repo's default
@@ -257,19 +266,25 @@ async function handleUpdate(update: any) {
         const tail = solo
           ? `Everything is saved as your personal study corpus, searchable with /recap.\n\nType /help to see what I can do.`
           : `Everything is saved as a study corpus.\n\nType /help to see what I can do.`;
+        // Attach the menu here: a reply keyboard only appears once a message carries it,
+        // and /start is the one command every user runs first.
         await sendMessage(m.chat.id,
           `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
-          media + tail); } },
+          media + tail,
+          undefined,
+          buildMenuKeyboard("main", m.from?.id === BACKFILL_ADMIN_TELEGRAM_ID)); } },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
     { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
+    { match: t => isCmd(t, "bug"),                                                       handle: handleBug },
     { match: t => isCmd(t, "backfill_grammar"),                                          handle: handleBackfillGrammar },
     { match: t => isCmd(t, "annotate_ab"),                                               handle: handleAnnotateAb },
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
+    { match: t => t === "/backfill_examples",                                             handle: handleBackfillExamples },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
     { match: t => t === "/diag",                                                         handle: handleDiag },
     { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
@@ -285,9 +300,36 @@ async function handleUpdate(update: any) {
     { match: t => t === "/recap_backfill" || t.startsWith("/recap_backfill@"),          handle: handleRecapBackfill },
     { match: t => isCmd(t, "recap", "ask"),                                             handle: handleRecap },
   ];
+  // Reply-keyboard taps and force_reply answers both arrive as ordinary text, so they
+  // are resolved into a command string HERE -- ahead of the dispatch table, and well
+  // ahead of handleTextMessage, which would otherwise translate a button label and
+  // forward it to the partner. `effective` is what the dispatch table then matches on.
+  let effective = msg;
   if (msg.text) {
+    const answered = commandFromForceReplyAnswer(msg);
+    if (answered) {
+      // The reply target was our own prompt, not a conversation message -- drop it so a
+      // reply-driven handler can never mistake the prompt for the message to act on.
+      const { reply_to_message: _prompt, ...rest } = msg;
+      effective = { ...rest, text: answered };
+    } else {
+      const tapped = await resolveMenuTap(msg, msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID);
+      if (tapped === "handled") return;
+      if (tapped) effective = { ...msg, text: tapped };
+    }
+  }
+  if (effective.text) {
     for (const cmd of COMMANDS) {
-      if (cmd.match(msg.text)) { await cmd.handle(msg, user); return; }
+      if (cmd.match(effective.text)) { await cmd.handle(effective, user); return; }
+    }
+    // A rewritten text is a button tap or a prompt answer, never something the user
+    // typed to their partner. If no command claimed it, the menu points at a command
+    // that no longer exists -- say so, rather than letting the fallthrough below
+    // translate the button's label and forward it as a message.
+    if (effective !== msg) {
+      console.error(`menu: no command matched rewritten text ${JSON.stringify(effective.text)}`);
+      await sendMessage(msg.chat.id, "That menu button is pointing at a command I don't have. Try typing the command instead.");
+      return;
     }
   }
   // Album items (media groups) arrive as separate webhooks — buffer + regroup them first.
@@ -957,14 +999,16 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
   const grammarExamples = langMeta(language).grammarExamples ?? `"tense", "case", "aspect", "mood"`;
   return (
     `Analyze the ${langName} text and return a JSON object with these keys:\n` +
-    `- "vocabulary": array of {lemma, part_of_speech, gloss, lemma_translation} for content words only.\n` +
+    `- "vocabulary": array of {lemma, part_of_speech, gloss, lemma_translation, example, example_translation} for content words only.\n` +
     `  * lemma MUST be the dictionary form (nominative singular for nouns, infinitive for verbs, base form for adjectives).\n` +
     `  * part_of_speech MUST be one of: "noun", "verb", "adjective", "adverb", "phrase".\n` +
     `  * gloss is 1-4 words in ${otherLangName} (the learner's language), disambiguating the word's specific sense as used in this text, not just the most generic/literal meaning.\n` +
-    `  * lemma_translation is the dictionary form of the word in ${otherLangName} (the OPPOSITE language), translated IN THE SAME SENSE the word is used in this text — it MUST agree with gloss (e.g. English "hard" used to mean difficult → "важкий", NOT "твердий"). For ${langName} lemmas, return the ${otherLangName} translation; this becomes the "answer" on a flashcard whose example sentence is this text, so a wrong-sense translation makes a wrong card.\n` +
+    `  * lemma_translation is the dictionary form of the word in ${otherLangName} (the OPPOSITE language), translated IN THE SAME SENSE the word is used in this text \u2014 it MUST agree with gloss (e.g. English "hard" used to mean difficult \u2192 "важкий", NOT "твердий"). For ${langName} lemmas, return the ${otherLangName} translation; this becomes the "answer" on a flashcard whose example is "example", so a wrong-sense translation makes a wrong card.\n` +
     `    - Give the dictionary form (infinitive for verbs, nominative singular for nouns).\n` +
     `    - One word only when possible; a short phrase if the language has no single-word equivalent.\n` +
     `    - The gloss and lemma_translation may be identical; that's fine \u2014 return both.\n` +
+    `  * example is the ONE sentence from the input text \u2014 copied verbatim, character-for-character, never paraphrased or shortened \u2014 in which the word appears in the form actually used. Use two consecutive sentences only if the word's sense is unrecoverable from one alone. This becomes the front of a flashcard, so it must never be the whole input.\n` +
+    `  * example_translation is the sentence from the accepted translation (given below under SENSE ANCHOR, if present) that corresponds to "example" \u2014 copied verbatim from that translation, never invented or back-translated. If the translation renders that stretch idiomatically and no sentence there actually contains a recognizable form of lemma_translation, return null rather than a sentence that doesn't support the answer. Return null whenever no SENSE ANCHOR translation is given below.\n` +
     `  * SKIP: prepositions, conjunctions, particles, interjections, pronouns, numerals, proper nouns (names of people/places).\n` +
     `  * For homographs (same lemma, different part of speech), return separate entries.\n` +
     `- "grammar": array of grammatical features used (e.g., ${grammarExamples})\n` +
@@ -1034,6 +1078,8 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
       part_of_speech: v.part_of_speech,
       gloss: v.gloss ?? null,
       lemma_translation: v.lemma_translation ?? null,
+      example: typeof v.example === "string" && v.example ? v.example : null,
+      example_translation: typeof v.example_translation === "string" && v.example_translation ? v.example_translation : null,
       first_seen_message_id: messageId,
       language: language,
     }));
@@ -1219,26 +1265,15 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
 const PUBLIC_COMMANDS: { command: string; description: string }[] = [
   { command: "start", description: "What the bot does" },
   { command: "help", description: "Show all commands" },
-  { command: "vocab", description: "Top unlearned words in each deck" },
-  { command: "learn", description: "Add a word to study (or: top N)" },
-  { command: "forget", description: "Remove a word from a deck" },
-  { command: "export", description: "Download both decks as CSV for Anki" },
-  { command: "capybara", description: "Toggle grammar help for your learning language" },
-  { command: "ask", description: "Ask your shared conversation memory" },
-  { command: "note", description: "Save a private note to memory" },
-  { command: "pin", description: "Pin a message to memory" },
-  { command: "unpin", description: "Unpin a message" },
-  { command: "pinned", description: "List pinned messages" },
 ];
-// Only the two commands an admin uses on a live instance appear in the menu. The
-// one-time corpus-migration tools (/backfill, /backfill_translations, /backfill_senses,
-// /recap_backfill) and the reply-based /reconcile & /restore are intentionally omitted
-// to keep the menu clean -- they remain fully functional when typed, and /help still
-// lists them.
+// The "/" list is deliberately just these two. Browsing lives on the branched reply
+// keyboard (see MENUS below), which the flat setMyCommands API cannot express; leaving
+// the full command list here as well would mean maintaining -- and showing -- the same
+// menu twice. Every command still works when typed, and /help still lists them all.
+// ADMIN_COMMANDS is registered against the admin's own chat scope; it carries nothing
+// extra today, since /diag and /update are reachable from the keyboard's admin branch.
 const ADMIN_COMMANDS: { command: string; description: string }[] = [
   ...PUBLIC_COMMANDS,
-  { command: "diag", description: "Admin: ping upstream APIs + DB" },
-  { command: "update", description: "Admin: check/deploy a new build" },
 ];
 
 async function setMyCommands(commands: { command: string; description: string }[], scope?: unknown): Promise<boolean> {
@@ -1279,6 +1314,168 @@ async function ensureCommandsRegistered(): Promise<void> {
   }
   const okMenuButton = await setChatMenuButtonToCommands();
   if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
+}
+
+// --- Branched reply-keyboard menu --------------------------------------------------
+// The "/" list (setMyCommands) is flat by design -- Telegram has no nesting in it -- so
+// the browsable menu is a ReplyKeyboardMarkup instead: persistent buttons under the
+// compose box, where a category button swaps the keyboard for its submenu. setMyCommands
+// is deliberately trimmed to /start + /help (see PUBLIC_COMMANDS): every command still
+// works when typed, the "/" list just stops duplicating the keyboard.
+//
+// The load-bearing detail: a reply-keyboard tap arrives as an ORDINARY TEXT MESSAGE
+// carrying the button's label -- there is no callback_data. In a translation bot that
+// means an unrecognised label would be translated and forwarded to the partner, so
+// handleUpdate resolves taps BEFORE handleTextMessage ever sees them. Labels carry an
+// emoji and a "uk · en" pair precisely so they cannot collide with real conversation.
+type MenuItem = {
+  label: string;
+  command?: string;   // dispatch this command text, exactly as if typed
+  menu?: string;      // open this submenu instead
+  prompt?: string;    // ask for an argument first; the answer completes `command`
+  adminOnly?: boolean;
+};
+
+// Force-reply prompts, keyed by the command they complete. The prompt text is the
+// lookup key on the way back (see commandFromForceReplyAnswer), so each must be unique
+// and must not be edited without the same edit here -- an in-flight prompt whose text
+// no longer matches simply falls through to being treated as a normal message.
+const ARG_PROMPTS: Record<string, string> = {
+  "/learn":  "✍️ Яке слово додати? · Which word to add?",
+  "/forget": "✍️ Яке слово прибрати? · Which word to remove?",
+  "/ask":    "✍️ Що запитати про ваші розмови? · What do you want to ask?",
+  "/note":   "✍️ Що записати? · What should I note?",
+  "/bug":    "✍️ Що пішло не так? · What went wrong?",
+};
+const PROMPT_TO_COMMAND: Map<string, string> = new Map(
+  Object.entries(ARG_PROMPTS).map(([cmd, prompt]) => [prompt, cmd]),
+);
+
+// Back buttons name their destination rather than all reading "Back": a reply keyboard
+// carries no state, so two identically-labelled buttons in different submenus would be
+// indistinguishable when the tap comes back as plain text.
+const BACK_TO_MAIN = "⬅️ Головне меню · Main menu";
+const BACK_TO_ADMIN = "⬅️ Адмін-меню · Admin menu";
+
+const MENUS: Record<string, MenuItem[][]> = {
+  main: [
+    [{ label: "📚 Словник · Vocabulary", menu: "vocab" },
+     { label: "🧠 Пам'ять · Memory", menu: "memory" }],
+    [{ label: "🎓 Граматика · Grammar", menu: "grammar" },
+     { label: "🐛 Повідомити ваду · Report a bug", command: "/bug", prompt: ARG_PROMPTS["/bug"] }],
+    [{ label: "❓ Довідка · Help", command: "/help" },
+     { label: "⚙️ Адмін · Admin", menu: "admin", adminOnly: true }],
+  ],
+  vocab: [
+    [{ label: "🔤 Топ слів · Top words", command: "/vocab" },
+     { label: "➕ Вивчити · Learn", command: "/learn", prompt: ARG_PROMPTS["/learn"] }],
+    [{ label: "➖ Забути · Forget", command: "/forget", prompt: ARG_PROMPTS["/forget"] },
+     { label: "📤 Експорт · Export", command: "/export" }],
+    [{ label: BACK_TO_MAIN, menu: "main" }],
+  ],
+  memory: [
+    [{ label: "❓ Запитати · Ask", command: "/ask", prompt: ARG_PROMPTS["/ask"] },
+     { label: "📝 Нотатка · Note", command: "/note", prompt: ARG_PROMPTS["/note"] }],
+    [{ label: "📌 Закріпити · Pin", command: "/pin" },
+     { label: "📋 Закріплені · Pinned", command: "/pinned" }],
+    [{ label: "🚫 Сховати · Hide", command: "/reconcile" },
+     { label: "♻️ Повернути · Restore", command: "/restore" }],
+    [{ label: BACK_TO_MAIN, menu: "main" }],
+  ],
+  grammar: [
+    [{ label: "🐹 Увімк/Вимк · Toggle", command: "/capybara" }],
+    [{ label: BACK_TO_MAIN, menu: "main" }],
+  ],
+  admin: [
+    [{ label: "🩺 Діагностика · Diag", command: "/diag", adminOnly: true },
+     { label: "⬆️ Оновлення · Update", command: "/update", adminOnly: true }],
+    [{ label: "🔄 Бекфіли · Backfills", menu: "backfills", adminOnly: true },
+     { label: "🧪 A/B анотацій · Annotate A/B", command: "/annotate_ab", adminOnly: true }],
+    [{ label: BACK_TO_MAIN, menu: "main" }],
+  ],
+  backfills: [
+    [{ label: "📝 Анотації · Annotate", command: "/backfill", adminOnly: true },
+     { label: "🌐 Переклади · Translations", command: "/backfill_translations", adminOnly: true }],
+    [{ label: "🎯 Сенси · Senses", command: "/backfill_senses", adminOnly: true },
+     { label: "✂️ Приклади · Examples", command: "/backfill_examples", adminOnly: true }],
+    [{ label: "📐 Граматика · Grammar", command: "/backfill_grammar", adminOnly: true },
+     { label: "🔍 Recap · Recap embed", command: "/recap_backfill", adminOnly: true }],
+    [{ label: BACK_TO_ADMIN, menu: "admin" }],
+  ],
+};
+
+// Flat label -> item index, built once. Labels are unique across the whole tree (the
+// two Back buttons name distinct destinations), so a tap resolves without knowing which
+// submenu the user is looking at -- which the keyboard itself never tells us.
+const MENU_ITEM_BY_LABEL: Map<string, MenuItem> = (() => {
+  const m = new Map<string, MenuItem>();
+  for (const rows of Object.values(MENUS)) {
+    for (const row of rows) {
+      for (const item of row) {
+        // One label may legitimately appear in several menus as long as it always does
+        // the same thing -- BACK_TO_MAIN is deliberately reused by every first-level
+        // submenu. Only a label bound to two DIFFERENT destinations is a real conflict,
+        // because the tap arrives as bare text with nothing to disambiguate it.
+        const prev = m.get(item.label);
+        if (prev && (prev.command !== item.command || prev.menu !== item.menu || prev.prompt !== item.prompt)) {
+          console.error(`menu: label ${JSON.stringify(item.label)} is bound to two different actions`);
+        }
+        m.set(item.label, item);
+      }
+    }
+  }
+  return m;
+})();
+
+// Render one menu as a reply keyboard, dropping admin-only buttons for everyone else so
+// the partner never sees (or can tap) the admin branch.
+function buildMenuKeyboard(menuName: string, isAdmin: boolean): any {
+  const rows = MENUS[menuName] ?? MENUS.main;
+  const keyboard = rows
+    .map((row) => row.filter((item) => !item.adminOnly || isAdmin).map((item) => ({ text: item.label })))
+    .filter((row) => row.length > 0);
+  return { keyboard, resize_keyboard: true, is_persistent: true };
+}
+
+const MENU_TITLES: Record<string, string> = {
+  main: "🏠 Головне меню · Main menu",
+  vocab: "📚 Словник · Vocabulary",
+  memory: "🧠 Пам'ять · Memory",
+  grammar: "🎓 Граматика · Grammar",
+  admin: "⚙️ Адмін-меню · Admin menu",
+  backfills: "🔄 Бекфіли · Backfills",
+};
+
+async function showMenu(chatId: number, menuName: string, isAdmin: boolean) {
+  await sendMessage(chatId, MENU_TITLES[menuName] ?? MENU_TITLES.main, undefined, buildMenuKeyboard(menuName, isAdmin));
+}
+
+// A reply to one of our force_reply prompts: rebuild the full command from the prompt
+// that was answered plus the answer text. Returns null for any other reply (notably a
+// /pin-style reply to a real conversation message, which must keep its reply_to_message).
+function commandFromForceReplyAnswer(msg: any): string | null {
+  const promptText = msg.reply_to_message?.text;
+  if (!promptText) return null;
+  const command = PROMPT_TO_COMMAND.get(promptText.trim());
+  if (!command) return null;
+  const answer = (msg.text ?? "").trim();
+  if (!answer) return null;
+  return `${command} ${answer}`;
+}
+
+// Resolve a reply-keyboard tap. Returns a command string to dispatch, "handled" when the
+// tap was fully served here (a submenu was opened or an argument prompt sent), or null
+// when the text is not a button at all and belongs on the normal message path.
+async function resolveMenuTap(msg: any, isAdmin: boolean): Promise<string | "handled" | null> {
+  const item = MENU_ITEM_BY_LABEL.get((msg.text ?? "").trim());
+  if (!item) return null;
+  if (item.adminOnly && !isAdmin) { await sendMessage(msg.chat.id, "Not authorized."); return "handled"; }
+  if (item.menu) { await showMenu(msg.chat.id, item.menu, isAdmin); return "handled"; }
+  if (item.prompt) {
+    await sendMessage(msg.chat.id, item.prompt, undefined, { force_reply: true, selective: true });
+    return "handled";
+  }
+  return item.command ?? null;
 }
 
 async function forwardToPartner(sender: any, original: string, translated: string, origLang: string, transLang: string) {
@@ -1612,7 +1809,7 @@ async function handleExport(msg: any, user: any) {
 async function exportRun(chatId: number, user: any) {
   const { data: cards, error } = await supabase
     .from("flashcards")
-    .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
+    .select(`created_at, vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation, example, example_translation), example_message:example_message_id (original_text, original_language, translated_text, translated_language)`)
     .order("created_at", { ascending: true });
 
   if (error) {
@@ -1643,16 +1840,22 @@ async function exportRun(chatId: number, user: any) {
   for (const card of (cards ?? []) as any[]) {
     const v = card.vocabulary;
     if (!v) continue;
-    const m = card.example_message;
-    let exampleSentence = "";
-    let exampleTranslation = "";
-    if (m) {
-      if (m.original_language === v.language) {
-        exampleSentence = m.original_text ?? "";
-        exampleTranslation = m.translated_text ?? "";
-      } else if (m.translated_language === v.language) {
-        exampleSentence = m.translated_text ?? "";
-        exampleTranslation = m.original_text ?? "";
+    // Prefer the short, model-extracted sentence pair stored on the vocabulary row.
+    // Rows annotated before that column existed (or backfilled without one -- an
+    // idiomatic translation with no locatable counterpart) fall back to the whole
+    // linked message, same as export always did.
+    let exampleSentence = v.example ?? "";
+    let exampleTranslation = v.example_translation ?? "";
+    if (!exampleSentence) {
+      const m = card.example_message;
+      if (m) {
+        if (m.original_language === v.language) {
+          exampleSentence = m.original_text ?? "";
+          exampleTranslation = m.translated_text ?? "";
+        } else if (m.translated_language === v.language) {
+          exampleSentence = m.translated_text ?? "";
+          exampleTranslation = m.original_text ?? "";
+        }
       }
     }
     if (exampleSentence && !exampleScriptMatchesLanguage(exampleSentence, v.language)) {
@@ -1815,6 +2018,8 @@ async function handleHelp(msg: any, user: any) {
       "",
       "\u0414\u0432\u0456 \u043a\u043e\u043b\u043e\u0434\u0438: \ud83c\uddfa\ud83c\udde6 \u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0456 \ud83c\uddec\ud83c\udde7 \u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430.",
       "",
+      "\u041a\u043d\u043e\u043f\u043a\u0438 \u043c\u0435\u043d\u044e \u2014 \u0432\u043d\u0438\u0437\u0443 \u0435\u043a\u0440\u0430\u043d\u0430. \u0423\u0441\u0456 \u043a\u043e\u043c\u0430\u043d\u0434\u0438 \u0442\u0430\u043a\u043e\u0436 \u043f\u0440\u0430\u0446\u044e\u044e\u0442\u044c, \u044f\u043a\u0449\u043e \u0457\u0445 \u043d\u0430\u0431\u0440\u0430\u0442\u0438.",
+      "",
       solo
         ? "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u043c\u0456\u0436 \u0442\u0432\u043e\u0457\u043c\u0438 \u0434\u0432\u043e\u043c\u0430 \u043c\u043e\u0432\u0430\u043c\u0438"
         : "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0456 \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
@@ -1837,12 +2042,16 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /pin \u2014 \u041f\u043e\u0437\u043d\u0430\u0447\u0438\u0442\u0438 \u044f\u043a \u0432\u0430\u0436\u043b\u0438\u0432\u0435",
       "\u2022 /unpin \u2014 \u0417\u043d\u044f\u0442\u0438 \u043f\u043e\u0437\u043d\u0430\u0447\u043a\u0443",
       "\u2022 /pinned \u2014 \u0421\u043f\u0438\u0441\u043e\u043a \u0437\u0430\u043a\u0440\u0456\u043f\u043b\u0435\u043d\u0438\u0445",
+      "",
+      "\u2022 /bug <\u043e\u043f\u0438\u0441> \u2014 \u041f\u043e\u0432\u0456\u0434\u043e\u043c\u0438\u0442\u0438 \u043f\u0440\u043e \u043f\u043e\u043c\u0438\u043b\u043a\u0443 \u0432 \u0431\u043e\u0442\u0456",
     );
   } else {
     lines.push(
       "*Capybara commands*",
       "",
       "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
+      "",
+      "Menu buttons are at the bottom of the screen. Every command below also works typed.",
       "",
       solo
         ? "\u2022 Just type or send a voice message \u2014 I translate it between your two languages"
@@ -1867,6 +2076,8 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /pin \u2014 Reply to a message to mark it meaningful (small /ask boost)",
       "\u2022 /unpin \u2014 Reply to a pinned message to remove the pin",
       "\u2022 /pinned \u2014 List all pinned messages chronologically",
+      "",
+      "\u2022 /bug <what went wrong> \u2014 Report a bug (files a GitHub issue)",
     );
   }
   if (isAdmin) {
@@ -1875,13 +2086,16 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /backfill \u2014 Annotate one batch of unprocessed messages");
     lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
     lines.push("\u2022 /backfill\\_senses \u2014 Re-fix flashcard translations to match their example sentence");
+    lines.push("\u2022 /backfill\\_examples \u2014 Fill short example/example\\_translation for older vocabulary rows");
     lines.push("\u2022 /backfill\\_grammar \u2014 Fill in card fields for older grammar corrections");
     lines.push("\u2022 /annotate\\_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)");
     lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
     lines.push("\u2022 /diag \u2014 Ping upstream APIs and check recent DB activity");
     lines.push("\u2022 /update \u2014 Check GitHub for a newer build; deploy with one tap");
   }
-  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
+  // /help re-attaches the keyboard too, so it is the recovery path if the keyboard was
+  // ever dismissed (Telegram's "hide keyboard" is per-user and we never see it happen).
+  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown", buildMenuKeyboard("main", isAdmin));
 }
 
 async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
@@ -2509,6 +2723,120 @@ async function handleBackfillSenses(msg: any, user: any) {
   scheduleBackgroundWork("resenseGrind", resenseGrind(msg.chat.id));
 }
 
+// --- /backfill_examples: retroactively fill the short example/example_translation pair
+// for vocabulary rows annotated before those columns existed -- see #53: without them,
+// /export fell back to the WHOLE first-seen message as a card's example (often a
+// paragraph), with no guarantee the translated side actually used the answer word.
+// Incremental like /backfill_translations (a row already carrying an example is never
+// revisited), but each row needs its first-seen message for context, so it runs as a
+// time-boxed background grind like /backfill_senses rather than one batch call.
+
+async function backfillExampleForCard(it: {
+  lemma: string; part_of_speech: string | null; lemmaTranslation: string | null; language: LangCode; otherLanguage: LangCode;
+  sourceText: string; targetText: string;
+}): Promise<{ example: string; example_translation: string | null } | null> {
+  const langName = langMeta(it.language).englishName;
+  const otherName = langMeta(it.otherLanguage).englishName;
+  const answer = it.lemmaTranslation ?? it.lemma;
+  const system =
+    `A ${langName} message was translated into ${otherName}:\n` +
+    `${langName}: "${it.sourceText}"\n` +
+    `${otherName}: "${it.targetText}"\n\n` +
+    `The ${langName} word "${it.lemma}" (${it.part_of_speech ?? "word"}, dictionary translation "${answer}") appears somewhere in the ${langName} text above.\n` +
+    `Return ONLY raw JSON: {"example": "<sentence>", "example_translation": "<sentence or null>"}.\n` +
+    `- "example": the ONE sentence from the ${langName} text — copied verbatim, character-for-character, never paraphrased — in which the word appears. Two consecutive sentences only if its sense is unrecoverable from one alone. Never the whole text.\n` +
+    `- "example_translation": the sentence from the ${otherName} text that corresponds to "example" — copied verbatim, never invented or back-translated. Return null if no sentence there actually contains a recognizable form of "${answer}".\n` +
+    `No markdown fences, no preamble.`;
+  try {
+    const result = await withRetry(() => anthropic.messages.create({
+      model: CLAUDE_MODEL, max_tokens: 400, thinking: { type: "disabled" },
+      system, messages: [{ role: "user", content: it.lemma }],
+    }));
+    const block = result.content.find((b) => b.type === "text");
+    if (block?.type !== "text") return null;
+    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    const parsed = JSON.parse(cleaned);
+    const example = typeof parsed?.example === "string" ? parsed.example.trim() : "";
+    if (!example) return null;
+    const exampleTranslation = typeof parsed?.example_translation === "string" ? parsed.example_translation.trim() : "";
+    return { example, example_translation: exampleTranslation || null };
+  } catch (e) {
+    console.error("backfillExampleForCard failed:", e);
+    return null;
+  }
+}
+
+async function exampleBackfillGrind(chatId: number) {
+  const startedAt = Date.now();
+  const { data: rows, error } = await supabase
+    .from("vocabulary")
+    .select("id, lemma, part_of_speech, language, lemma_translation, first_seen_message_id")
+    .is("example", null)
+    .not("first_seen_message_id", "is", null)
+    .order("created_at", { ascending: true });
+  if (error) {
+    console.error("backfill_examples fetch failed:", error);
+    await sendMessage(chatId, "Couldn't fetch vocabulary rows. Check logs.");
+    return;
+  }
+  const pending = (rows ?? []) as any[];
+  if (pending.length === 0) { await sendMessage(chatId, "✅ No more rows to backfill."); return; }
+
+  const msgIds = [...new Set(pending.map((v) => v.first_seen_message_id))];
+  const msgById = new Map<string, any>();
+  for (let i = 0; i < msgIds.length; i += 100) {
+    const { data: ms } = await supabase.from("messages")
+      .select("id, original_text, translated_text, original_language, translated_language")
+      .in("id", msgIds.slice(i, i + 100));
+    for (const m of (ms ?? []) as any[]) msgById.set(m.id, m);
+  }
+
+  type Item = { id: string; lemma: string; part_of_speech: string | null; lemmaTranslation: string | null; language: LangCode; otherLanguage: LangCode; sourceText: string; targetText: string };
+  const items: Item[] = [];
+  let skippedNoMessage = 0;
+  for (const v of pending) {
+    const m = msgById.get(v.first_seen_message_id);
+    if (!m || !m.translated_language || !m.translated_text) { skippedNoMessage++; continue; }
+    const isOrig = m.original_language === v.language;
+    const sourceText = isOrig ? m.original_text : m.translated_text;
+    const targetText = isOrig ? m.translated_text : m.original_text;
+    const otherLanguage = isOrig ? m.translated_language : m.original_language;
+    if (!sourceText || !targetText || !otherLanguage) { skippedNoMessage++; continue; }
+    items.push({ id: v.id, lemma: v.lemma, part_of_speech: v.part_of_speech, lemmaTranslation: v.lemma_translation, language: v.language, otherLanguage, sourceText, targetText });
+  }
+
+  let processed = 0, filled = 0, failed = 0;
+  for (let i = 0; i < items.length; i += BACKFILL_CONCURRENCY) {
+    if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
+    const chunk = items.slice(i, i + BACKFILL_CONCURRENCY);
+    await Promise.allSettled(chunk.map(async (it) => {
+      const res = await backfillExampleForCard(it);
+      processed++;
+      if (!res) { failed++; return; }
+      const { error: uErr } = await supabase.from("vocabulary")
+        .update({ example: res.example, example_translation: res.example_translation })
+        .eq("id", it.id);
+      if (uErr) { failed++; console.error("backfill_examples update failed:", uErr); } else { filled++; }
+    }));
+  }
+  const remaining = items.length - processed;
+  await sendMessage(chatId,
+    `✅ Example backfill run done.\n` +
+    `Rows checked: ${processed}/${items.length}\n` +
+    `Filled: ${filled}\n` +
+    (failed > 0 ? `Failed: ${failed}\n` : "") +
+    (skippedNoMessage > 0 ? `Skipped (no usable linked message): ${skippedNoMessage}\n` : "") +
+    (remaining > 0
+      ? `\nRan out of time with ${remaining} left — send /backfill_examples again to finish.`
+      : `\n🎉 Whole deck checked. Run /export and re-import into Anki (update existing notes when the first field matches) to refresh the cards — your study progress is kept.`));
+}
+
+async function handleBackfillExamples(msg: any, user: any) {
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  await sendMessage(msg.chat.id, "⏳ Filling in short example sentences for older vocabulary rows — I'll report when this run finishes.");
+  scheduleBackgroundWork("exampleBackfillGrind", exampleBackfillGrind(msg.chat.id));
+}
+
 // --- /backfill_grammar: fill in the card fields older corrections never captured -----
 // Corrections stored before v77/v79 have no correction_focus (so they export as a whole
 // sentence instead of a blank) and no lemma/gloss (so the blank has no clue). Re-running
@@ -2689,6 +3017,100 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
   summary.push("Rates are standard (post-introductory). Switch by setting ANNOTATION_MODEL in index.ts, then redeploy.");
 
   await sendChunked(chatId, [...blocks, summary.join("\n")]);
+}
+
+// --- /bug: file a GitHub issue from inside Telegram ---------------------------------
+// Bugs get noticed while using the bot, not while sitting at a terminal, and the detail
+// that makes one reproducible (what was just sent, which direction, what came back) is
+// freshest right then. This posts exactly what the reporter typed -- no conversation
+// history, no message IDs, nothing scraped from the corpus -- because an issue leaves
+// the couple's private instance for GitHub, where it is subject to that repo's
+// visibility rather than this policy. Available to both partners: either can hit a bug.
+
+// Create one issue via the REST API. Returns the issue's html_url, or an error string.
+async function createGitHubIssue(title: string, body: string): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  // The webhook swallows a handler throw and still answers Telegram 200 (so a failed
+  // update is never retried into a duplicate issue) -- which also means an uncaught
+  // network error here would leave the reporter with no reply at all. Catch it and
+  // turn it into something the reporter can act on.
+  let resp: Response;
+  try {
+    resp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/issues`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${GITHUB_ISSUE_TOKEN}`,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "capybara-bot", // GitHub's REST API rejects requests without a User-Agent
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ title, body }),
+    });
+  } catch (e) {
+    console.error("createGitHubIssue fetch failed:", e);
+    return { ok: false, error: "Couldn't reach GitHub (network error). Try again in a minute." };
+  }
+  if (resp.status === 201) {
+    const json = await resp.json().catch(() => null);
+    const url = json?.html_url;
+    if (typeof url === "string") return { ok: true, url };
+    return { ok: false, error: "created, but GitHub returned no issue URL" };
+  }
+  const detail = await resp.text().catch(() => "<no body>");
+  console.error(`createGitHubIssue non-201: status=${resp.status} body=${detail.slice(0, 300)}`);
+  // 403/404 on a repo that exists is almost always a token missing "Issues: write" --
+  // GitHub 404s rather than 403s an unauthorized repo read, so say so for both.
+  if (resp.status === 401 || resp.status === 403 || resp.status === 404) {
+    return { ok: false, error: "GitHub rejected the request. The token likely lacks \"Issues: write\" on this repo (or GITHUB_REPO is wrong)." };
+  }
+  if (resp.status === 410) return { ok: false, error: "Issues are disabled on this repository." };
+  return { ok: false, error: `GitHub returned HTTP ${resp.status}.` };
+}
+
+// First line (or first 72 chars) becomes the title so the issue list stays scannable;
+// the whole report is repeated in the body, so nothing is lost to the split.
+function bugTitleFrom(report: string): string {
+  const firstLine = report.split("\n")[0].trim();
+  const base = firstLine || report.trim();
+  return base.length <= 72 ? base : `${base.slice(0, 69).trimEnd()}...`;
+}
+
+async function handleBug(msg: any, user: any) {
+  const text = (msg.text ?? "").trim();
+  const firstSpace = text.indexOf(" ");
+  let report = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
+  if (!report) {
+    await sendMessage(msg.chat.id,
+      "Usage: `/bug <what went wrong>`\n\n" +
+      "Files a GitHub issue on the bot's repo. Say what you did, what you expected, and what happened instead.\n\n" +
+      "⚠️ Only the text you type is sent — no conversation history — but it does leave this chat for GitHub, so don't paste anything private.",
+      "Markdown");
+    return;
+  }
+  if (!GITHUB_REPO || !GITHUB_ISSUE_TOKEN) {
+    await sendMessage(msg.chat.id,
+      "Bug reporting isn't configured on this instance.\n\n" +
+      "The admin needs to set the GITHUB\\_REPO and GITHUB\\_ISSUE\\_TOKEN function secrets (the token needs \"Issues: write\").",
+      "Markdown");
+    return;
+  }
+  let truncated = false;
+  if (report.length > BUG_REPORT_MAX_CHARS) {
+    report = report.slice(0, BUG_REPORT_MAX_CHARS);
+    truncated = true;
+  }
+  // Reporter + running version are the two things that are always useful on a bug and
+  // always missing from a report written by hand.
+  const body =
+    `${report}${truncated ? "\n\n_(report truncated at " + BUG_REPORT_MAX_CHARS + " characters)_" : ""}\n\n` +
+    `---\n` +
+    `Reported via \`/bug\` in Telegram by **${user.display_name}** — running \`${BUILD_VERSION}\`.`;
+  const result = await createGitHubIssue(bugTitleFrom(report), body);
+  if (!result.ok) {
+    await sendMessage(msg.chat.id, `Couldn't file that. ${result.error}`);
+    return;
+  }
+  await sendMessage(msg.chat.id, `🐛 Filed: ${result.url}`);
 }
 
 // --- /update: check GitHub for a newer build, and (admin) deploy it with one tap ---
