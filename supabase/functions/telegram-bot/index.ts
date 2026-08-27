@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v87";
+const BUILD_VERSION = "v88";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -285,6 +285,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/backfill_translations",                                        handle: handleBackfillTranslations },
     { match: t => t === "/backfill_senses",                                              handle: handleBackfillSenses },
     { match: t => t === "/backfill_examples",                                             handle: handleBackfillExamples },
+    { match: t => t === "/backfill_glosses",                                              handle: handleBackfillGlosses },
     { match: t => t === "/backfill",                                                     handle: handleBackfill },
     { match: t => t === "/diag",                                                         handle: handleDiag },
     { match: t => t === "/update" || t.startsWith("/update@"),                          handle: handleUpdateCommand },
@@ -1414,6 +1415,7 @@ const MENUS: Record<string, MenuItem[][]> = {
      { label: "✂️ Приклади · Examples", command: "/backfill_examples", adminOnly: true }],
     [{ label: "📐 Граматика · Grammar", command: "/backfill_grammar", adminOnly: true },
      { label: "🔍 Recap · Recap embed", command: "/recap_backfill", adminOnly: true }],
+    [{ label: "🈯 Глоси · Glosses", command: "/backfill_glosses", adminOnly: true }],
     [{ label: BACK_TO_ADMIN, menu: "admin" }],
   ],
 };
@@ -2115,6 +2117,7 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /backfill\\_translations \u2014 Fill lemma\\_translation for one batch");
     lines.push("\u2022 /backfill\\_senses \u2014 Re-fix flashcard translations to match their example sentence");
     lines.push("\u2022 /backfill\\_examples \u2014 Fill short example/example\\_translation for older vocabulary rows");
+    lines.push("\u2022 /backfill\\_glosses \u2014 Rewrite glosses stuck in the wrong language");
     lines.push("\u2022 /backfill\\_grammar \u2014 Fill in card fields for older grammar corrections");
     lines.push("\u2022 /annotate\\_ab [n] \u2014 Compare annotation models on recent messages (writes nothing)");
     lines.push("\u2022 /recap\\_backfill \u2014 Embed one batch of messages for /recap");
@@ -2689,7 +2692,7 @@ async function resenseGrind(chatId: number) {
   // example_message_id = first_seen_message_id, so that message is the card's example).
   const { data: cardRows, error: cErr } = await supabase
     .from("flashcards")
-    .select("vocabulary(id, lemma, part_of_speech, language, first_seen_message_id, lemma_translation)");
+    .select("vocabulary(id, lemma, part_of_speech, language, first_seen_message_id, lemma_translation, gloss)");
   if (cErr) { console.error("resense: flashcards fetch failed:", cErr); await sendMessage(chatId, "Couldn't fetch the deck. Check logs."); return; }
   const vocabById = new Map<string, any>();
   for (const r of (cardRows ?? []) as any[]) {
@@ -2707,7 +2710,7 @@ async function resenseGrind(chatId: number) {
     for (const m of (ms ?? []) as any[]) msgById.set(m.id, m);
   }
   // Build work items with the sense-anchor context (both language sides).
-  type Item = { id: string; lemma: string; part_of_speech: string | null; language: LangCode; otherLanguage: LangCode; sourceText: string; targetText: string; oldTranslation: string | null };
+  type Item = { id: string; lemma: string; part_of_speech: string | null; language: LangCode; otherLanguage: LangCode; sourceText: string; targetText: string; oldTranslation: string | null; oldGloss: string | null };
   const items: Item[] = [];
   for (const v of vocab) {
     const m = msgById.get(v.first_seen_message_id);
@@ -2717,7 +2720,7 @@ async function resenseGrind(chatId: number) {
     const targetText = isOrig ? m.translated_text : m.original_text;
     const otherLanguage = isOrig ? m.translated_language : m.original_language;
     if (!sourceText || !targetText || !otherLanguage) continue;
-    items.push({ id: v.id, lemma: v.lemma, part_of_speech: v.part_of_speech, language: v.language, otherLanguage, sourceText, targetText, oldTranslation: v.lemma_translation });
+    items.push({ id: v.id, lemma: v.lemma, part_of_speech: v.part_of_speech, language: v.language, otherLanguage, sourceText, targetText, oldTranslation: v.lemma_translation, oldGloss: v.gloss });
   }
   let processed = 0, corrected = 0, unchanged = 0, failed = 0;
   for (let i = 0; i < items.length; i += BACKFILL_CONCURRENCY) {
@@ -2727,9 +2730,15 @@ async function resenseGrind(chatId: number) {
       const res = await resenseCard(it);
       processed++;
       if (!res) { failed++; return; }
-      if (res.lemma_translation === it.oldTranslation) { unchanged++; return; }
-      const patch: Record<string, string> = { lemma_translation: res.lemma_translation };
-      if (res.gloss) patch.gloss = res.gloss;
+      // Each field is compared on its own. Returning early when only the translation was
+      // already right used to strand the gloss -- and a row whose translation is correct
+      // but whose gloss is in the WRONG LANGUAGE is exactly the common case (see
+      // /backfill_glosses), so the gloss patch below was unreachable for the rows that
+      // most needed it.
+      const patch: Record<string, string> = {};
+      if (res.lemma_translation !== it.oldTranslation) patch.lemma_translation = res.lemma_translation;
+      if (res.gloss && res.gloss !== it.oldGloss) patch.gloss = res.gloss;
+      if (Object.keys(patch).length === 0) { unchanged++; return; }
       const { error: uErr } = await supabase.from("vocabulary").update(patch).eq("id", it.id);
       if (uErr) { failed++; console.error("resense update failed:", uErr); } else { corrected++; }
     }));
@@ -2864,6 +2873,161 @@ async function handleBackfillExamples(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   await sendMessage(msg.chat.id, "⏳ Filling in short example sentences for older vocabulary rows — I'll report when this run finishes.");
   scheduleBackgroundWork("exampleBackfillGrind", exampleBackfillGrind(msg.chat.id));
+}
+
+// --- /backfill_glosses: put each gloss back into the LEARNER's language -------------
+// A gloss is meant to be in the OPPOSITE language to its lemma -- that is the language of
+// the person studying that deck. An older annotation prompt asked for the gloss in English
+// unconditionally, which is right by accident for Ukrainian lemmas and wrong for every
+// English one, so one deck ends up glossing English words in English: useless to the
+// partner learning English.
+//
+// /backfill_senses cannot reach these rows. It re-derives the gloss correctly, but only
+// writes when lemma_translation ALSO changed, and these rows have correct translations and
+// only bad glosses (that early return is fixed above, but it still visits carded rows only).
+//
+// Detection is by script, using the same helper /export uses to sanity-check examples, so
+// nothing here hardcodes a language pair. On a SAME-SCRIPT instance (e.g. English+Spanish)
+// script cannot distinguish the two languages, so this command correctly finds nothing
+// rather than guessing -- it is a cross-script repair.
+const BACKFILL_GLOSS_BATCH = 25;
+
+// One batched call: many lemmas per request, like translateLemmasBatch, because 3-4k rows
+// one-at-a-time would be thousands of round trips for a one-word answer each.
+async function reglossLemmasBatch(
+  items: Array<{ id: string; lemma: string; part_of_speech: string | null; gloss: string | null; lemma_translation: string | null }>,
+  language: LangCode,
+  otherLanguage: LangCode,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (items.length === 0) return out;
+  const langName = langMeta(language).englishName;
+  const otherName = langMeta(otherLanguage).englishName;
+  const notes = langMeta(otherLanguage).translationNotes;
+  const lines = items.map((it, i) => {
+    const pos = it.part_of_speech ?? "unknown";
+    const hint = [it.gloss ? `current ${langName} gloss: ${it.gloss}` : null,
+                  it.lemma_translation ? `${otherName} translation: ${it.lemma_translation}` : null]
+      .filter(Boolean).join("; ");
+    return `${i + 1}. ${it.lemma} (${pos}${hint ? "; " + hint : ""})`;
+  }).join("\n");
+  const system =
+    `Each numbered item is a ${langName} dictionary word whose gloss was written in the WRONG language.\n` +
+    `Rewrite each gloss in ${otherName} — the language of the learner studying this deck.\n` +
+    `Rules:\n` +
+    `- 1-4 words of ${otherName}. A gloss, not a definition or a sentence.\n` +
+    `- Keep the SENSE the existing hints describe: the current gloss and the ${otherName} translation both point at which meaning is wanted. Preserve that sense; only the language changes.\n` +
+    `- If the item is a proper noun, foreign word, or gibberish, return null for it.\n` +
+    `- Output ONLY a raw JSON array: [{"n": 1, "gloss": "..."}, {"n": 2, "gloss": null}, ...]\n` +
+    `- Do NOT wrap in markdown code fences. Do NOT include any preamble.` +
+    (notes ? `\n${notes}` : "");
+  let result;
+  try {
+    result = await withRetry(() => anthropic.messages.create({
+      model: CLAUDE_MODEL, max_tokens: 8192, thinking: { type: "disabled" },
+      system, messages: [{ role: "user", content: lines }],
+    }));
+  } catch (e) {
+    console.error("reglossLemmasBatch API call failed:", e);
+    return out;
+  }
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") return out;
+  let parsed: any;
+  try {
+    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    parsed = JSON.parse(cleaned);
+  } catch {
+    console.error("reglossLemmasBatch JSON parse failed:", block.text.slice(0, 300));
+    return out;
+  }
+  if (!Array.isArray(parsed)) return out;
+  for (const entry of parsed) {
+    if (typeof entry?.n !== "number") continue;
+    const idx = entry.n - 1;
+    if (idx < 0 || idx >= items.length) continue;
+    const g = entry.gloss;
+    if (typeof g !== "string" || g.trim().length === 0) continue;
+    // Refuse a "fix" still in the wrong script -- writing it would only churn the row and
+    // leave it looking repaired while /export still shows the learner their own language.
+    if (!exampleScriptMatchesLanguage(g, otherLanguage)) continue;
+    out.set(items[idx].id, g.trim());
+  }
+  return out;
+}
+
+async function glossBackfillGrind(chatId: number) {
+  const startedAt = Date.now();
+  const { data: uRows } = await supabase.from("users").select("native_language");
+  const instanceLangs = [...new Set((uRows ?? []).map((u: any) => u.native_language as string))];
+  const otherOf = (lang: string): string => instanceLangs.find((l) => l !== lang) ?? lang;
+
+  // Scanned in pages and filtered here rather than in SQL: "wrong script for the opposite
+  // language" is a property of the language registry, not something to re-express as a
+  // hardcoded Postgres regex. Reads are cheap next to the model calls, and a repaired row
+  // stops matching, so successive runs shrink the set on their own.
+  const wrong: any[] = [];
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data: page, error } = await supabase
+      .from("vocabulary")
+      .select("id, lemma, part_of_speech, language, gloss, lemma_translation")
+      .not("gloss", "is", null)
+      .order("created_at", { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("backfill_glosses scan failed:", error);
+      await sendMessage(chatId, "Couldn't scan vocabulary. Check logs.");
+      return;
+    }
+    if (!page || page.length === 0) break;
+    for (const v of page as any[]) {
+      const other = otherOf(v.language);
+      if (other === v.language) continue;               // solo/unknown pair: nothing to compare
+      if (langMeta(other).script === langMeta(v.language).script) continue; // same-script: undetectable
+      if (!exampleScriptMatchesLanguage(v.gloss, other)) wrong.push(v);
+    }
+    if (page.length < PAGE) break;
+  }
+
+  if (wrong.length === 0) { await sendMessage(chatId, "✅ Every gloss is already in the learner's language."); return; }
+
+  let fixed = 0, skipped = 0, processed = 0;
+  for (let i = 0; i < wrong.length; i += BACKFILL_GLOSS_BATCH) {
+    if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
+    const chunk = wrong.slice(i, i + BACKFILL_GLOSS_BATCH);
+    // One call per language, so a mixed chunk is split rather than mislabelled.
+    const byLang = new Map<string, any[]>();
+    for (const v of chunk) {
+      if (!byLang.has(v.language)) byLang.set(v.language, []);
+      byLang.get(v.language)!.push(v);
+    }
+    for (const [l, group] of byLang) {
+      const map = await reglossLemmasBatch(group, l as LangCode, otherOf(l) as LangCode);
+      processed += group.length;
+      for (const v of group) {
+        const g = map.get(v.id);
+        if (!g) { skipped++; continue; }
+        const { error: uErr } = await supabase.from("vocabulary").update({ gloss: g }).eq("id", v.id);
+        if (uErr) { skipped++; console.error("backfill_glosses update failed:", uErr); } else { fixed++; }
+      }
+    }
+  }
+  const remaining = wrong.length - processed;
+  await sendMessage(chatId,
+    `✅ Gloss backfill run done.\n` +
+    `Wrong-language glosses found: ${wrong.length}\n` +
+    `Rewritten: ${fixed}\n` +
+    (skipped > 0 ? `Skipped (unusable answer): ${skipped}\n` : "") +
+    (remaining > 0
+      ? `\nRan out of time with ${remaining} left — send /backfill_glosses again to finish.`
+      : `\n🎉 Every gloss is now in the learner's language. Run /export and re-import into Anki to refresh the cards — your study progress is kept.`));
+}
+
+async function handleBackfillGlosses(msg: any, user: any) {
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  await sendMessage(msg.chat.id, "⏳ Rewriting glosses that are in the wrong language — I'll report when this run finishes.");
+  scheduleBackgroundWork("glossBackfillGrind", glossBackfillGrind(msg.chat.id));
 }
 
 // --- /backfill_grammar: fill in the card fields older corrections never captured -----
