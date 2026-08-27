@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v85";
+const BUILD_VERSION = "v86";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1258,33 +1258,26 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
   if (!resp.ok) console.error("sendContact failed:", resp.status, await resp.text().catch(() => "<no body>"));
 }
 
-// --- Command menu (setMyCommands) -------------------------------------------
-// Populates Telegram's "/" menu so the bot's commands are discoverable. Scoped:
-// both partners see PUBLIC_COMMANDS (default scope); the admin ALSO sees the admin
-// commands, in their own chat only.
-const PUBLIC_COMMANDS: { command: string; description: string }[] = [
-  { command: "start", description: "What the bot does" },
-  { command: "help", description: "Show all commands" },
-];
-// The "/" list is deliberately just these two. Browsing lives on the branched reply
-// keyboard (see MENUS below), which the flat setMyCommands API cannot express; leaving
-// the full command list here as well would mean maintaining -- and showing -- the same
-// menu twice. Every command still works when typed, and /help still lists them all.
-// ADMIN_COMMANDS is registered against the admin's own chat scope; it carries nothing
-// extra today, since /diag and /update are reachable from the keyboard's admin branch.
-const ADMIN_COMMANDS: { command: string; description: string }[] = [
-  ...PUBLIC_COMMANDS,
-];
-
-async function setMyCommands(commands: { command: string; description: string }[], scope?: unknown): Promise<boolean> {
-  const body: Record<string, unknown> = { commands };
+// --- Command menu (deleteMyCommands) -----------------------------------------
+// The bot registers NO "/" commands at all. Browsing lives entirely on the branched
+// reply keyboard (see MENUS below), which the flat setMyCommands API cannot express, so
+// a "/" list could only ever duplicate it -- and Telegram gives no way to hide the
+// compose-box menu button itself (setChatMenuButton has no "none" type). Registering an
+// empty list is the closest lever there is: with nothing to list, clients have nothing
+// to show behind that button. Every command still works when TYPED, and /help still
+// lists them all -- only the autocomplete popup goes away.
+//
+// Commands are stored per SCOPE, so clearing the default scope alone would strand the
+// admin's chat-scoped list, which this bot used to set. Both scopes are cleared.
+async function deleteMyCommands(scope?: unknown): Promise<boolean> {
+  const body: Record<string, unknown> = {};
   if (scope) body.scope = scope;
-  const resp = await fetch(`${TELEGRAM_API}/setMyCommands`, {
+  const resp = await fetch(`${TELEGRAM_API}/deleteMyCommands`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!resp.ok) { console.error("setMyCommands failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
+  if (!resp.ok) { console.error("deleteMyCommands failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
   return true;
 }
 
@@ -1307,10 +1300,10 @@ let commandsRegistered = false;
 // transient failure retries on the next request rather than waiting for a cold start.
 async function ensureCommandsRegistered(): Promise<void> {
   if (commandsRegistered) return;
-  const okPublic = await setMyCommands(PUBLIC_COMMANDS);
+  const okPublic = await deleteMyCommands();
   let okAdmin = true;
   if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
-    okAdmin = await setMyCommands(ADMIN_COMMANDS, { type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
+    okAdmin = await deleteMyCommands({ type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
   }
   const okMenuButton = await setChatMenuButtonToCommands();
   if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
@@ -1319,9 +1312,9 @@ async function ensureCommandsRegistered(): Promise<void> {
 // --- Branched reply-keyboard menu --------------------------------------------------
 // The "/" list (setMyCommands) is flat by design -- Telegram has no nesting in it -- so
 // the browsable menu is a ReplyKeyboardMarkup instead: persistent buttons under the
-// compose box, where a category button swaps the keyboard for its submenu. setMyCommands
-// is deliberately trimmed to /start + /help (see PUBLIC_COMMANDS): every command still
-// works when typed, the "/" list just stops duplicating the keyboard.
+// compose box, where a category button swaps the keyboard for its submenu. The "/" list
+// is registered EMPTY (see deleteMyCommands above) rather than duplicating this tree;
+// every command still works when typed, and /help still lists them all.
 //
 // The load-bearing detail: a reply-keyboard tap arrives as an ORDINARY TEXT MESSAGE
 // carrying the button's label -- there is no callback_data. In a translation bot that

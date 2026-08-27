@@ -116,9 +116,9 @@ them in a single turn.
   semantic + keyword search over everything you've said, then a grounded synthesis
   (see [the pipeline below](#the-recap-memory-pipeline)).
 - `/note <note>` stores a private note that only *your* `/ask` can retrieve.
-- Both have long-form aliases — `/recap` and `/remember` — which keep working. The short
-  names are what the `/` menu shows: a command you want to add text to has to be *typed*,
-  since tapping a menu entry sends it immediately.
+- Both have long-form aliases — `/recap` and `/remember` — which keep working. On the menu
+  keyboard these sit under 🧠 Memory, and because they take text, tapping one opens a reply
+  prompt rather than firing the bare command.
 - `/pin` / `/pinned` / `/unpin` mark messages as meaningful (a small recall boost);
   `/reconcile` / `/restore` hide or restore a message from recap results.
 
@@ -447,8 +447,11 @@ also appear in Telegram's **`/` menu** (admin commands show only to the admin). 
 Commands are browsable from a **branched menu keyboard** under the compose box —
 `📚 Vocabulary`, `🧠 Memory`, `🎓 Grammar`, `⚙️ Admin` (admin only) — each opening a submenu
 with a back button. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
-open a reply prompt. Telegram's `/` list is deliberately trimmed to `/start` and `/help`,
-since `setMyCommands` is flat and can't express the tree; **every command still works typed.**
+open a reply prompt. Telegram's `/` list is registered **empty** (`deleteMyCommands`, both
+scopes), since `setMyCommands` is flat and can't express the tree — and with nothing to list,
+clients have nothing to show behind the compose-box menu button, which Telegram otherwise
+gives no way to hide. **Every command still works typed**, and `/help` lists them all; only
+the autocomplete popup is gone.
 
 | Command | Does |
 |---|---|
