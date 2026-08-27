@@ -498,13 +498,15 @@ an existing corpus** — new instances can ignore them.
 | `/backfill` | Annotate one batch of un-annotated messages |
 | `/backfill_translations` | Fill in missing cross-language lemma translations, one batch |
 | `/backfill_senses` | Re-derive flashcard translations so each matches its example sentence |
-| `/backfill_examples` | Fill in the short verbatim example sentence pair for older vocabulary rows |
+| `/backfill_examples` | Fill in the short verbatim example sentence pair for older vocabulary rows. **Self-chaining** — one tap runs it to completion; every other backfill still needs re-tapping |
 | `/backfill_grammar` | Fill in card fields (blank target, dictionary form, meaning) for older corrections |
 | `/recap_backfill` | Embed one batch of existing messages for `/recap` |
 | `/annotate_ab` | Compare annotation models on recent messages — reports quality, tokens, cost. Writes nothing |
 
 Each backfill command is **idempotent and batched** — run it repeatedly until it reports
-zero remaining.
+zero remaining. `/backfill_examples` is the exception: it re-invokes itself over HTTP
+(authenticated by `WEBHOOK_SECRET`, capped at 40 rounds, and stops itself if a round fills
+nothing) and posts progress to the chat until the whole deck is done, so one tap is enough.
 
 ## Design philosophy
 

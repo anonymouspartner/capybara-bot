@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v90";
+const BUILD_VERSION = "v91";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -210,6 +210,30 @@ Deno.serve(async (req) => {
       JSON.stringify(body),
       { status: 200, headers: { "content-type": "application/json" } },
     );
+  }
+
+  // Internal continuation of a /backfill_examples chain (see runExampleBackfillChain):
+  // a fresh invocation of THIS SAME function, authenticated by a header instead of a
+  // Telegram update, so one round's background execution window never has to cover the
+  // whole backfill. Must stay before the Telegram secret check -- this request carries
+  // no Telegram header at all. depth/chat_id ride in the query string since there is no
+  // Telegram update body to carry them in.
+  if (req.method === "POST" && url.searchParams.has("internal_backfill_examples")) {
+    if (req.headers.get(INTERNAL_CHAIN_HEADER) !== WEBHOOK_SECRET) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    // Number(null) and Number("") both coerce to 0 -- a finite number -- so a MISSING
+    // param must be rejected before Number() ever sees it, or a malformed self-call
+    // would silently run as depth=0/chat_id=0 instead of failing loudly.
+    const depthParam = url.searchParams.get("depth");
+    const chatIdParam = url.searchParams.get("chat_id");
+    const depth = depthParam ? Number(depthParam) : NaN;
+    const chatId = chatIdParam ? Number(chatIdParam) : NaN;
+    if (!Number.isFinite(depth) || !Number.isFinite(chatId)) {
+      return new Response("Bad request", { status: 400 });
+    }
+    scheduleBackgroundWork(`exampleBackfillChain (depth ${depth})`, runExampleBackfillChain(chatId, depth));
+    return new Response("ok");
   }
 
   const secret = req.headers.get("x-telegram-bot-api-secret-token");
@@ -2764,42 +2788,67 @@ async function handleBackfillSenses(msg: any, user: any) {
 // revisited), but each row needs its first-seen message for context, so it runs as a
 // time-boxed background grind like /backfill_senses rather than one batch call.
 
-async function backfillExampleForCard(it: {
-  lemma: string; part_of_speech: string | null; lemmaTranslation: string | null; language: LangCode; otherLanguage: LangCode;
-  sourceText: string; targetText: string;
-}): Promise<{ example: string; example_translation: string | null } | null> {
-  const langName = langMeta(it.language).englishName;
-  const otherName = langMeta(it.otherLanguage).englishName;
-  const answer = it.lemmaTranslation ?? it.lemma;
+async function backfillExamplesForMessage(
+  sourceText: string, targetText: string, language: LangCode, otherLanguage: LangCode,
+  items: Array<{ id: string; lemma: string; part_of_speech: string | null; lemma_translation: string | null }>,
+): Promise<Map<string, { example: string; example_translation: string | null }>> {
+  const out = new Map<string, { example: string; example_translation: string | null }>();
+  if (items.length === 0) return out;
+  const langName = langMeta(language).englishName;
+  const otherName = langMeta(otherLanguage).englishName;
+  const lines = items.map((it, i) => {
+    const answer = it.lemma_translation ?? it.lemma;
+    return `${i + 1}. "${it.lemma}" (${it.part_of_speech ?? "word"}, dictionary translation "${answer}")`;
+  }).join("\n");
   const system =
     `A ${langName} message was translated into ${otherName}:\n` +
-    `${langName}: "${it.sourceText}"\n` +
-    `${otherName}: "${it.targetText}"\n\n` +
-    `The ${langName} word "${it.lemma}" (${it.part_of_speech ?? "word"}, dictionary translation "${answer}") appears somewhere in the ${langName} text above.\n` +
-    `Return ONLY raw JSON: {"example": "<sentence>", "example_translation": "<sentence or null>"}.\n` +
-    `- "example": the ONE sentence from the ${langName} text — copied verbatim, character-for-character, never paraphrased — in which the word appears. Two consecutive sentences only if its sense is unrecoverable from one alone. Never the whole text.\n` +
-    `- "example_translation": the sentence from the ${otherName} text that corresponds to "example" — copied verbatim, never invented or back-translated. Return null if no sentence there actually contains a recognizable form of "${answer}".\n` +
+    `${langName}: "${sourceText}"\n` +
+    `${otherName}: "${targetText}"\n\n` +
+    `Each numbered ${langName} word below appears somewhere in the ${langName} text above. For EACH one, find:\n` +
+    `- "example": the ONE sentence from the ${langName} text — copied verbatim, character-for-character, never paraphrased — in which that word appears. Two consecutive sentences only if its sense is unrecoverable from one alone. Never the whole text.\n` +
+    `- "example_translation": the sentence from the ${otherName} text that corresponds to "example" — copied verbatim, never invented or back-translated. Return null if no sentence there actually contains a recognizable form of that word's dictionary translation.\n\n` +
+    `Words:\n${lines}\n\n` +
+    `Output ONLY a raw JSON array, one object per word, in order: [{"n": 1, "example": "...", "example_translation": "..."|null}, ...]\n` +
     `No markdown fences, no preamble.`;
+  let result;
   try {
-    const result = await withRetry(() => anthropic.messages.create({
-      model: CLAUDE_MODEL, max_tokens: 400, thinking: { type: "disabled" },
-      system, messages: [{ role: "user", content: it.lemma }],
+    result = await withRetry(() => anthropic.messages.create({
+      model: CLAUDE_MODEL, max_tokens: 8192, thinking: { type: "disabled" },
+      system, messages: [{ role: "user", content: "Go." }],
     }));
-    const block = result.content.find((b) => b.type === "text");
-    if (block?.type !== "text") return null;
-    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-    const parsed = JSON.parse(cleaned);
-    const example = typeof parsed?.example === "string" ? parsed.example.trim() : "";
-    if (!example) return null;
-    const exampleTranslation = typeof parsed?.example_translation === "string" ? parsed.example_translation.trim() : "";
-    return { example, example_translation: exampleTranslation || null };
   } catch (e) {
-    console.error("backfillExampleForCard failed:", e);
-    return null;
+    console.error("backfillExamplesForMessage API call failed:", e);
+    return out;
   }
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") return out;
+  let parsed: any;
+  try {
+    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    parsed = JSON.parse(cleaned);
+  } catch {
+    console.error("backfillExamplesForMessage JSON parse failed:", block.text.slice(0, 300));
+    return out;
+  }
+  if (!Array.isArray(parsed)) return out;
+  for (const entry of parsed) {
+    if (typeof entry?.n !== "number") continue;
+    const idx = entry.n - 1;
+    if (idx < 0 || idx >= items.length) continue;
+    const example = typeof entry?.example === "string" ? entry.example.trim() : "";
+    if (!example) continue;
+    const exampleTranslation = typeof entry?.example_translation === "string" ? entry.example_translation.trim() : "";
+    out.set(items[idx].id, { example, example_translation: exampleTranslation || null });
+  }
+  return out;
 }
 
-async function exampleBackfillGrind(chatId: number) {
+type ExampleBackfillResult = {
+  filled: number; failed: number; skippedNoMessage: number;
+  groupsProcessed: number; totalGroups: number; verifiedRemaining: number;
+};
+
+async function exampleBackfillGrind(chatId: number): Promise<ExampleBackfillResult> {
   const startedAt = Date.now();
   const { data: rows, error } = await supabase
     .from("vocabulary")
@@ -2810,10 +2859,13 @@ async function exampleBackfillGrind(chatId: number) {
   if (error) {
     console.error("backfill_examples fetch failed:", error);
     await sendMessage(chatId, "Couldn't fetch vocabulary rows. Check logs.");
-    return;
+    return { filled: 0, failed: 0, skippedNoMessage: 0, groupsProcessed: 0, totalGroups: 0, verifiedRemaining: -1 };
   }
   const pending = (rows ?? []) as any[];
-  if (pending.length === 0) { await sendMessage(chatId, "✅ No more rows to backfill."); return; }
+  if (pending.length === 0) {
+    await sendMessage(chatId, "✅ No more rows to backfill.");
+    return { filled: 0, failed: 0, skippedNoMessage: 0, groupsProcessed: 0, totalGroups: 0, verifiedRemaining: 0 };
+  }
 
   const msgIds = [...new Set(pending.map((v) => v.first_seen_message_id))];
   const msgById = new Map<string, any>();
@@ -2824,8 +2876,13 @@ async function exampleBackfillGrind(chatId: number) {
     for (const m of (ms ?? []) as any[]) msgById.set(m.id, m);
   }
 
-  type Item = { id: string; lemma: string; part_of_speech: string | null; lemmaTranslation: string | null; language: LangCode; otherLanguage: LangCode; sourceText: string; targetText: string };
-  const items: Item[] = [];
+  // Grouped by (message, lemma's own language) rather than one call per row: a message
+  // that introduced several still-pending words shares one API call for all of them,
+  // cutting ~2.7 rows/call to ~1 call/message on this corpus. A message's vocab rows
+  // share v.language in the overwhelming case (the side that message annotated), so the
+  // language key is a defensive split, not the common path.
+  type Group = { sourceText: string; targetText: string; language: LangCode; otherLanguage: LangCode; rows: any[] };
+  const groups = new Map<string, Group>();
   let skippedNoMessage = 0;
   for (const v of pending) {
     const m = msgById.get(v.first_seen_message_id);
@@ -2835,40 +2892,114 @@ async function exampleBackfillGrind(chatId: number) {
     const targetText = isOrig ? m.translated_text : m.original_text;
     const otherLanguage = isOrig ? m.translated_language : m.original_language;
     if (!sourceText || !targetText || !otherLanguage) { skippedNoMessage++; continue; }
-    items.push({ id: v.id, lemma: v.lemma, part_of_speech: v.part_of_speech, lemmaTranslation: v.lemma_translation, language: v.language, otherLanguage, sourceText, targetText });
+    const key = `${v.first_seen_message_id}:${v.language}`;
+    if (!groups.has(key)) groups.set(key, { sourceText, targetText, language: v.language, otherLanguage, rows: [] });
+    groups.get(key)!.rows.push(v);
   }
 
-  let processed = 0, filled = 0, failed = 0;
-  for (let i = 0; i < items.length; i += BACKFILL_CONCURRENCY) {
+  const groupList = [...groups.values()];
+  let filled = 0, failed = 0, groupsProcessed = 0;
+  for (let i = 0; i < groupList.length; i += BACKFILL_CONCURRENCY) {
     if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
-    const chunk = items.slice(i, i + BACKFILL_CONCURRENCY);
-    await Promise.allSettled(chunk.map(async (it) => {
-      const res = await backfillExampleForCard(it);
-      processed++;
-      if (!res) { failed++; return; }
-      const { error: uErr } = await supabase.from("vocabulary")
-        .update({ example: res.example, example_translation: res.example_translation })
-        .eq("id", it.id);
-      if (uErr) { failed++; console.error("backfill_examples update failed:", uErr); } else { filled++; }
+    const chunk = groupList.slice(i, i + BACKFILL_CONCURRENCY);
+    await Promise.allSettled(chunk.map(async (g) => {
+      const items = g.rows.map((v) => ({ id: v.id, lemma: v.lemma, part_of_speech: v.part_of_speech, lemma_translation: v.lemma_translation }));
+      const map = await backfillExamplesForMessage(g.sourceText, g.targetText, g.language, g.otherLanguage, items);
+      groupsProcessed++;
+      for (const v of g.rows) {
+        const res = map.get(v.id);
+        if (!res) { failed++; continue; }
+        const { error: uErr } = await supabase.from("vocabulary")
+          .update({ example: res.example, example_translation: res.example_translation })
+          .eq("id", v.id);
+        if (uErr) { failed++; console.error("backfill_examples update failed:", uErr); } else { filled++; }
+      }
     }));
   }
-  const remaining = items.length - processed;
+
+  // A DB round-trip, not items.length - processed: skippedNoMessage rows are still
+  // "example IS NULL" and will be re-selected (and re-skipped) by the next round, so
+  // only a fresh count reflects what's actually left, the same "verified remaining"
+  // pattern /backfill_translations already uses.
+  const { count: verifiedRemainingRaw } = await supabase
+    .from("vocabulary")
+    .select("id", { count: "exact", head: true })
+    .is("example", null)
+    .not("first_seen_message_id", "is", null);
+  const verifiedRemaining = verifiedRemainingRaw ?? -1;
+
   await sendMessage(chatId,
-    `✅ Example backfill run done.\n` +
-    `Rows checked: ${processed}/${items.length}\n` +
+    `✅ Example backfill round done.\n` +
+    `Messages processed: ${groupsProcessed}/${groupList.length}\n` +
     `Filled: ${filled}\n` +
     (failed > 0 ? `Failed: ${failed}\n` : "") +
     (skippedNoMessage > 0 ? `Skipped (no usable linked message): ${skippedNoMessage}\n` : "") +
-    (remaining > 0
-      ? `\nRan out of time with ${remaining} left — send /backfill_examples again to finish.`
+    `Rows still pending: ${verifiedRemaining}\n` +
+    (verifiedRemaining > 0
+      ? `\nContinuing automatically…`
       : `\n🎉 Whole deck checked. Run /export and re-import into Anki (update existing notes when the first field matches) to refresh the cards — your study progress is kept.`));
+
+  return { filled, failed, skippedNoMessage, groupsProcessed, totalGroups: groupList.length, verifiedRemaining };
+}
+
+// --- Self-chaining: /backfill_examples used to need ~25 manual taps (one per
+// BACKFILL_BUDGET_MS-boxed round). It now runs unattended: each round, if rows remain
+// and the round made real progress, this fires an authenticated request back at the
+// function's OWN url to run the next round as a FRESH invocation -- not a longer-running
+// loop inside this one, since a single invocation's background-execution window is not
+// guaranteed to outlast 10+ rounds. Two hard stops protect a bug from running forever
+// unattended: EXAMPLE_BACKFILL_MAX_CHAIN_DEPTH, and madeNoProgress below.
+const EXAMPLE_BACKFILL_MAX_CHAIN_DEPTH = 40;
+// Reuses WEBHOOK_SECRET rather than a new secret: this proves "this request came from
+// our own function," the same trust WEBHOOK_SECRET already establishes for Telegram's
+// webhook, and provisioning a chained backfill needs no maintainer action to enable.
+const INTERNAL_CHAIN_HEADER = "x-capybara-internal-secret";
+
+async function runExampleBackfillChain(chatId: number, depth: number): Promise<void> {
+  const result = await exampleBackfillGrind(chatId);
+  if (result.verifiedRemaining <= 0) return; // exampleBackfillGrind already sent the finishing message
+
+  if (depth >= EXAMPLE_BACKFILL_MAX_CHAIN_DEPTH) {
+    await sendMessage(chatId,
+      `⏸️ Auto-backfill paused after ${depth} rounds (safety cap) with ${result.verifiedRemaining} left.\n\nSend /backfill_examples to continue.`);
+    return;
+  }
+  // Every group this round was looked at (not cut short by the time budget) and NONE
+  // produced a fill: every remaining row is either failing outright or -- once
+  // groupsProcessed reaches 0 groups because everything left is skippedNoMessage --
+  // permanently unfillable. Either way, another round would just repeat this one.
+  const madeNoProgress = result.filled === 0 && result.groupsProcessed >= result.totalGroups;
+  if (madeNoProgress) {
+    await sendMessage(chatId,
+      `⚠️ Auto-backfill stopped: last round filled 0 of ${result.totalGroups} messages (${result.verifiedRemaining} rows still pending) — it isn't making progress. Check function logs.\n\nSend /backfill_examples to try again by hand.`);
+    return;
+  }
+
+  scheduleBackgroundWork(`exampleBackfillChainNext (${depth + 1})`, (async () => {
+    let resp: Response;
+    try {
+      resp = await fetch(`${SUPABASE_URL}/functions/v1/telegram-bot?internal_backfill_examples=1&depth=${depth + 1}&chat_id=${chatId}`, {
+        method: "POST",
+        headers: { [INTERNAL_CHAIN_HEADER]: WEBHOOK_SECRET },
+      });
+    } catch (e) {
+      console.error("example backfill chain self-invoke failed:", e);
+      await sendMessage(chatId, "⚠️ Auto-backfill couldn't continue itself (network error). Send /backfill_examples to resume.");
+      return;
+    }
+    if (!resp.ok) {
+      console.error(`example backfill chain self-invoke failed: HTTP ${resp.status}`);
+      await sendMessage(chatId, `⚠️ Auto-backfill couldn't continue itself (HTTP ${resp.status}). Send /backfill_examples to resume.`);
+    }
+  })());
 }
 
 async function handleBackfillExamples(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
-  await sendMessage(msg.chat.id, "⏳ Filling in short example sentences for older vocabulary rows — I'll report when this run finishes.");
-  scheduleBackgroundWork("exampleBackfillGrind", exampleBackfillGrind(msg.chat.id));
+  await sendMessage(msg.chat.id, "⏳ Filling in short example sentences for older vocabulary rows — this now keeps going on its own until it's done; I'll post progress as it runs.");
+  scheduleBackgroundWork("exampleBackfillChain", runExampleBackfillChain(msg.chat.id, 0));
 }
+
 
 // --- /backfill_glosses: put each gloss back into the LEARNER's language -------------
 // A gloss is meant to be in the OPPOSITE language to its lemma -- that is the language of
