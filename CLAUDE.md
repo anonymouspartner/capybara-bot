@@ -83,11 +83,27 @@ Optional (enable the admin `/update` self-deploy command; the feature is inert i
 `/update` only reports version status, no deploy button), `GITHUB_REPO` (`owner/name`),
 `GITHUB_DEPLOY_BRANCH` (defaults to `main`).
 
-Optional (enable the `/bug` report command; inert if unset): `GITHUB_ISSUE_TOKEN` (GitHub PAT
+Optional (enable the admin `/bug` report command; inert if unset): `GITHUB_ISSUE_TOKEN` (GitHub PAT
 with `Issues: write` — files issues on `GITHUB_REPO`). Falls back to `GITHUB_DEPLOY_TOKEN`, which
 then needs both `Issues: write` and `Actions: write`; keeping them separate means the issue-filing
 token can't dispatch a production deploy. `/bug` sends only the text the reporter types — never
 conversation content — but that text does leave the instance for GitHub.
+
+## Repo topology (important)
+
+Two repos exist under `anonymouspartner`:
+
+| Repo | Visibility | State |
+|---|---|---|
+| `capybara-bot` | **public** | active — this is the one that ships, and what `GITHUB_REPO` names |
+| `capybara` | private | **archived** (predecessor; archived repos can't take issues) |
+
+**The working repo is public.** Never commit conversation content, a partner's real details, or
+anything from the corpus — code, docs and `.env.example` placeholders only. It also means a `/bug`
+issue is **world-readable**, which is why `/bug` is **admin-only**: the non-admin partner can't
+judge where the text lands, and a warning in a prompt is not consent. If bug reports ever need to
+be private, add a `GITHUB_ISSUE_REPO` secret pointing at a *new* private repo rather than reusing
+the archived one.
 
 ## Environment notes (this laptop)
 
