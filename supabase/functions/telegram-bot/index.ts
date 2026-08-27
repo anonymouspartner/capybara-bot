@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v89";
+const BUILD_VERSION = "v90";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1811,6 +1811,14 @@ async function debouncedAlbumFlush(mediaGroupId: string, user: any) {
   }
 }
 
+// Telegram's legacy Markdown uses a single "_" for italics. part_of_speech is shown
+// inside one ( _(${pos})_ ), so a value containing its own underscore -- "phrasal_verb"
+// slipped through annotation at least once -- would close the span early and garble the
+// line. Escaping is the general fix: it holds even for a pos value nobody has seen yet.
+function mdEscapeItalicSlot(value: string): string {
+  return value.replace(/_/g, "\\_");
+}
+
 function csvEscape(value: string | null | undefined): string {
   const s = value ?? "";
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
@@ -2148,7 +2156,7 @@ function formatVocabSection(
     return [`${flag} *${label} deck*${headerSuffix}\n_All top words already added._`];
   }
   const lines = words.map((w: any, i: number) => {
-    const pos = w.part_of_speech ? ` _(${w.part_of_speech})_` : "";
+    const pos = w.part_of_speech ? ` _(${mdEscapeItalicSlot(w.part_of_speech)})_` : "";
     const gloss = w.gloss ?? "?";
     return `${i + 1}. *${w.lemma}*${pos} \u2014 ${gloss} _(${w.occurrence_count}\u00d7)_`;
   });
@@ -2284,7 +2292,7 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
     return;
   }
   const lines = unlearned.map((v: any, i: number) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
+    const pos = v.part_of_speech ? ` _(${mdEscapeItalicSlot(v.part_of_speech)})_` : "";
     const gloss = v.gloss ?? "?";
     return `${i + 1}. *${v.lemma}*${pos} \u2014 ${gloss}`;
   });
@@ -2372,7 +2380,7 @@ async function handleLearn(msg: any, user: any) {
     return;
   }
   const lines = toAdd.map((v: any) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
+    const pos = v.part_of_speech ? ` _(${mdEscapeItalicSlot(v.part_of_speech)})_` : "";
     const gloss = v.gloss ?? "?";
     return `\u2022 *${v.lemma}*${pos} \u2014 ${gloss}`;
   });
@@ -2437,7 +2445,7 @@ async function handleForget(msg: any, user: any) {
   const deletedIds = new Set(deleted.map((r: any) => r.vocabulary_id));
   const removed = vocabRows.filter((v: any) => deletedIds.has(v.id));
   const lines = removed.map((v: any) => {
-    const pos = v.part_of_speech ? ` _(${v.part_of_speech})_` : "";
+    const pos = v.part_of_speech ? ` _(${mdEscapeItalicSlot(v.part_of_speech)})_` : "";
     const gloss = v.gloss ?? "?";
     return `\u2022 *${v.lemma}*${pos} \u2014 ${gloss}`;
   });
@@ -2599,17 +2607,17 @@ async function handleBackfillTranslations(msg: any, user: any) {
   const updates = [...ukMap.entries(), ...enMap.entries()];
   let succeeded = 0;
   let failed = 0;
-  if (updates.length > 0) {
-    const upsertRows = updates.map(([id, translation]) => ({ id, lemma_translation: translation }));
-    const { error: upsertErr } = await supabase
-      .from("vocabulary")
-      .upsert(upsertRows, { onConflict: "id" });
-    if (upsertErr) {
-      console.error("backfill_translations upsert failed:", upsertErr);
-      failed = updates.length;
-    } else {
-      succeeded = updates.length;
-    }
+  // Individual UPDATEs, not a bare upsert({ onConflict: "id" }): PostgREST turns that
+  // upsert into INSERT ... ON CONFLICT (id) DO UPDATE, and Postgres validates NOT NULL
+  // constraints on the candidate row BEFORE it even checks for a conflict. A payload of
+  // only {id, lemma_translation} is missing lemma/language (NOT NULL, no default), so
+  // every such call failed outright -- this was the entire reason /backfill_translations
+  // could never make progress, not the null-translation branch below. Every row here is
+  // already known to exist (its id came from the SELECT above), so a plain UPDATE is not
+  // just the fix but the correct operation -- there is no insert case to cover.
+  for (const [id, translation] of updates) {
+    const { error: updErr } = await supabase.from("vocabulary").update({ lemma_translation: translation }).eq("id", id);
+    if (updErr) { failed++; console.error("backfill_translations update failed:", updErr); } else { succeeded++; }
   }
   const untranslated = rows.length - (ukMap.size + enMap.size);
   const { count: stillRemaining } = await supabase
