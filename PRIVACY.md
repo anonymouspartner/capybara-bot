@@ -61,7 +61,9 @@ One further service is contacted **only when you explicitly invoke it**, never d
 |---|---|---|
 | **GitHub** | `/bug` files an issue on the repository named by your own `GITHUB_REPO` secret, using your own token | You are the token holder and the repository's owner or collaborator. |
 
-`/bug` sends **only the text you type in that command** — no messages, no translations, no vocabulary, no notes. It is the one path by which text you enter can leave your instance for a destination other than the three services above, and an issue is subject to the **visibility of that repository**: on a public repo it is world-readable. Don't paste anything private into a bug report. The command is inert unless `GITHUB_REPO` and an issue-capable token are both configured.
+`/bug` sends **only the text you type in that command** — no messages, no translations, no vocabulary, no notes. It is the one path by which text you enter can leave your instance for a destination other than the three services above, and an issue is subject to the **visibility of that repository**: on a public repo it is world-readable.
+
+For that reason `/bug` is **restricted to the admin** (the `ADMIN_TELEGRAM_ID` user), who owns the repository and can judge what belongs in a public issue. The other partner cannot file one; they are told to pass the problem to the admin instead. The command is inert unless `GITHUB_REPO` and an issue-capable token are both configured.
 
 No data is sent to any service using a key, account, or intermediary controlled by the authors of this repository.
 

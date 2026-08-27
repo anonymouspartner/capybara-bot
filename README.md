@@ -463,7 +463,6 @@ since `setMyCommands` is flat and can't express the tree; **every command still 
 | `/forget <word>` | Remove a word from the matching deck |
 | `/export` | Export vocabulary decks **and your grammar corrections** as a single Anki CSV |
 | `/capybara` · `/capybara on\|off` | Toggle a private grammar coach for your learning language (per person, off by default) |
-| `/bug <what went wrong>` | File a GitHub issue on the bot's repo (needs `GITHUB_ISSUE_TOKEN`; sends only what you type) |
 | `/help` · `/start` | Help / welcome |
 
 > `/recap` has a 24-hour cooling-off on **messages** (recent messages don't surface),
@@ -480,8 +479,9 @@ since `setMyCommands` is flat and can't express the tree; **every command still 
   conversation), but `/recap` answers are generated per-asker.
 - **Your keys, your data.** You bring your own Anthropic and OpenAI keys; nothing is
   routed through a shared service.
-- **`/bug` is the one opt-in outbound path.** It sends only the text you type to GitHub,
-  never conversation content, and only when you run it. See `PRIVACY.md` §4.
+- **`/bug` is the one opt-in outbound path**, and it is **admin-only**. It sends only the
+  text the admin types to GitHub, never conversation content. The repo is public, so those
+  issues are world-readable. See `PRIVACY.md` §4.
 
 ## Admin & maintenance commands
 
@@ -491,6 +491,7 @@ an existing corpus** — new instances can ignore them.
 | Command | Does |
 |---|---|
 | `/diag` | Ping Anthropic, Whisper, and embeddings; report recent DB activity |
+| `/bug <what went wrong>` | File a GitHub issue (needs `GITHUB_ISSUE_TOKEN`). Admin-only because the repo is **public** — issues are world-readable |
 | `/backfill` | Annotate one batch of un-annotated messages |
 | `/backfill_translations` | Fill in missing cross-language lemma translations, one batch |
 | `/backfill_senses` | Re-derive flashcard translations so each matches its example sentence |
