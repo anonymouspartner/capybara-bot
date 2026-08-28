@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v91";
+const BUILD_VERSION = "v92";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1047,6 +1047,7 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
     `  * example is the ONE sentence from the input text \u2014 copied verbatim, character-for-character, never paraphrased or shortened \u2014 in which the word appears in the form actually used. Use two consecutive sentences only if the word's sense is unrecoverable from one alone. This becomes the front of a flashcard, so it must never be the whole input.\n` +
     `  * example_translation is the sentence from the accepted translation (given below under SENSE ANCHOR, if present) that corresponds to "example" \u2014 copied verbatim from that translation, never invented or back-translated. If the translation renders that stretch idiomatically and no sentence there actually contains a recognizable form of lemma_translation, return null rather than a sentence that doesn't support the answer. Return null whenever no SENSE ANCHOR translation is given below.\n` +
     `  * SKIP: prepositions, conjunctions, particles, interjections, pronouns, numerals, proper nouns (names of people/places).\n` +
+    `  * SKIP any word whose only occurrence in the text is inside source code, markup, a URL, or a similar non-prose span (e.g. a CSS/HTML/JSON snippet) — such an occurrence is not real ${langName} usage and would make a nonsense flashcard.\n` +
     `  * For homographs (same lemma, different part of speech), return separate entries.\n` +
     `- "grammar": array of grammatical features used (e.g., ${grammarExamples})\n` +
     `- "idioms": array of any idiomatic expressions\n` +
@@ -2807,6 +2808,7 @@ async function backfillExamplesForMessage(
     `Each numbered ${langName} word below appears somewhere in the ${langName} text above. For EACH one, find:\n` +
     `- "example": the ONE sentence from the ${langName} text — copied verbatim, character-for-character, never paraphrased — in which that word appears. Two consecutive sentences only if its sense is unrecoverable from one alone. Never the whole text.\n` +
     `- "example_translation": the sentence from the ${otherName} text that corresponds to "example" — copied verbatim, never invented or back-translated. Return null if no sentence there actually contains a recognizable form of that word's dictionary translation.\n\n` +
+    `If a word's only occurrence in the ${langName} text is inside source code, markup, a URL, or a similar non-prose span (e.g. a CSS/HTML/JSON snippet), that is not real ${langName} usage — return null for both "example" and "example_translation" for that word rather than quoting the code.\n\n` +
     `Words:\n${lines}\n\n` +
     `Output ONLY a raw JSON array, one object per word, in order: [{"n": 1, "example": "...", "example_translation": "..."|null}, ...]\n` +
     `No markdown fences, no preamble.`;
