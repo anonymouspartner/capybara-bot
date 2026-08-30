@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v92";
+const BUILD_VERSION = "v93";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1201,13 +1201,14 @@ async function sendVoice(chatId: number, voiceFileId: string, caption?: string) 
   });
 }
 
-async function sendVideo(chatId: number, videoFileId: string, caption?: string) {
+async function sendVideo(chatId: number, videoFileId: string, caption?: string): Promise<boolean> {
   const resp = await fetch(`${TELEGRAM_API}/sendVideo`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, video: videoFileId, caption }),
   });
   if (!resp.ok) console.error("sendVideo failed:", resp.status, await resp.text().catch(() => "<no body>"));
+  return resp.ok;
 }
 
 async function sendPhoto(chatId: number, photoFileId: string, caption?: string) {
@@ -1220,14 +1221,20 @@ async function sendPhoto(chatId: number, photoFileId: string, caption?: string) 
 }
 
 // Round "video note" messages (recorded in Telegram) — the API takes no caption,
-// so any attribution must be sent as a separate text message.
-async function sendVideoNote(chatId: number, videoNoteFileId: string) {
+// so any attribution must be sent as a separate text message. Telegram refuses these
+// (and voice notes) with VOICE_MESSAGES_FORBIDDEN when the recipient's own Telegram
+// privacy setting for "Voice and Video Messages" excludes non-contacts, which a bot
+// always is — the caller needs to know this happened rather than assume delivery.
+async function sendVideoNote(chatId: number, videoNoteFileId: string): Promise<{ ok: boolean; forbidden: boolean }> {
   const resp = await fetch(`${TELEGRAM_API}/sendVideoNote`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, video_note: videoNoteFileId }),
   });
-  if (!resp.ok) console.error("sendVideoNote failed:", resp.status, await resp.text().catch(() => "<no body>"));
+  if (resp.ok) return { ok: true, forbidden: false };
+  const body = await resp.text().catch(() => "<no body>");
+  console.error("sendVideoNote failed:", resp.status, body);
+  return { ok: false, forbidden: body.includes("VOICE_MESSAGES_FORBIDDEN") };
 }
 
 async function sendDocument(chatId: number, fileName: string, content: string, mimeType: string, caption?: string) {
@@ -1552,7 +1559,14 @@ async function handleVideoMessage(msg: any, user: any) {
       await sendMessage(msg.chat.id, "\ud83c\udfa5 Got your video message, but there's no partner to forward it to yet.");
       return;
     }
-    await sendVideoNote(partner.telegram_id, msg.video_note.file_id);
+    const result = await sendVideoNote(partner.telegram_id, msg.video_note.file_id);
+    if (!result.ok) {
+      const reason = result.forbidden
+        ? "your partner's Telegram privacy setting for \"Voice and Video Messages\" is blocking messages from this bot \u2014 they can fix it under Settings \u2192 Privacy and Security \u2192 Voice Messages \u2192 Everybody"
+        : "Telegram rejected it";
+      await sendMessage(msg.chat.id, `\ud83c\udfa5 Couldn't deliver your video message \u2014 ${reason}. Try sending it as a regular video instead.`);
+      return;
+    }
     await sendMessage(partner.telegram_id, `\ud83c\udfa5 ${senderName} sent a video message.`);
     await sendMessage(msg.chat.id, "\ud83c\udfa5 Video message forwarded to your partner.");
     return;
@@ -1565,8 +1579,8 @@ async function handleVideoMessage(msg: any, user: any) {
     return;
   }
   const partnerCaption = caption ? `\ud83c\udfa5 ${senderName}: ${caption}` : `\ud83c\udfa5 ${senderName} sent a video.`;
-  await sendVideo(partner.telegram_id, msg.video.file_id, partnerCaption);
-  await sendMessage(msg.chat.id, "\ud83c\udfa5 Video forwarded to your partner.");
+  const sent = await sendVideo(partner.telegram_id, msg.video.file_id, partnerCaption);
+  await sendMessage(msg.chat.id, sent ? "\ud83c\udfa5 Video forwarded to your partner." : "\ud83c\udfa5 Couldn't deliver your video \u2014 Telegram rejected it.");
 }
 
 // Photos are forwarded as-is by Telegram file_id (no download/translation step),
