@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v93";
+const BUILD_VERSION = "v94";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -288,16 +288,20 @@ async function handleUpdate(update: any) {
           ? `Send a photo, file, GIF, or audio with a caption and I'll translate the caption into your study corpus too.\n\n`
           : `You can also send photos, videos, files, stickers, GIFs, audio, locations, and contacts — I'll forward them to the other person, and translate any caption.\n\n`;
         const tail = solo
-          ? `Everything is saved as your personal study corpus, searchable with /recap.\n\nType /help to see what I can do.`
-          : `Everything is saved as a study corpus.\n\nType /help to see what I can do.`;
-        // Attach the menu here: a reply keyboard only appears once a message carries it,
-        // and /start is the one command every user runs first.
+          ? `Everything is saved as your personal study corpus, searchable with /recap.\n\n`
+          : `Everything is saved as a study corpus.\n\n`;
+        // Deliberately NO keyboard on /start. Sending a reply keyboard always displays it,
+        // and the menu is meant to stay folded away behind the grid button in the compose
+        // row -- popping it open on the one command every user runs first is exactly the
+        // behaviour that button exists to avoid. /menu is the way to summon it (and the
+        // way to get the button back if a chat ever loses the keyboard entirely).
         await sendMessage(m.chat.id,
           `Hi ${u.display_name}! Send me text or voice in ${langLabel(u.native_language)} or ${langLabel(u.learning_language)} and I'll translate between them.\n\n` +
-          media + tail,
-          undefined,
-          buildMenuKeyboard("main", m.from?.id === BACKFILL_ADMIN_TELEGRAM_ID)); } },
+          media + tail +
+          `Tap the grid button next to the paperclip for the menu. If you don't see it, send /menu.\n\n` +
+          `Type /help to see what I can do.`); } },
     { match: t => t === "/help",                                                        handle: handleHelp },
+    { match: t => isCmd(t, "menu"),                                                     handle: handleMenu },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
@@ -1365,9 +1369,10 @@ async function ensureCommandsRegistered(): Promise<void> {
 // EMPTY (see deleteMyCommands above) rather than duplicating this tree; every command
 // still works when typed, and /help still lists them all.
 //
-// The keyboard is COLLAPSED, not pinned open (see buildMenuKeyboard): it lives behind the
-// grid icon in the compose row, so the chat is not permanently shortened by a block of
-// buttons nobody is using mid-conversation.
+// The keyboard is HIDDEN, not pinned open: it lives behind the grid button in the compose
+// row and is only ever displayed when the user asks for it. Nothing the bot sends carries
+// it -- not /start, not /help (see buildMenuKeyboard for why sending one always unfolds
+// it) -- so the two ways in are that button and the /menu command.
 //
 // The load-bearing detail: a reply-keyboard tap arrives as an ORDINARY TEXT MESSAGE
 // carrying the button's label -- there is no callback_data. In a translation bot that
@@ -2090,7 +2095,7 @@ async function handleHelp(msg: any, user: any) {
       "",
       "\u0414\u0432\u0456 \u043a\u043e\u043b\u043e\u0434\u0438: \ud83c\uddfa\ud83c\udde6 \u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0456 \ud83c\uddec\ud83c\udde7 \u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430.",
       "",
-      "\u041a\u043d\u043e\u043f\u043a\u0438 \u043c\u0435\u043d\u044e \u2014 \u0432\u043d\u0438\u0437\u0443 \u0435\u043a\u0440\u0430\u043d\u0430. \u0423\u0441\u0456 \u043a\u043e\u043c\u0430\u043d\u0434\u0438 \u0442\u0430\u043a\u043e\u0436 \u043f\u0440\u0430\u0446\u044e\u044e\u0442\u044c, \u044f\u043a\u0449\u043e \u0457\u0445 \u043d\u0430\u0431\u0440\u0430\u0442\u0438.",
+      "Кнопки меню — за значком сітки поряд зі скріпкою. Натисни його, щоб відкрити Освіту й Пам'ять. /menu — якщо значка не видно. Усі команди також працюють, якщо їх набрати.",
       "",
       solo
         ? "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u043c\u0456\u0436 \u0442\u0432\u043e\u0457\u043c\u0438 \u0434\u0432\u043e\u043c\u0430 \u043c\u043e\u0432\u0430\u043c\u0438"
@@ -2098,6 +2103,7 @@ async function handleHelp(msg: any, user: any) {
       solo
         ? "\u2022 \u0414\u043e\u0434\u0430\u0439 \u043f\u0456\u0434\u043f\u0438\u0441 \u0434\u043e \u0444\u043e\u0442\u043e/\u0444\u0430\u0439\u043b\u0443 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0439\u043e\u0433\u043e \u0443 \u0442\u0432\u0456\u0439 \u043a\u043e\u0440\u043f\u0443\u0441"
         : "\u2022 \u041d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0444\u043e\u0442\u043e \u0430\u0431\u043e \u0432\u0456\u0434\u0435\u043e \u2014 \u044f \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u0439\u043e\u0433\u043e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
+      "\u2022 /menu — Відкрити кнопки меню",
       "\u2022 /vocab \u2014 \u041d\u0430\u0439\u0447\u0430\u0441\u0442\u0456\u0448\u0456 \u0441\u043b\u043e\u0432\u0430, \u0449\u0435 \u043d\u0435 \u0432\u0438\u0432\u0447\u0435\u043d\u0456",
       "\u2022 /learn <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0414\u043e\u0434\u0430\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0434\u043e \u043a\u043e\u043b\u043e\u0434\u0438",
       "\u2022 /learn top N \u2014 \u041e\u043f\u0442\u043e\u043c \u0434\u043e\u0434\u0430\u0442\u0438 N \u0441\u043b\u0456\u0432",
@@ -2121,7 +2127,7 @@ async function handleHelp(msg: any, user: any) {
       "",
       "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
       "",
-      "Menu buttons are at the bottom of the screen. Every command below also works typed.",
+      "Menu buttons live behind the grid button next to the paperclip — tap it for Education and Memory. /menu if you don't see it. Every command below also works typed.",
       "",
       solo
         ? "\u2022 Just type or send a voice message \u2014 I translate it between your two languages"
@@ -2130,6 +2136,7 @@ async function handleHelp(msg: any, user: any) {
         ? "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it into your study corpus"
         : "\u2022 Send a photo, video, file, sticker, GIF, audio, location, or contact \u2014 I forward it to the other person",
       "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it and add it to your study corpus",
+      "\u2022 /menu \u2014 Open the button menu",
       "\u2022 /vocab \u2014 Top words still unlearned in each deck",
       "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
       "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",
@@ -2163,10 +2170,18 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /update \u2014 Check GitHub for a newer build; deploy with one tap");
     lines.push("\u2022 /bug <what went wrong> \u2014 File a GitHub issue (PUBLIC repo)");
   }
-  // /help re-attaches the keyboard too, so it is the recovery path if the keyboard was
-  // ever dismissed outright (Telegram's "hide keyboard" is per-user and we never see it
-  // happen). Merely folded away is not dismissed -- the grid icon reopens that itself.
-  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown", buildMenuKeyboard("main", isAdmin));
+  // No keyboard here either: /help is read far more often than the menu is wanted, and
+  // attaching one would unfold the menu every time. /help names /menu instead, which is
+  // the single command that does open it.
+  await sendMessage(msg.chat.id, lines.join("\n"), "Markdown");
+}
+
+// The only command that deliberately opens the keyboard. Everything else leaves it
+// folded behind the compose-row grid button, so this is both "show me the menu" for
+// anyone who would rather type than tap and the repair for a chat that has no grid
+// button at all -- one sendMessage carrying a reply keyboard re-registers it.
+async function handleMenu(msg: any, _user: any) {
+  await showMenu(msg.chat.id, "main", msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID);
 }
 
 async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit: number): Promise<any[]> {
