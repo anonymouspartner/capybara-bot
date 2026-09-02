@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v92";
+const BUILD_VERSION = "v93";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -337,8 +337,10 @@ async function handleUpdate(update: any) {
       // reply-driven handler can never mistake the prompt for the message to act on.
       const { reply_to_message: _prompt, ...rest } = msg;
       effective = { ...rest, text: answered };
-      // Telegram dropped the menu keyboard when it showed the reply box; have this
-      // command's own reply carry it back, in the submenu the button was tapped from.
+      // Telegram dropped the menu keyboard when it showed the reply box -- and with it
+      // the grid icon that reopens it, since there is nothing left to reopen. Have this
+      // command's own reply carry the keyboard back, in the submenu the button was
+      // tapped from; it folds away again on the next tap like any other.
       pendingKeyboardRestore = {
         chatId: msg.chat.id,
         isAdmin: msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID,
@@ -1358,10 +1360,14 @@ async function ensureCommandsRegistered(): Promise<void> {
 
 // --- Branched reply-keyboard menu --------------------------------------------------
 // The "/" list (setMyCommands) is flat by design -- Telegram has no nesting in it -- so
-// the browsable menu is a ReplyKeyboardMarkup instead: persistent buttons under the
-// compose box, where a category button swaps the keyboard for its submenu. The "/" list
-// is registered EMPTY (see deleteMyCommands above) rather than duplicating this tree;
-// every command still works when typed, and /help still lists them all.
+// the browsable menu is a ReplyKeyboardMarkup instead: buttons under the compose box,
+// where a category button swaps the keyboard for its submenu. The "/" list is registered
+// EMPTY (see deleteMyCommands above) rather than duplicating this tree; every command
+// still works when typed, and /help still lists them all.
+//
+// The keyboard is COLLAPSED, not pinned open (see buildMenuKeyboard): it lives behind the
+// grid icon in the compose row, so the chat is not permanently shortened by a block of
+// buttons nobody is using mid-conversation.
 //
 // The load-bearing detail: a reply-keyboard tap arrives as an ORDINARY TEXT MESSAGE
 // carrying the button's label -- there is no callback_data. In a translation bot that
@@ -1459,12 +1465,24 @@ const MENU_ITEM_BY_LABEL: Map<string, MenuItem> = (() => {
 
 // Render one menu as a reply keyboard, dropping admin-only buttons for everyone else so
 // the partner never sees (or can tap) the admin branch.
+//
+// one_time_keyboard (and NOT is_persistent) is what keeps the menu out of the way: this
+// is a translation chat first, and a menu wedged above the compose box permanently ate a
+// third of the screen. With one_time_keyboard the buttons fold away the moment one is
+// tapped, and Telegram parks the keyboard behind the grid icon in the compose row -- one
+// tap there brings this same menu back, at whichever level it was last left. Setting
+// is_persistent: true would pin it open AND remove that icon, so the two are mutually
+// exclusive: the icon exists precisely because the keyboard is collapsible.
+//
+// Opening a submenu still shows it immediately -- a freshly sent reply_markup is always
+// displayed -- so a category tap folds one keyboard and unfolds the next, which reads as
+// navigation rather than as a keyboard flickering shut.
 function buildMenuKeyboard(menuName: string, isAdmin: boolean): any {
   const rows = MENUS[menuName] ?? MENUS.main;
   const keyboard = rows
     .map((row) => row.filter((item) => !item.adminOnly || isAdmin).map((item) => ({ text: item.label })))
     .filter((row) => row.length > 0);
-  return { keyboard, resize_keyboard: true, is_persistent: true };
+  return { keyboard, resize_keyboard: true, one_time_keyboard: true };
 }
 
 const MENU_TITLES: Record<string, string> = {
@@ -2146,7 +2164,8 @@ async function handleHelp(msg: any, user: any) {
     lines.push("\u2022 /bug <what went wrong> \u2014 File a GitHub issue (PUBLIC repo)");
   }
   // /help re-attaches the keyboard too, so it is the recovery path if the keyboard was
-  // ever dismissed (Telegram's "hide keyboard" is per-user and we never see it happen).
+  // ever dismissed outright (Telegram's "hide keyboard" is per-user and we never see it
+  // happen). Merely folded away is not dismissed -- the grid icon reopens that itself.
   await sendMessage(msg.chat.id, lines.join("\n"), "Markdown", buildMenuKeyboard("main", isAdmin));
 }
 

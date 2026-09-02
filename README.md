@@ -444,9 +444,11 @@ A few things keep a fresh instance reproducible from the committed files alone:
 Send **`/help`** in the bot for the full, language-aware list — the everyday commands
 also appear in Telegram's **`/` menu** (admin commands show only to the admin). Highlights:
 
-Commands are browsable from a **branched menu keyboard** under the compose box —
-`🎓 Education`, `🧠 Memory`, and `⚙️ Admin` (admin only) — each opening a submenu with a
-back button. `/help` is deliberately not on it: it still works typed. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
+Commands are browsable from a **branched menu keyboard** that folds away behind the grid
+icon in the compose row (tap it to bring the menu back) — `🎓 Education`, `🧠 Memory`, and
+`⚙️ Admin` (admin only) — each opening a submenu with a back button. It is deliberately
+*not* pinned open: this is a chat first, and the buttons collapse again after each tap.
+`/help` is deliberately not on it: it still works typed. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
 open a reply prompt. Telegram's `/` list is registered **empty** (`deleteMyCommands`, both
 scopes), since `setMyCommands` is flat and can't express the tree — and with nothing to list,
 clients have nothing to show behind the compose-box menu button, which Telegram otherwise
