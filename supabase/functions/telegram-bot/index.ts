@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v95";
+const BUILD_VERSION = "v96";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -306,6 +306,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
     { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
+    { match: t => isCmd(t, "pronounce"),                                                 handle: handlePronounce },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
     { match: t => isCmd(t, "bug"),                                                       handle: handleBug },
     { match: t => isCmd(t, "backfill_grammar"),                                          handle: handleBackfillGrammar },
@@ -1472,7 +1473,8 @@ const MENUS: Record<string, MenuItem[][]> = {
      { label: "➕ Вивчити · Learn", command: "/learn", prompt: ARG_PROMPTS["/learn"] }],
     [{ label: "➖ Забути · Forget", command: "/forget", prompt: ARG_PROMPTS["/forget"] },
      { label: "📤 Експорт · Export", command: "/export" }],
-    [{ label: "🐹 Граматика · Grammar", command: "/capybara" }],
+    [{ label: "🐹 Граматика · Grammar", command: "/capybara" },
+     { label: "🗣️ Вимова · Pronounce", command: "/pronounce" }],
     [{ label: BACK_TO_MAIN, menu: "main" }],
   ],
   memory: [
@@ -2132,6 +2134,145 @@ async function exportRun(chatId: number, user: any) {
   await sendDocument(chatId, filename, csv, "text/csv", caption);
 }
 
+// --- /pronounce -------------------------------------------------------------
+// Builds the phrase list for a pronunciation deck and sends it out as JSON. The
+// .apkg itself is NOT built here: packaging needs genanki (Python), which can't
+// run in a Deno edge function, so the split is deliberate --
+//   bot  -> picks the phrases (a DB query, which is what Deno is good at)
+//   you  -> scripts/anki_pronunciation turns them into the .apkg with real audio
+// Keeping generation off GitHub Actions also keeps corpus text off a public
+// repo's world-readable runner logs. See scripts/anki_pronunciation/README.md.
+
+// Locales Azure AI Speech can score with Pronunciation Assessment (what the AnkiPA
+// add-on drives). Ukrainian has NO Azure model, so a uk deck is a listen-and-repeat
+// deck rather than a graded one -- the caption says so instead of letting the deck
+// silently fail to score. Mirrors AZURE_ASSESSABLE_LOCALES in phrases.py; if
+// Microsoft adds uk-UA, both lists change together.
+const PRONUNCIATION_LOCALES: Record<string, string> = {
+  en: "en-US", uk: "uk-UA", es: "es-ES", fr: "fr-FR",
+  de: "de-DE", it: "it-IT", pt: "pt-PT", pl: "pl-PL",
+};
+const AZURE_ASSESSABLE_LOCALES = new Set([
+  "ar-EG", "ar-SA", "ca-ES", "zh-HK", "zh-CN", "zh-TW", "da-DK", "nl-NL",
+  "en-AU", "en-CA", "en-IN", "en-GB", "en-US", "fi-FI", "fr-CA", "fr-FR",
+  "de-DE", "hi-IN", "it-IT", "ja-JP", "ko-KR", "ms-MY", "nb-NO", "pl-PL",
+  "pt-BR", "pt-PT", "ru-RU", "es-MX", "es-ES", "sv-SE", "ta-IN", "th-TH",
+  "vi-VN",
+]);
+const PRONOUNCE_DEFAULT_LIMIT = 40;
+const PRONOUNCE_MAX_LIMIT = 200;
+
+async function handlePronounce(msg: any, user: any) {
+  // "/pronounce", "/pronounce uk", "/pronounce uk 60", "/pronounce 60" all work.
+  // Language defaults to what the requester is learning -- the side they need to
+  // pronounce -- and the count to PRONOUNCE_DEFAULT_LIMIT.
+  const args = (msg.text ?? "").trim().split(/\s+/).slice(1);
+  let lang: LangCode = user.learning_language;
+  let limit = PRONOUNCE_DEFAULT_LIMIT;
+  for (const arg of args) {
+    const parsedLang = parseLangArg(arg);
+    if (parsedLang) { lang = parsedLang; continue; }
+    const n = Number.parseInt(arg, 10);
+    if (Number.isFinite(n) && n > 0) limit = Math.min(n, PRONOUNCE_MAX_LIMIT);
+  }
+  await sendMessage(msg.chat.id, `⏳ Collecting ${langFlag(lang)} phrases…`);
+  scheduleBackgroundWork("pronounceRun", pronounceRun(msg.chat.id, lang, limit));
+}
+
+async function pronounceRun(chatId: number, lang: LangCode, limit: number) {
+  // occurrence_count defaults to 1 and is only recomputed by this RPC, so ordering by
+  // it without refreshing first ranks by a stale number. /vocab does the same thing for
+  // the same reason; a failure here degrades the ordering, not the command.
+  try { await refreshVocabularyCounts(); }
+  catch (e) { console.error("refreshVocabularyCounts failed:", e); }
+
+  // Over-fetch: the same sentence reaches us through several lemmas, and dedupe
+  // below trims it back. Ordered by occurrence_count so you drill what you say, and
+  // filtered to > 0 to match vocab_top_unlearned -- a zero-count row is one whose
+  // annotations are gone, so it isn't something you actually say.
+  const { data: rows, error } = await supabase
+    .from("vocabulary")
+    .select("id, lemma, lemma_translation, example, example_translation, occurrence_count")
+    .eq("language", lang)
+    .gt("occurrence_count", 0)
+    .order("occurrence_count", { ascending: false })
+    .limit(limit * 3);
+
+  if (error) {
+    console.error("pronounce query failed:", error);
+    await sendMessage(chatId, "Couldn't collect phrases. Check function logs.");
+    return;
+  }
+
+  type Phrase = { id: string; text: string; translation: string; hint?: string; source: string };
+  const phrases: Phrase[] = [];
+  const seen = new Set<string>();
+  let wrongScript = 0;
+  for (const row of (rows ?? []) as any[]) {
+    // Prefer the short model-extracted sentence: a real sentence is what you
+    // actually want to pronounce. Rows annotated before that column existed fall
+    // back to the bare lemma rather than being dropped.
+    let example = (row.example ?? "").trim();
+    const lemma = (row.lemma ?? "").trim();
+    // Same guard /export applies to this column: a stored example can be in the WRONG
+    // script for the card's language (the linked message was misattributed). Shipping
+    // one here is worse than in a CSV -- it would be synthesized in the wrong language's
+    // voice and handed to Azure as the wrong locale -- so fall back to the lemma, which
+    // is in the row's own language by construction.
+    if (example && !exampleScriptMatchesLanguage(example, lang)) {
+      wrongScript++;
+      example = "";
+    }
+    const phrase: Phrase | null = example
+      ? { id: `vocab:${row.id}`, text: example, translation: (row.example_translation ?? "").trim(), hint: lemma, source: "example" }
+      : lemma
+      ? { id: `vocab:${row.id}`, text: lemma, translation: (row.lemma_translation ?? "").trim(), source: "lemma" }
+      : null;
+    if (!phrase) continue;
+    const key = phrase.text.replace(/\s+/g, " ").toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    phrases.push(phrase);
+    if (phrases.length >= limit) break;
+  }
+
+  if (phrases.length === 0) {
+    await sendMessage(chatId,
+      `No ${langLabel(lang)} vocabulary yet, so there's nothing to pronounce.\n\n` +
+      `Chat for a while (or use /learn) to build the corpus first.`);
+    return;
+  }
+
+  const locale = PRONUNCIATION_LOCALES[lang] ?? lang;
+  const assessable = AZURE_ASSESSABLE_LOCALES.has(locale);
+  const today = new Date().toISOString().slice(0, 10);
+  // Schema string is the compatibility handshake with scripts/anki_pronunciation:
+  // the script refuses a file it doesn't recognize rather than half-reading it.
+  const payload = {
+    schema: "capybara.pronunciation.v1",
+    generated_at: new Date().toISOString(),
+    language: lang,
+    locale,
+    deck: `Capybara::Pronunciation::${langLabel(lang)}`,
+    assessable,
+    phrases,
+  };
+
+  if (wrongScript > 0) {
+    console.warn(`pronounce: fell back to the lemma for ${wrongScript} row(s) whose example was in the wrong script.`);
+  }
+
+  const caption =
+    `${langFlag(lang)} ${phrases.length} ${langLabel(lang)} phrase${phrases.length === 1 ? "" : "s"} for pronunciation practice.\n\n` +
+    `Build the deck:\n` +
+    `\`python -m scripts.anki_pronunciation --phrases <this file>\`\n\n` +
+    (assessable
+      ? `AnkiPA will score these (${locale}). After importing, set AnkiPA → Card fields to "TargetText".`
+      : `⚠️ Azure has no pronunciation model for ${locale}, so AnkiPA can't grade these yet — the deck works as listen-and-repeat with reference audio.`);
+
+  await sendDocument(chatId, `phrases-${lang}-${today}.json`, JSON.stringify(payload, null, 2), "application/json", caption);
+}
+
 async function refreshVocabularyCounts() {
   const { error } = await supabase.rpc("refresh_vocabulary_counts");
   if (error) throw error;
@@ -2162,6 +2303,7 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /learn top N \u2014 \u041e\u043f\u0442\u043e\u043c \u0434\u043e\u0434\u0430\u0442\u0438 N \u0441\u043b\u0456\u0432",
       "\u2022 /forget <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0412\u0438\u0434\u0430\u043b\u0438\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0437 \u043a\u043e\u043b\u043e\u0434\u0438",
       "\u2022 /export \u2014 \u0417\u0430\u0432\u0430\u043d\u0442\u0430\u0436\u0438\u0442\u0438 CSV \u0434\u043b\u044f Anki",
+      "\u2022 /pronounce \u2014 \u0424\u0440\u0430\u0437\u0438 \u0434\u043b\u044f \u0442\u0440\u0435\u043d\u0443\u0432\u0430\u043d\u043d\u044f \u0432\u0438\u043c\u043e\u0432\u0438",
       "\u2022 /capybara \u2014 \u041f\u0435\u0440\u0435\u0432\u0456\u0440\u043a\u0430 \u0433\u0440\u0430\u043c\u0430\u0442\u0438\u043a\u0438 \u043c\u043e\u0432\u0438, \u044f\u043a\u0443 \u0432\u0438\u0432\u0447\u0430\u0454\u0448 (\u0443\u0432\u0456\u043c\u043a/\u0432\u0438\u043c\u043a)",
       "",
       "*\u041f\u0430\u043c'\u044f\u0442\u044c \u0440\u043e\u0437\u043c\u043e\u0432*",
@@ -2195,6 +2337,7 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",
       "\u2022 /forget <word> \u2014 Remove a word from the matching deck",
       "\u2022 /export \u2014 Download both decks as a single CSV for Anki",
+      "\u2022 /pronounce \u2014 Phrases for pronunciation practice (Anki + AnkiPA)",
       "\u2022 /capybara \u2014 Toggle grammar checks on the language you're learning",
       "",
       "*Conversation memory*",

@@ -7,3 +7,12 @@ supabase/.temp/
 .env
 .env.*
 !.env.example
+
+# Pronunciation-deck generator: synthesized audio, built decks, and any phrase
+# list exported from the corpus. Generated audio is Vika's voice and the phrase
+# lists are conversation-derived — this repo is public, so none of it is committable.
+__pycache__/
+scripts/anki_pronunciation/.cache/
+scripts/anki_pronunciation/dist/
+*.apkg
+phrases-*.json

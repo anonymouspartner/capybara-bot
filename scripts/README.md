@@ -4,6 +4,21 @@ Developer utilities for capybara-bot. Nothing here is imported by the bot
 (`supabase/functions/telegram-bot/index.ts`) or the deploy path — these are
 off-to-the-side tools you run by hand.
 
+## `anki_pronunciation/` — pronunciation decks for Anki + AnkiPA
+
+Builds an Anki `.apkg` whose note type is laid out for the [AnkiPA](https://github.com/warleysr/ankipa)
+add-on (Azure pronunciation scoring), with reference audio attached. Pairs with the
+bot's `/pronounce` command, which emits the phrase list this consumes.
+
+Needs `genanki` (`pip install -r scripts/anki_pronunciation/requirements.txt`) — the only
+pip dependency anywhere in this repo. Read `scripts/anki_pronunciation/README.md` first:
+Azure cannot score Ukrainian, and OpenAI has no public custom-voice API, and both facts
+shape how you'd use it.
+
+```bash
+python -m scripts.anki_pronunciation --lang uk --dry-run   # no API calls, no cost
+```
+
 ## `model_latency_bench.py` — Sonnet 5 vs Opus 4.8 latency
 
 Measures how much faster `claude-sonnet-5` is than `claude-opus-4-8` on the bot's

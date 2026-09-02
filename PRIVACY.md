@@ -55,11 +55,25 @@ The bot makes API calls to three external services in the course of normal opera
 | **OpenAI** (Whisper + embeddings) | Voice transcription, semantic search embeddings | You are the API key holder and account holder. Data is sent under your OpenAI account's terms. |
 | **Telegram** | Message delivery and webhook | You are the bot owner registered with @BotFather. |
 
-One further service is contacted **only when you explicitly invoke it**, never during normal message handling:
+Two further services are contacted **only when you explicitly invoke them**, never during normal message handling:
 
 | Service | Purpose | Your relationship |
 |---|---|---|
 | **GitHub** | `/bug` files an issue on the repository named by your own `GITHUB_REPO` secret, using your own token | You are the token holder and the repository's owner or collaborator. |
+| **A text-to-speech provider** (ElevenLabs, Azure Speech, or OpenAI TTS — whichever you configure) | The pronunciation-deck generator sends it the phrases you are practising, and it returns the reference audio | You are the API key holder and account holder. |
+
+### The pronunciation-deck generator
+
+`scripts/anki_pronunciation/` is a **local tool you run by hand**, not part of the bot. The bot's `/pronounce` command only assembles a phrase list and sends it to you in Telegram; nothing leaves your instance at that point.
+
+When you then build a deck, two kinds of data can leave:
+
+- **The phrases themselves** — drawn from your vocabulary, which is derived from your conversations — are sent to whichever TTS provider you configure, so it can speak them.
+- **A voiceprint**, if you use a *cloned* voice. Training a clone means uploading recordings of a real person's speech to that vendor. That is a decision about **someone else's** voice: if the voice is your partner's, it is theirs to agree to, and a setting in a config file is not consent.
+
+The `local` provider avoids both concerns for the audio: it reads recordings from a folder on your own machine and contacts no vendor at all. It is also the most faithful reference, being an actual person rather than a model's approximation of one.
+
+Generated decks, cached audio, and exported phrase lists are all gitignored, because the working repository is public.
 
 `/bug` sends **only the text you type in that command** — no messages, no translations, no vocabulary, no notes. It is the one path by which text you enter can leave your instance for a destination other than the three services above, and an issue is subject to the **visibility of that repository**: on a public repo it is world-readable.
 
@@ -67,7 +81,7 @@ For that reason `/bug` is **restricted to the admin** (the `ADMIN_TELEGRAM_ID` u
 
 No data is sent to any service using a key, account, or intermediary controlled by the authors of this repository.
 
-You should review the privacy policies and data processing agreements of Anthropic, OpenAI, and Telegram — and of GitHub, if you enable `/bug` — to understand how those services handle data sent to them directly under your account.
+You should review the privacy policies and data processing agreements of Anthropic, OpenAI, and Telegram — of GitHub, if you enable `/bug` — and of your chosen text-to-speech provider, if you build pronunciation decks — to understand how those services handle data sent to them directly under your account.
 
 ---
 
