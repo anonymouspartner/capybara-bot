@@ -1,0 +1,8 @@
+# Only third-party dependency of the pronunciation-deck generator.
+# Everything else in this package is stdlib.
+#
+#   python3 -m pip install -r scripts/anki_pronunciation/requirements.txt
+#
+# Nothing here is installed by CI or the deploy path — the bot itself is Deno
+# and never imports this package.
+genanki>=0.13.0
