@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v94";
+const BUILD_VERSION = "v95";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -372,6 +372,16 @@ async function handleUpdate(update: any) {
     if (effective !== msg) {
       console.error(`menu: no command matched rewritten text ${JSON.stringify(effective.text)}`);
       await sendMessage(msg.chat.id, "That menu button is pointing at a command I don't have. Try typing the command instead.");
+      return;
+    }
+    // A bare "/word" that matched nothing is not conversation either -- it is almost
+    // always a stale entry in a client's cached "/" list (see deleteMyCommands: those
+    // lists outlive the build that wrote them). Left to fall through it would be
+    // translated and forwarded, dropping "/education" into the partner's chat as though
+    // it had been said out loud.
+    if (/^\/[A-Za-z][A-Za-z0-9_]{0,31}(@[A-Za-z0-9_]+)?$/.test(effective.text.trim())) {
+      console.error(`unknown command ${JSON.stringify(effective.text.trim())}`);
+      await sendMessage(msg.chat.id, "I don't have that command \u2014 your app may be showing an old menu. Send /menu for the buttons, or /help for everything I can do.");
       return;
     }
   }
@@ -1320,11 +1330,26 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
 // to show behind that button. Every command still works when TYPED, and /help still
 // lists them all -- only the autocomplete popup goes away.
 //
-// Commands are stored per SCOPE, so clearing the default scope alone would strand the
-// admin's chat-scoped list, which this bot used to set. Both scopes are cleared.
-async function deleteMyCommands(scope?: unknown): Promise<boolean> {
+// Clearing the DEFAULT scope alone does not empty anybody's "/" list. Telegram resolves
+// it by walking from the most specific scope to the least -- chat, then all_private_chats,
+// then default -- and inside each scope it prefers the entry written for the user's
+// language over the language-less one. The first match wins, so a single leftover in a
+// narrower scope keeps serving commands forever while the default scope sits empty.
+//
+// That is not hypothetical: a pre-v86 build wrote a Ukrainian, chat-scoped list, and the
+// non-admin partner's client was still offering /education and /memory -- commands this
+// build does not have -- long after they were removed. Tapping one sent bare "/education"
+// as a message, which the bot then dutifully translated and forwarded to the partner.
+//
+// So clear the whole matrix: every scope this bot has ever written, in every language it
+// has ever written one in. Deleting a list that was never set is a no-op, which makes
+// over-deleting the cheap and safe direction.
+const COMMAND_LANGUAGES: (string | undefined)[] = [undefined, "en", "uk"];
+
+async function deleteMyCommands(scope?: unknown, languageCode?: string): Promise<boolean> {
   const body: Record<string, unknown> = {};
   if (scope) body.scope = scope;
+  if (languageCode) body.language_code = languageCode;
   const resp = await fetch(`${TELEGRAM_API}/deleteMyCommands`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1351,15 +1376,43 @@ let commandsRegistered = false;
 // Register the "/" menu once per warm instance (self-heals on each cold start /
 // deploy, picking up any command changes). The flag flips only after success, so a
 // transient failure retries on the next request rather than waiting for a cold start.
+// Every chat that could be carrying a chat-scoped list. The admin's id is known from a
+// secret; the partner's is only in the DB, and it was the PARTNER whose list went stale,
+// so reading the users table is the point rather than an optimisation.
+async function chatsWithPossibleCommandLists(): Promise<number[]> {
+  const ids = new Set<number>();
+  if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) ids.add(BACKFILL_ADMIN_TELEGRAM_ID);
+  const { data, error } = await supabase.from("users").select("telegram_id");
+  if (error) console.error("users read for command cleanup failed:", error);
+  for (const row of data ?? []) {
+    const id = Number(row.telegram_id);
+    if (Number.isFinite(id)) ids.add(id);
+  }
+  return [...ids];
+}
+
 async function ensureCommandsRegistered(): Promise<void> {
   if (commandsRegistered) return;
-  const okPublic = await deleteMyCommands();
-  let okAdmin = true;
-  if (!Number.isNaN(BACKFILL_ADMIN_TELEGRAM_ID)) {
-    okAdmin = await deleteMyCommands({ type: "chat", chat_id: BACKFILL_ADMIN_TELEGRAM_ID });
+  const scopes: (unknown | undefined)[] = [
+    undefined,                        // default
+    { type: "all_private_chats" },
+    { type: "all_group_chats" },
+  ];
+  for (const chatId of await chatsWithPossibleCommandLists()) {
+    scopes.push({ type: "chat", chat_id: chatId });
+  }
+  let ok = true;
+  for (const scope of scopes) {
+    for (const language of COMMAND_LANGUAGES) {
+      // Not short-circuited: one failing combination must not skip the rest, and the
+      // flag below only flips when the whole matrix came back clean, so a partial pass
+      // retries on the next request instead of leaving a stale list in place.
+      const cleared = await deleteMyCommands(scope, language);
+      ok = cleared && ok;
+    }
   }
   const okMenuButton = await setChatMenuButtonToCommands();
-  if (okPublic && okAdmin && okMenuButton) commandsRegistered = true;
+  if (ok && okMenuButton) commandsRegistered = true;
 }
 
 // --- Branched reply-keyboard menu --------------------------------------------------

@@ -450,8 +450,10 @@ opening a submenu with a back button. Nothing the bot sends unfolds it (sending 
 keyboard always displays it, so neither `/start` nor `/help` carries one): this is a chat
 first, and the two ways in are that button and **`/menu`**. The buttons fold away again
 after each tap. `/help` is deliberately not on the menu: it still works typed. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
-open a reply prompt. Telegram's `/` list is registered **empty** (`deleteMyCommands`, both
-scopes), since `setMyCommands` is flat and can't express the tree — and with nothing to list,
+open a reply prompt. Telegram's `/` list is registered **empty** (`deleteMyCommands` across every
+scope and language the bot has ever written one in — a client resolves the list from the
+narrowest scope outwards, so one leftover keeps serving dead commands while the default
+scope sits empty), since `setMyCommands` is flat and can't express the tree — and with nothing to list,
 clients have nothing to show behind the compose-box menu button, which Telegram otherwise
 gives no way to hide. **Every command still works typed**, and `/help` lists them all; only
 the autocomplete popup is gone.
