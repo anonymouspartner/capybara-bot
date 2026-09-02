@@ -191,6 +191,11 @@ class LocalRecordings:
     """
 
     def __init__(self, directory: str | Path, manifest: str | Path | None = None):
+        # Guard the empty string explicitly: Path("") is Path("."), which passes
+        # is_dir(), so an unset CAPYBARA_RECORDINGS_DIR would otherwise fail later
+        # with a confusing "manifest not found: manifest.json".
+        if not str(directory).strip():
+            raise TTSError("CAPYBARA_RECORDINGS_DIR must be set for provider 'local'")
         self._dir = Path(directory)
         if not self._dir.is_dir():
             raise TTSError(f"CAPYBARA_RECORDINGS_DIR does not exist: {self._dir}")
@@ -290,15 +295,18 @@ class AudioCache:
         self.misses = 0
 
     @staticmethod
-    def digest(text: str, provider: TTSProvider) -> str:
-        key = f"{provider.identity}\x00{' '.join(text.split())}"
+    def digest(text: str, provider: TTSProvider, locale: str = "") -> str:
+        # locale is part of the key because AzureTTS puts it in the SSML: the same
+        # sentence under two locales is genuinely different audio, and without this
+        # the second deck would silently reuse the first deck's pronunciation.
+        key = f"{provider.identity}\x00{locale}\x00{' '.join(text.split())}"
         return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
-    def media_name(self, text: str, provider: TTSProvider) -> str:
-        return f"capy_pron_{self.digest(text, provider)}.mp3"
+    def media_name(self, text: str, provider: TTSProvider, locale: str = "") -> str:
+        return f"capy_pron_{self.digest(text, provider, locale)}.mp3"
 
     def get_or_synthesize(self, text: str, provider: TTSProvider, *, locale: str) -> Path:
-        path = self._dir / self.media_name(text, provider)
+        path = self._dir / self.media_name(text, provider, locale)
         if path.is_file() and path.stat().st_size > 0:
             self.hits += 1
             return path

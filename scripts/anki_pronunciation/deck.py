@@ -25,10 +25,18 @@ import genanki
 from .phrases import PhraseSet
 from .tts import AudioCache, TTSProvider
 
-# Fixed forever. genanki keys the note type on this id; generating a fresh one per
+# Fixed forever. genanki keys the note type on these ids; generating a fresh one per
 # run would make every export a brand-new note type, so re-imports would stack up
 # duplicate "Capybara Pronunciation-a1b2c" models instead of merging.
-MODEL_ID = 1742395011
+#
+# TWO ids, because the scorable and shadowing decks carry DIFFERENT templates (one
+# promises Ctrl+W scoring, the other says there is none). Anki keys a note type by id
+# and the last import wins, so sharing one id between them would let the English deck
+# overwrite the Ukrainian deck's template -- leaving Ukrainian cards advertising a
+# score they cannot get, or English cards missing the cue. Separate ids means both
+# decks can live in one collection, each telling the truth.
+MODEL_ID_ASSESSABLE = 1742395011
+MODEL_ID_SHADOW = 1742395012
 
 FIELDS = ["TargetText", "ReferenceAudio", "Translation", "Language", "Hint", "SourceId"]
 
@@ -113,14 +121,14 @@ SHADOW_NOTICE = """
 
 
 def build_model(assessable: bool) -> genanki.Model:
-    """The note type. `assessable` only swaps the on-card cue text.
+    """The note type. `assessable` picks the scorable or the shadowing variant.
 
-    The model ID and field list stay identical either way, so the Ukrainian and
-    English decks share one note type in Anki and AnkiPA needs configuring once.
+    The FIELD LIST is identical either way -- same names, same order -- so AnkiPA's
+    "Card fields" setting (TargetText) is configured once and applies to both.
     """
     return genanki.Model(
-        MODEL_ID,
-        "Capybara Pronunciation",
+        MODEL_ID_ASSESSABLE if assessable else MODEL_ID_SHADOW,
+        "Capybara Pronunciation" if assessable else "Capybara Pronunciation (shadowing)",
         fields=[{"name": name} for name in FIELDS],
         templates=[{
             "name": "Listen and Speak",

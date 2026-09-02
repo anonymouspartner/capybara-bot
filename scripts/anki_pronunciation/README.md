@@ -90,8 +90,13 @@ Card fields: `TargetText`** (leave *Text extraction method* on **Fields only**).
 
 ## Configuration
 
-None of this belongs in Supabase function secrets — the bot never runs this code.
-Put it in a local `.env` or your shell. See the matching block in `.env.example`.
+Copy `scripts/anki_pronunciation/.env.example` to `scripts/anki_pronunciation/.env`
+(gitignored), or just export these in your shell.
+
+**Keep them out of the repo-root `.env`.** `provision.sh` and `setup.ts` both run
+`supabase secrets set --env-file .env`, which uploads *every* key in that file to the
+Supabase project — and the edge function never runs this code, so these credentials
+would sit in the bot's runtime environment with nothing to use them.
 
 | Variable | Needed when | Notes |
 |---|---|---|
