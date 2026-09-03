@@ -14,5 +14,7 @@ supabase/.temp/
 __pycache__/
 scripts/anki_pronunciation/.cache/
 scripts/anki_pronunciation/dist/
+scripts/anki_pronunciation/.autopull-state.json
+scripts/anki_pronunciation/.autopull.log
 *.apkg
 phrases-*.json

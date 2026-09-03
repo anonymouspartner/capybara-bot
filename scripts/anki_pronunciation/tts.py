@@ -38,6 +38,47 @@ _RETRIES = 3
 _TIMEOUT = 120
 
 
+def log_usage(model: str, characters: int, feature: str = "pronunciation_tts") -> None:
+    """Record one billable TTS call in the bot's `api_usage` ledger.
+
+    The bot has no ElevenLabs integration and deliberately holds no TTS credentials --
+    it can't meter this spend itself, so the side that actually spends it writes the row.
+    The API key stays local; only the character count and price leave this machine.
+
+    Best-effort in every direction: silent no-op when Supabase isn't configured (which is
+    the normal case for `--phrases` runs), and a logging failure warns rather than losing
+    a deck that has already been paid for and built.
+    """
+    url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not url or not key:
+        return
+    # Mirrors CHARACTER_RATES in the bot's index.ts; keep the two in step.
+    cost = (characters / 1000) * 0.30
+    body = json.dumps({
+        "provider": "elevenlabs",
+        "model": model,
+        "feature": feature,
+        "characters": characters,
+        "cost_usd": round(cost, 6),
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{url}/rest/v1/api_usage",
+        data=body,
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:  # never fail a build over metering
+        print(f"  ! usage logging failed (deck is unaffected): {e}")
+
+
 class TTSError(RuntimeError):
     pass
 
@@ -97,7 +138,7 @@ class ElevenLabsTTS:
             "model_id": self._model,
             "voice_settings": self._settings,
         }).encode("utf-8")
-        return _post(
+        audio = _post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{self._voice}"
             "?output_format=mp3_44100_128",
             data=body,
@@ -107,6 +148,10 @@ class ElevenLabsTTS:
                 "Accept": "audio/mpeg",
             },
         )
+        # Logged here, not in AudioCache: ElevenLabs bills per character synthesized, so
+        # a cache hit costs nothing and must not appear in the ledger.
+        log_usage(self._model, len(text))
+        return audio
 
 
 class OpenAITTS:

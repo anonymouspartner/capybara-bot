@@ -108,10 +108,27 @@ would sit in the bot's runtime environment with nothing to use them.
 | `OPENAI_API_KEY` | `openai` | the key the bot already uses |
 | `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION` | `azure` | you need these for AnkiPA anyway |
 | `CAPYBARA_RECORDINGS_DIR` | `local` | folder + `manifest.json` mapping phrase → filename |
-| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | `--lang` only | not needed with `--phrases` |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | `--lang`; optional otherwise | needed to read the vocabulary table, and (when set) also used to log TTS spend — see below |
 | `TELEGRAM_BOT_TOKEN` | `--send-to` only | same token the bot uses |
 
 ---
+
+## Cost logging
+
+When `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set, each **real** synthesis call
+writes one row to the bot's `api_usage` table (provider, model, characters, price), so
+`/annotate_ab cost` in Telegram can report TTS spend next to the bot's own Claude and
+OpenAI spend. The bot can't meter this itself — it has no ElevenLabs integration and holds
+no TTS credentials — so the side that spends the money records it.
+
+Only the character count and computed price leave this machine; **`ELEVENLABS_API_KEY`
+never does**, and never belongs in the repo-root `.env`. Cache hits log nothing, because a
+cache hit costs nothing. Without Supabase configured this is a silent no-op, and a logging
+failure only warns — it never loses a deck you've already paid to build.
+
+The price uses an *effective* rate (plan price ÷ plan character quota), since ElevenLabs
+bills a monthly quota rather than per call. Keep it in step with `CHARACTER_RATES` in
+`index.ts`.
 
 ## The AnkiPA field contract
 
