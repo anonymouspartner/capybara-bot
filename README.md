@@ -507,7 +507,22 @@ an existing corpus** — new instances can ignore them.
 | `/backfill_examples` | Fill in the short verbatim example sentence pair for older vocabulary rows. **Self-chaining** — one tap runs it to completion; every other backfill still needs re-tapping |
 | `/backfill_grammar` | Fill in card fields (blank target, dictionary form, meaning) for older corrections |
 | `/recap_backfill` | Embed one batch of existing messages for `/recap` |
-| `/annotate_ab` | Compare annotation models on recent messages — reports quality, tokens, cost. Writes nothing |
+| `/annotate_ab` | Compare annotation models on recent messages — reports quality, tokens, cost. Writes nothing (beyond its own cost-ledger rows) |
+| `/annotate_ab cost` | Report **measured** API spend from the `api_usage` ledger — totals for 24h / 7d / 30d / all-time, broken down by provider and call site. Calls no models, so it's free |
+
+Every paid API call the bot makes — all eleven Claude call sites, plus Whisper
+transcription and embeddings — writes one row to `api_usage` as it happens, priced at call
+time from the rate tables at the top of `index.ts`. Writes are fire-and-forget, so metering
+can never delay or break a reply. `/annotate_ab cost` reads that ledger back.
+
+ElevenLabs lines in the report come from `scripts/anki_pronunciation/`, not the bot: the
+edge function has no ElevenLabs integration and holds no TTS credentials, so the deck
+generator writes its own rows using the service role key. Its price is an *effective* rate
+(plan price ÷ plan character quota), since ElevenLabs bills a monthly quota rather than
+per call — see `CHARACTER_RATES`.
+
+The ledger starts filling from the first call after the build that added it; it cannot
+reconstruct spend from before that.
 
 Each backfill command is **idempotent and batched** — run it repeatedly until it reports
 zero remaining. `/backfill_examples` is the exception: it re-invokes itself over HTTP

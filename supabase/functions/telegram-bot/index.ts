@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v96";
+const BUILD_VERSION = "v97";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -39,12 +39,51 @@ const CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 // Defaults to CLAUDE_MODEL, i.e. no behavior change until deliberately switched.
 const ANNOTATION_MODEL: string = CLAUDE_MODEL;
 
-// USD per million tokens, used only by the /annotate_ab cost report. Standard
-// (post-introductory) rates, so the projection reflects steady-state spend.
+// Billing rates for every paid API the bot calls, used by logApiUsage to price each
+// call as it happens and by the /annotate_ab cost report to total them up. Standard
+// (post-introductory) rates, so figures reflect steady-state spend.
+//
+// USD per million tokens.
 const MODEL_RATES: Record<string, { input: number; output: number }> = {
   "claude-sonnet-5": { input: 3, output: 15 },
   "claude-haiku-4-5-20251001": { input: 1, output: 5 },
+  "text-embedding-3-small": { input: 0.02, output: 0 },
 };
+
+// USD per minute of audio. Whisper bills on the duration it actually transcribed,
+// which is why transcription reads `duration` off the verbose_json response rather
+// than trusting Telegram's reported voice duration.
+const AUDIO_RATES: Record<string, { perMinute: number }> = {
+  "whisper-1": { perMinute: 0.006 },
+};
+
+// USD per 1000 characters. ElevenLabs actually bills a monthly character quota, not
+// per-call usage, so this is an EFFECTIVE rate: (plan price / plan character quota).
+// Update it when the plan changes, otherwise TTS lines in the cost report drift.
+// These rows come from scripts/anki_pronunciation/, never from the bot itself.
+const CHARACTER_RATES: Record<string, { per1kChars: number }> = {
+  "eleven_multilingual_v2": { per1kChars: 0.30 },
+};
+
+// An unknown model prices at 0 rather than throwing: a new model should degrade the
+// cost report, not break the call site that logged it.
+function costUsd(model: string, inputTokens: number, outputTokens: number): number {
+  const rate = MODEL_RATES[model];
+  if (!rate) return 0;
+  return (inputTokens * rate.input + outputTokens * rate.output) / 1_000_000;
+}
+
+function audioCostUsd(model: string, seconds: number): number {
+  const rate = AUDIO_RATES[model];
+  if (!rate) return 0;
+  return (seconds / 60) * rate.perMinute;
+}
+
+function characterCostUsd(model: string, characters: number): number {
+  const rate = CHARACTER_RATES[model];
+  if (!rate) return 0;
+  return (characters / 1000) * rate.per1kChars;
+}
 
 const BACKFILL_ADMIN_TELEGRAM_ID = Number(Deno.env.get("ADMIN_TELEGRAM_ID"));
 
@@ -170,6 +209,44 @@ function scheduleBackgroundWork(label: string, work: Promise<unknown>) {
   } else {
     work.catch((e) => console.error(`${label} failed:`, e));
   }
+}
+
+// Record one billable API call. Deliberately fire-and-forget: metering is never worth
+// delaying a reply for, and a logging failure must not surface as a failed translation.
+// Callers pass raw units (tokens / audio seconds / characters) and the price is fixed
+// here at call time, because the rate tables above drift as vendors reprice.
+function logApiUsage(entry: {
+  provider: "anthropic" | "openai" | "elevenlabs";
+  model: string;
+  feature: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  audioSeconds?: number;
+  characters?: number;
+}) {
+  const inputTokens = entry.inputTokens ?? 0;
+  const outputTokens = entry.outputTokens ?? 0;
+  const audioSeconds = entry.audioSeconds ?? 0;
+  const characters = entry.characters ?? 0;
+  const cost = costUsd(entry.model, inputTokens, outputTokens)
+    + audioCostUsd(entry.model, audioSeconds)
+    + characterCostUsd(entry.model, characters);
+  // Wrapped in an async IIFE rather than handed the query builder directly: PostgREST
+  // returns failures in `error` instead of rejecting, so scheduleBackgroundWork's .catch
+  // would never fire and a broken ledger would look healthy.
+  scheduleBackgroundWork(`logApiUsage(${entry.feature})`, (async () => {
+    const { error } = await supabase.from("api_usage").insert({
+      provider: entry.provider,
+      model: entry.model,
+      feature: entry.feature,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      audio_seconds: audioSeconds,
+      characters,
+      cost_usd: cost,
+    });
+    if (error) console.error(`logApiUsage(${entry.feature}) insert failed:`, error.message);
+  })());
 }
 
 Deno.serve(async (req) => {
@@ -535,6 +612,10 @@ async function classifyLanguageLLM(text: string, defaultLang: LangCode, otherLan
       system: `Identify which language a message is written in. It is either ${dm.englishName} (code "${defaultLang}") or ${om.englishName} (code "${otherLangCode}"). Reply with ONLY one token: ${defaultLang}, ${otherLangCode}, or unsure. No punctuation, no explanation. If it is a proper noun, a shared cognate, or too short to tell, reply unsure.`,
       messages: [{ role: "user", content: text }],
     }));
+    logApiUsage({
+      provider: "anthropic", model: CLAUDE_HAIKU_MODEL, feature: "classify_language",
+      inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+    });
     const block = result.content.find((b) => b.type === "text");
     const ans = block?.type === "text" ? block.text.trim().toLowerCase() : "";
     if (ans === defaultLang) return defaultLang;
@@ -778,6 +859,10 @@ async function translate(
     console.error("translate API call failed:", e);
     return null;
   }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_MODEL, feature: "translate",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type === "text") { LAST_TRANSLATE_ERROR = null; return block.text.trim(); }
   LAST_TRANSLATE_ERROR = `no text block in response (got: ${result.content.map((b) => b.type).join(", ")})`;
@@ -874,6 +959,10 @@ async function checkGrammar(text: string, learnLang: LangCode, nativeLang: LangC
     console.error("checkGrammar API call failed:", e);
     return null;
   }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_MODEL, feature: "grammar_check",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type !== "text") return null;
   let parsed: any;
@@ -991,6 +1080,14 @@ async function whisperRequest(audioBlob: Blob, language?: string): Promise<Whisp
     if (resp.ok) {
       try {
         const data = await resp.json();
+        // Billed on the audio duration OpenAI actually processed, which verbose_json
+        // reports back -- more accurate than Telegram's voice.duration, and logged per
+        // successful attempt so a retried clip bills once per call that really landed.
+        // Logged before the empty-transcript bail: a 200 with no text was still charged.
+        logApiUsage({
+          provider: "openai", model: "whisper-1", feature: "transcribe",
+          audioSeconds: typeof data.duration === "number" ? data.duration : 0,
+        });
         const text = typeof data.text === "string" ? data.text.trim() : "";
         if (!text) return { ok: false, error: "Whisper returned an empty transcript." };
         const detectedLanguage = typeof data.language === "string" ? data.language.toLowerCase() : "";
@@ -1080,9 +1177,13 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
 // annotateMessage, which persists the result, and by the A/B harness, which does not.
 type AnnotationRun = { parsed: any | null; inputTokens: number; outputTokens: number; ms: number };
 
+// `feature` separates the two callers in the cost ledger: the live path bills as
+// "annotate", the A/B harness as "annotate_ab_harness". The harness writes nothing to
+// the domain tables but still spends real money, so it belongs in the ledger -- just not
+// mixed into per-message annotation cost.
 async function runAnnotation(
   model: string, text: string, language: LangCode, otherLanguage: LangCode,
-  parallelText?: string, label = "",
+  parallelText?: string, label = "", feature = "annotate",
 ): Promise<AnnotationRun> {
   const started = Date.now();
   let result;
@@ -1103,6 +1204,10 @@ async function runAnnotation(
     outputTokens: result.usage?.output_tokens ?? 0,
     ms: Date.now() - started,
   };
+  logApiUsage({
+    provider: "anthropic", model, feature,
+    inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type !== "text") return { parsed: null, ...usage };
   if (result.stop_reason === "max_tokens") {
@@ -1495,6 +1600,7 @@ const MENUS: Record<string, MenuItem[][]> = {
      { label: "⬆️ Оновлення · Update", command: "/update", adminOnly: true }],
     [{ label: "✂️ Приклади · Examples", command: "/backfill_examples", adminOnly: true },
      { label: "🧪 A/B анотацій · Annotate A/B", command: "/annotate_ab", adminOnly: true }],
+    [{ label: "💰 Витрати · API spend", command: "/annotate_ab cost", adminOnly: true }],
     [{ label: "🐛 Повідомити ваду · Report a bug", command: "/bug", prompt: ARG_PROMPTS["/bug"], adminOnly: true }],
     [{ label: BACK_TO_MAIN, menu: "main" }],
   ],
@@ -2459,6 +2565,10 @@ async function lemmatize(word: string, language: LangCode): Promise<string | nul
       messages: [{ role: "user", content: word }],
     }));
   } catch (e) { console.error("lemmatize API call failed:", e); return null; }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_MODEL, feature: "lemmatize",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type !== "text") return null;
   try {
@@ -2813,6 +2923,10 @@ async function translateLemmasBatch(
     console.error("translateLemmasBatch API call failed:", e);
     return out;
   }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_MODEL, feature: "backfill_translations",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type !== "text") return out;
   let parsed: any;
@@ -2922,6 +3036,10 @@ async function resenseCard(it: {
       model: CLAUDE_MODEL, max_tokens: 200, thinking: { type: "disabled" },
       system, messages: [{ role: "user", content: it.lemma }],
     }));
+    logApiUsage({
+      provider: "anthropic", model: CLAUDE_MODEL, feature: "backfill_senses",
+      inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+    });
     const block = result.content.find((b) => b.type === "text");
     if (block?.type !== "text") return null;
     const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
@@ -3052,6 +3170,10 @@ async function backfillExamplesForMessage(
     console.error("backfillExamplesForMessage API call failed:", e);
     return out;
   }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_MODEL, feature: "backfill_examples",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type !== "text") return out;
   let parsed: any;
@@ -3289,6 +3411,10 @@ async function reglossLemmasBatch(
     console.error("reglossLemmasBatch API call failed:", e);
     return out;
   }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_MODEL, feature: "backfill_glosses",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type !== "text") return out;
   let parsed: any;
@@ -3473,12 +3599,6 @@ async function sendChunked(chatId: number, blocks: string[], limit = 3500) {
   if (buf) await sendMessage(chatId, buf);
 }
 
-function costUsd(model: string, inputTokens: number, outputTokens: number): number {
-  const rate = MODEL_RATES[model];
-  if (!rate) return 0;
-  return (inputTokens * rate.input + outputTokens * rate.output) / 1_000_000;
-}
-
 function lemmaSummary(run: AnnotationRun, max = 8): string {
   if (!run.parsed) return "(failed)";
   const vocab = (run.parsed.vocabulary ?? []) as any[];
@@ -3495,8 +3615,77 @@ function lemmaSummary(run: AnnotationRun, max = 8): string {
 async function handleAnnotateAb(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   const arg = msg.text.replace(/^\/annotate_ab(@\S+)?/i, "").trim();
+  // `/annotate_ab cost` reports what the bot has actually spent, from the api_usage
+  // ledger. It reads rows and calls nothing, so unlike the A/B run it is free and fast
+  // enough to answer inline.
+  if (/^cost\b/i.test(arg)) { scheduleBackgroundWork("costReport", costReport(msg.chat.id)); return; }
   const sampleSize = Math.min(Math.max(parseInt(arg, 10) || 5, 1), 15);
   scheduleBackgroundWork("annotateAbRun", annotateAbRun(msg.chat.id, user, sampleSize));
+}
+
+// Spend actually recorded, by window and by call site. Aggregation happens here rather
+// than in SQL because PostgREST can't GROUP BY; at one couple's volume the row count per
+// window is small enough that pulling and folding them is cheaper than adding an RPC.
+const COST_WINDOWS: { label: string; hours: number | null }[] = [
+  { label: "today (24h)", hours: 24 },
+  { label: "last 7d", hours: 24 * 7 },
+  { label: "last 30d", hours: 24 * 30 },
+  { label: "all time", hours: null },
+];
+
+async function costReport(chatId: number) {
+  // One unfiltered read, windowed in memory: the report always includes an all-time
+  // total, so there is no narrower slice worth pushing down to the query.
+  const { data: rows, error } = await supabase.from("api_usage")
+    .select("provider, model, feature, cost_usd, created_at")
+    .order("created_at", { ascending: false })
+    .limit(50000);
+  if (error) { await sendMessage(chatId, `⚠️ Couldn't read api_usage: ${error.message}`); return; }
+  if (!rows || rows.length === 0) {
+    await sendMessage(chatId,
+      "No API usage recorded yet.\n\nThe ledger starts filling from the first call after this build was deployed — it can't reconstruct spend from before that.");
+    return;
+  }
+
+  const blocks: string[] = ["💰 Measured API spend"];
+  for (const w of COST_WINDOWS) {
+    const since = w.hours === null ? 0 : Date.now() - w.hours * 3600_000;
+    const inWindow = rows.filter((r: any) => new Date(r.created_at).getTime() >= since);
+    const total = inWindow.reduce((s: number, r: any) => s + Number(r.cost_usd ?? 0), 0);
+    if (inWindow.length === 0) { blocks.push(`— ${w.label} —\n(nothing)`); continue; }
+
+    // Biggest line items first: the point of the report is "what is costing me money".
+    // Models are collected as a set, not overwritten -- a window that straddles an
+    // ANNOTATION_MODEL switch has one feature billed under two models, and that is
+    // precisely the comparison this command exists to support.
+    const byFeature = new Map<string, { cost: number; calls: number; models: Set<string> }>();
+    for (const r of inWindow) {
+      const prev = byFeature.get(r.feature) ?? { cost: 0, calls: 0, models: new Set<string>() };
+      prev.models.add(r.model);
+      byFeature.set(r.feature, { cost: prev.cost + Number(r.cost_usd ?? 0), calls: prev.calls + 1, models: prev.models });
+    }
+    const lines = [...byFeature.entries()]
+      .sort((a, b) => b[1].cost - a[1].cost)
+      .map(([feature, v]) =>
+        `  ${feature}: $${v.cost.toFixed(4)} (${v.calls} call${v.calls === 1 ? "" : "s"}, ${[...v.models].join(" + ")})`);
+
+    const byProvider = new Map<string, number>();
+    for (const r of inWindow) byProvider.set(r.provider, (byProvider.get(r.provider) ?? 0) + Number(r.cost_usd ?? 0));
+    const providerLine = [...byProvider.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([p, c]) => `${p} $${c.toFixed(4)}`).join(" · ");
+
+    blocks.push(`— ${w.label} —\n$${total.toFixed(4)} total · ${inWindow.length} calls\n${providerLine}\n${lines.join("\n")}`);
+  }
+
+  const earliest = rows.reduce((min: number, r: any) => Math.min(min, new Date(r.created_at).getTime()), Date.now());
+  const days = Math.max(1, (Date.now() - earliest) / 86_400_000);
+  const allTime = rows.reduce((s: number, r: any) => s + Number(r.cost_usd ?? 0), 0);
+  blocks.push(
+    `Ledger starts ${new Date(earliest).toISOString().slice(0, 10)} (${days.toFixed(1)}d) → ` +
+    `~$${(allTime / days * 30).toFixed(2)}/mo at the observed rate.\n` +
+    `ElevenLabs lines come from scripts/anki_pronunciation/, not the bot, and are priced at an effective rate — see CHARACTER_RATES.`);
+  await sendChunked(chatId, blocks);
 }
 
 async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
@@ -3529,8 +3718,8 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
     const other = otherLang(lang, user);
     const parallel = row.translated_text ?? undefined;
     // Sequential per model so the latency figures aren't skewed by contending with each other.
-    const current = await runAnnotation(ANNOTATION_MODEL, row.original_text, lang, other, parallel, row.id);
-    const alt = await runAnnotation(challenger, row.original_text, lang, other, parallel, row.id);
+    const current = await runAnnotation(ANNOTATION_MODEL, row.original_text, lang, other, parallel, row.id, "annotate_ab_harness");
+    const alt = await runAnnotation(challenger, row.original_text, lang, other, parallel, row.id, "annotate_ab_harness");
     for (const [model, run] of [[ANNOTATION_MODEL, current], [challenger, alt]] as [string, AnnotationRun][]) {
       totals[model].input += run.inputTokens;
       totals[model].output += run.outputTokens;
@@ -3545,11 +3734,19 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
     );
   }
 
-  // Project steady-state spend from the last 30 days of real traffic. Annotation runs
-  // once per side, so a message costs two passes.
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const { count: monthlyMessages } = await supabase
     .from("messages").select("id", { count: "exact", head: true }).gte("created_at", since);
+
+  // The current model has a real 30-day history in the ledger, so report what it actually
+  // cost rather than extrapolating from a handful of sampled passes. The challenger has
+  // no history by definition -- it has never run in production -- so it stays a
+  // projection, and the two are labelled so they are not read as equivalent.
+  const { data: measuredRows } = await supabase
+    .from("api_usage").select("cost_usd")
+    .eq("feature", "annotate").eq("model", ANNOTATION_MODEL)
+    .gte("created_at", since);
+  const measured30d = (measuredRows ?? []).reduce((s: number, r: any) => s + Number(r.cost_usd ?? 0), 0);
 
   const summary: string[] = ["— Totals —"];
   for (const model of [ANNOTATION_MODEL, challenger]) {
@@ -3558,14 +3755,18 @@ async function annotateAbRun(chatId: number, user: any, sampleSize: number) {
     const perPass = sample.length ? spend / sample.length : 0;
     const monthly = perPass * 2 * (monthlyMessages ?? 0);
     const role = model === ANNOTATION_MODEL ? "current" : "challenger";
+    const projection = model === ANNOTATION_MODEL && (measuredRows?.length ?? 0) > 0
+      ? `  $${spend.toFixed(4)} for this run → $${measured30d.toFixed(2)} MEASURED over the last 30d (${measuredRows!.length} live annotations)`
+      : `  $${spend.toFixed(4)} for this run → ~$${monthly.toFixed(2)}/mo PROJECTED at ${monthlyMessages ?? 0} msg/mo`;
     summary.push(
       `${model} (${role})\n` +
       `  ${t.input} in / ${t.output} out, avg ${Math.round(t.ms / sample.length)}ms/pass` +
-      (t.failures ? `, ${t.failures} failed` : "") + "\n" +
-      `  $${spend.toFixed(4)} for this run → ~$${monthly.toFixed(2)}/mo at ${monthlyMessages ?? 0} msg/mo`,
+      (t.failures ? `, ${t.failures} failed` : "") + "\n" + projection,
     );
   }
-  summary.push("Rates are standard (post-introductory). Switch by setting ANNOTATION_MODEL in index.ts, then redeploy.");
+  summary.push(
+    "Rates are standard (post-introductory). Switch by setting ANNOTATION_MODEL in index.ts, then redeploy.\n" +
+    "This run's own passes are billed to feature 'annotate_ab_harness', so they don't distort per-message annotation cost. See /annotate_ab cost.");
 
   await sendChunked(chatId, [...blocks, summary.join("\n")]);
 }
@@ -3821,6 +4022,10 @@ async function handleDiag(msg: any, user: any) {
     lines.push(`\u274c Anthropic FAIL: ${e instanceof Error ? e.message : String(e)}`);
   }
 
+  // Neither probe below is metered into api_usage. The Whisper one posts a 1-byte
+  // non-ogg that OpenAI rejects before transcribing, so it is never billed; the
+  // embeddings one spends a single token. Logging them would cost a write per /diag and
+  // put rows worth ~$0.00000004 next to real spend, which is noise, not signal.
   const whisperStart = Date.now();
   try {
     const form = new FormData();
@@ -3898,6 +4103,10 @@ async function embedText(text: string): Promise<number[] | null> {
     }
     if (!resp.ok) { console.error("embedText HTTP", resp.status, await resp.text().catch(() => "")); return null; }
     const data = await resp.json().catch(() => null);
+    logApiUsage({
+      provider: "openai", model: EMBEDDING_MODEL, feature: "embed",
+      inputTokens: typeof data?.usage?.total_tokens === "number" ? data.usage.total_tokens : 0,
+    });
     const emb = data?.data?.[0]?.embedding;
     if (!Array.isArray(emb) || emb.length !== EMBEDDING_DIM) { console.error("embedText: malformed response"); return null; }
     return emb as number[];
@@ -3926,6 +4135,10 @@ async function embedTextsBatch(texts: string[]): Promise<(number[] | null)[]> {
     }
     if (!resp.ok) { console.error("embedTextsBatch HTTP", resp.status, await resp.text().catch(() => "")); return texts.map(() => null); }
     const data = await resp.json().catch(() => null);
+    logApiUsage({
+      provider: "openai", model: EMBEDDING_MODEL, feature: "embed_batch",
+      inputTokens: typeof data?.usage?.total_tokens === "number" ? data.usage.total_tokens : 0,
+    });
     const items = data?.data;
     if (!Array.isArray(items)) { console.error("embedTextsBatch: malformed response"); return texts.map(() => null); }
     const out: (number[] | null)[] = texts.map(() => null);
@@ -4190,6 +4403,10 @@ async function parseQuestion(question: string, fallbackLang: LangCode, langs: La
     console.error("parseQuestion API call failed:", e);
     return defaultParse(fallbackLang);
   }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_HAIKU_MODEL, feature: "recap_parse",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type !== "text") return defaultParse(fallbackLang);
   let parsed: any;
@@ -4349,6 +4566,10 @@ async function synthesizeAnswer(
     console.error("synthesizeAnswer API call failed:", e);
     return null;
   }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_MODEL, feature: "recap_synthesis",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
   const block = result.content.find((b) => b.type === "text");
   if (block?.type !== "text") return null;
   return block.text.trim();
