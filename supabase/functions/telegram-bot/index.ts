@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v97";
+const BUILD_VERSION = "v98";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -338,6 +338,53 @@ function isCmd(text: string, ...names: string[]): boolean {
   return names.some((n) => text === `/${n}` || text.startsWith(`/${n} `) || text.startsWith(`/${n}@`));
 }
 
+// The command token a message opens with -- "/learn top 5" -> "learn", and the mistyped
+// "/lear <word>" -> "lear" -- or null if the message does not open with one. The
+// lookahead is what keeps a path out of it: "/home/user/notes.txt is where" continues
+// with "/", not whitespace, so it stays conversation. Only ever consulted AFTER the
+// dispatch table has declined the text, so whatever it returns at that point is a
+// command this build does not have.
+function leadingCommandToken(text: string): string | null {
+  const m = text.trim().match(/^\/([A-Za-z][A-Za-z0-9_]{0,31})(?:@[A-Za-z0-9_]+)?(?=\s|$)/);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// Names for the "did you mean" hint on a mistyped command -- the ones /help advertises,
+// minus the admin backfills, which are not what a typo is reaching for. Dispatch never
+// consults this list (a command is unknown precisely because the table declined it), so
+// a name missing here costs a suggestion and nothing else.
+const SUGGESTIBLE_COMMANDS = [
+  "start", "help", "menu", "vocab", "learn", "forget", "export", "pronounce", "capybara",
+  "pin", "unpin", "pinned", "remember", "note", "recap", "ask", "reconcile", "restore",
+];
+
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    for (let j = 1; j <= b.length; j++) {
+      row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+// Closest known command to a mistyped token, or null when nothing is close enough to be
+// worth guessing. A token that is a prefix of a real command ("lear", "reca") counts as
+// one edit away -- three characters minimum, so a stray "/l" does not confidently
+// suggest "/learn".
+function nearestCommand(token: string): string | null {
+  let best: string | null = null;
+  let bestScore = 3;
+  for (const name of SUGGESTIBLE_COMMANDS) {
+    const prefix = token.length >= 3 && (name.startsWith(token) || token.startsWith(name));
+    const d = prefix ? 1 : editDistance(token, name);
+    if (d < bestScore) { bestScore = d; best = name; }
+  }
+  return best;
+}
+
 async function handleUpdate(update: any) {
   // Populate the "/" command menu on first use per warm instance (background, idempotent).
   scheduleBackgroundWork("ensureCommandsRegistered", ensureCommandsRegistered());
@@ -452,14 +499,37 @@ async function handleUpdate(update: any) {
       await sendMessage(msg.chat.id, "That menu button is pointing at a command I don't have. Try typing the command instead.");
       return;
     }
-    // A bare "/word" that matched nothing is not conversation either -- it is almost
+    // A "/word" that matched nothing is not conversation either. Bare, it is almost
     // always a stale entry in a client's cached "/" list (see deleteMyCommands: those
-    // lists outlive the build that wrote them). Left to fall through it would be
-    // translated and forwarded, dropping "/education" into the partner's chat as though
-    // it had been said out loud.
-    if (/^\/[A-Za-z][A-Za-z0-9_]{0,31}(@[A-Za-z0-9_]+)?$/.test(effective.text.trim())) {
-      console.error(`unknown command ${JSON.stringify(effective.text.trim())}`);
-      await sendMessage(msg.chat.id, "I don't have that command \u2014 your app may be showing an old menu. Send /menu for the buttons, or /help for everything I can do.");
+    // lists outlive the build that wrote them). With an argument it is almost always a
+    // typo for a real command. Either way, left to fall through it would be translated
+    // and forwarded -- dropping "/education" into the partner's chat as though it had
+    // been said out loud, and worse for the typo: "/lear <word>" was annotated as
+    // conversation, so the mistyped command ended up as the example sentence on the
+    // front of that word's flashcard.
+    const unknownCmd = leadingCommandToken(effective.text);
+    if (unknownCmd) {
+      const typed = effective.text.trim();
+      console.error(`unknown command ${JSON.stringify(typed)}`);
+      // Collapsed to one line: the dispatch table only accepts an argument after a
+      // single space, so "/learn\nword" lands here too, and its suggestion is the same
+      // command written on one line.
+      const rest = typed.replace(/^\/[A-Za-z][A-Za-z0-9_]{0,31}(?:@[A-Za-z0-9_]+)?/, "").trim().replace(/\s+/g, " ");
+      const near = nearestCommand(unknownCmd);
+      // Reattach the argument so the suggestion can be copied straight back, but only
+      // when it is short enough to read as one line -- echoing a pasted paragraph back
+      // at someone is not a suggestion.
+      const suggestion = near ? `/${near}${rest && rest.length <= 200 ? ` ${rest}` : ""}` : null;
+      const header = near === unknownCmd
+        ? "I couldn't read that as a command \u2014 did you mean:"
+        : `I don't have /${unknownCmd} \u2014 did you mean:`;
+      const lines = suggestion
+        ? [header, "", suggestion]
+        : ["I don't have that command \u2014 your app may be showing an old menu. Send /menu for the buttons, or /help for everything I can do."];
+      // Only worth saying when something followed the command: a bare "/education" had
+      // no message in it to send on.
+      if (rest) lines.push("", "Nothing was sent or saved. If you meant to say it out loud, send it again without the leading slash.");
+      await sendMessage(msg.chat.id, lines.join("\n"));
       return;
     }
   }
@@ -2074,6 +2144,7 @@ async function exportRun(chatId: number, user: any) {
 
   const deckCounts: Record<string, number> = {};
   let blankedExamples = 0;
+  let commandExamples = 0;
   const rows: string[] = [];
   for (const card of (cards ?? []) as any[]) {
     const v = card.vocabulary;
@@ -2095,6 +2166,18 @@ async function exportRun(chatId: number, user: any) {
           exampleTranslation = m.original_text ?? "";
         }
       }
+    }
+    // An example that opens with a command token was never something anyone said: it is
+    // a mistyped command ("/lear <word>") from before the dispatch guard caught those,
+    // which fell through to translation and was annotated as conversation. Blank it
+    // rather than print the typo on the front of a card. Anki matches an imported note
+    // on its first field (the lemma), so re-importing updates the existing card and the
+    // bad front goes away -- nothing has to be deleted by hand.
+    if (exampleSentence && leadingCommandToken(exampleSentence)) {
+      console.warn(`export: blanking example for lemma="${v.lemma}" lang=${v.language} \u2014 example is a mistyped command line`);
+      exampleSentence = "";
+      exampleTranslation = "";
+      commandExamples++;
     }
     if (exampleSentence && !exampleScriptMatchesLanguage(exampleSentence, v.language)) {
       const { cyrillicRatio, letters } = detectScriptRatios(exampleSentence);
@@ -2200,6 +2283,9 @@ async function exportRun(chatId: number, user: any) {
   if (blankedExamples > 0) {
     console.warn(`export: blanked ${blankedExamples} example sentence${blankedExamples === 1 ? "" : "s"} due to script mismatch.`);
   }
+  if (commandExamples > 0) {
+    console.warn(`export: blanked ${commandExamples} example sentence${commandExamples === 1 ? "" : "s"} that were mistyped commands.`);
+  }
 
   const ankiHeader = [
     "#separator:Comma",
@@ -2216,6 +2302,10 @@ async function exportRun(chatId: number, user: any) {
   const filename = `capybara-${today}.csv`;
   const blankedNote = blankedExamples > 0
     ? `\n\n\u26a0\ufe0f Blanked ${blankedExamples} example sentence${blankedExamples === 1 ? "" : "s"} because the linked message was in the wrong script for the card's language.`
+    : "";
+  const commandNote = commandExamples > 0
+    ? `\n\n\u267b\ufe0f Blanked ${commandExamples} example sentence${commandExamples === 1 ? "" : "s"} that turned out to be a mistyped command rather than conversation. ` +
+      `Re-import this file over your existing deck (Anki matches on the first field) and those card fronts are fixed in place.`
     : "";
   const caption =
     `Decks \u2014 ${[
@@ -2236,7 +2326,7 @@ async function exportRun(chatId: number, user: any) {
           : `: the front is what you wrote, the back is the fix.`) +
         ` Tagged capybara::grammar::<error type>, so you can build a filtered deck for whichever mistake you make most.`
       : "") +
-    blankedNote;
+    blankedNote + commandNote;
   await sendDocument(chatId, filename, csv, "text/csv", caption);
 }
 
