@@ -159,14 +159,41 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
    - **Keyword** — trigram similarity (`pg_trgm`).
 4. **Merge** the two rankings with **Reciprocal Rank Fusion** (RRF), then **filter and
    rank**:
-   - **24-hour cooling-off on messages** — very recent messages don't surface (notes are
-     exempt).
    - **Note privacy** — notes are only visible to their author.
    - **Pin boost** — pinned messages get a small score bump.
    - **Reconciled messages are excluded** entirely.
+   - **Recency reservation** — on a "when did I last…" question, the newest on-topic
+     candidates get reserved seats instead of being out-ranked by older text that happens
+     to match the wording better.
 5. **Synthesize** (Claude Sonnet) a grounded answer: quotes appear in their original
    language, messages and notes are cited distinctly, and the model is instructed never
    to guess beyond the retrieved context or to play advisor/predictor/judge.
+
+### Date questions
+
+"When did I last donate blood?" is the most common shape of question put to `/recap`, so
+it gets its own path. The parser tags a question as `latest` or `earliest`; that tag
+widens retrieval, tells the synthesis prompt to lead with the date on its own line, and
+asks the model to return the context indices of the items that record the event *actually
+happening* (as opposed to planning it). Those indices come back as data — **every date the
+answer states is computed in code from `created_at`, never by the model**, which is
+unreliable at date arithmetic and will happily drop a year or misjudge an elapsed span.
+The result is a dated headline plus an *Earlier mentions* footer showing the gaps between
+occurrences:
+
+```
+Last time: Saturday, 14 March 2026 — 6 months ago
+
+You said: «just got back from donating, arm is killing me»
+
+Earlier mentions:
+• 2 Nov 2025 (4 months before)
+• 19 Jun 2024 (16 months before)
+```
+
+Dates render in **UTC**, as every `/recap` date always has. A message sent late in the
+evening from a zone behind UTC is stamped on the following UTC day, so a date answer about
+it can read a day late; the message itself is in the chat with its local time on it.
 
 ## The model: one instance per pair
 
@@ -474,8 +501,10 @@ the autocomplete popup is gone.
 | `/menu` | Open the button menu (it otherwise stays behind the compose-box grid button) |
 | `/help` · `/start` | Help / welcome |
 
-> `/recap` has a 24-hour cooling-off on **messages** (recent messages don't surface),
-> but `/remember` **notes** are searchable immediately.
+> `/recap` searches **messages and notes immediately** — there is no delay on either.
+> (Messages were held back for 24 hours in earlier builds; that cooling-off was removed
+> because it silently returned the wrong answer to "when did I last…" whenever the thing
+> had happened the day before.)
 
 ## Privacy
 
@@ -551,8 +580,9 @@ deploy-safety and reproducibility handoffs that shaped them.
   gated shut until you do.
 - **Bot doesn't recognize a user** — an unregistered Telegram user gets a reply with
   their own numeric ID. Put both IDs in `seed_couple.sql` and run it.
-- **A freshly-sent message doesn't appear in `/recap`** — expected: messages have a
-  24-hour cooling-off. Use a `/remember` note to test recap immediately.
+- **A freshly-sent message doesn't appear in `/recap`** — embedding happens in the
+  background a few seconds after the message lands; give it a moment. If it never shows
+  up, run `/recap_backfill` (admin) to embed the backlog.
 - **Voice transcription works but no audio is archived** — the `voice-messages` storage
   bucket is missing; the upload error is logged and ignored. Create the bucket.
 - **`getWebhookInfo` shows a `last_error_message`** — usually a wrong webhook URL or a

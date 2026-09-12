@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v98";
+const BUILD_VERSION = "v99";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -185,10 +185,36 @@ const RECAP_K_FLOOR = 3;
 const RECAP_K_CEILING = 25;
 const RECAP_K_NARROW = 5;
 const RECAP_K_BROAD = 20;
-const RECAP_COOLING_OFF_HOURS = 24;
+// A "when did I last donate blood?" question is narrow in shape -- the answer is one
+// date -- but it needs a wide retrieval. The headline uses one item; the earlier-mentions
+// footer under it is only worth printing if enough prior occurrences survived the cut, so
+// recency questions take a slice several times wider than a plain narrow question.
+const RECAP_K_RECENCY = 15;
+// How many of the newest (or oldest) on-topic candidates get reserved seats in the final
+// set for a recency question. Relevance ranking answers "which of these is most about
+// blood donation"; it does not answer "which one was the most recent", and on a chat
+// where the same errand recurs for years the latest mention is rarely the best-worded
+// one. Without reserved seats the newest occurrence loses its seat to older text that
+// happens to match the query better -- which is the whole question, answered wrong.
+const RECAP_RECENCY_RESERVED = 6;
+// Cap on earlier-mention lines under the answer. A daily-schedule chat can produce
+// dozens of hits for a recurring errand; past half a dozen the footer stops being a
+// cadence and starts being a wall.
+const RECAP_FOOTER_MAX = 6;
 const RECAP_PIN_BOOST = 0.005;
 const RECAP_CANDIDATE_POOL = 50;
 const RECAP_BACKFILL_BATCH_SIZE = 50;
+// Which wall clock /recap renders dates against. messages.created_at is now() at insert
+// -- an absolute UTC instant -- and every /recap date is rendered back in UTC, which is
+// what the bot has always done (the old context block sliced the raw timestamp). Named
+// rather than inlined at each formatter so the choice is visible in one place, and so
+// moving off it later is a one-line change.
+//
+// The known edge: a message sent late in the evening in a zone behind UTC is stamped on
+// the following UTC day, so a date question about it can read one day late. The exact
+// message is still right there in the chat with its local time on it, which is where that
+// gets resolved.
+const RECAP_TIMEZONE = "UTC";
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
@@ -4453,15 +4479,125 @@ async function handleRemember(msg: any, user: any) {
   await sendMessage(msg.chat.id, "\ud83d\udcdd Noted.");
 }
 
+// --- Date rendering for /recap ------------------------------------------------------
+// Every date that reaches the asker is computed here and handed to the model as a
+// finished string, never derived by it. A model asked to do date arithmetic drops the
+// year, rounds an elapsed span to the wrong unit, or quietly invents a weekday -- and for
+// a question whose entire answer IS a date ("when did I last donate blood?"), a date
+// that is approximately right is worse than no answer. The model decides which items are
+// occurrences; this code decides what day they fell on.
+
+function recapLocale(lang: LangCode): string {
+  return lang === "uk" ? "uk-UA" : "en-GB";
+}
+
+function tzFormatter(lang: LangCode, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat(recapLocale(lang), { ...options, timeZone: RECAP_TIMEZONE });
+}
+
+function formatInTz(iso: string, lang: LangCode, options: Intl.DateTimeFormatOptions): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return tzFormatter(lang, options).format(d);
+}
+
+// "Saturday, 14 March 2026" -- the headline form. Weekday and year are both load-bearing:
+// "March 14" alone is ambiguous across years in a chat that has run for several.
+function formatFullDate(iso: string, lang: LangCode): string {
+  const weekday = formatInTz(iso, lang, { weekday: "long" });
+  const rest = formatInTz(iso, lang, { day: "numeric", month: "long", year: "numeric" });
+  return `${weekday}, ${rest}`;
+}
+
+// "14 Mar 2026" -- the compact form for the earlier-mentions footer.
+function formatShortDate(iso: string, lang: LangCode): string {
+  return formatInTz(iso, lang, { day: "numeric", month: "short", year: "numeric" });
+}
+
+function formatTimeOfDay(iso: string, lang: LangCode): string {
+  return formatInTz(iso, lang, { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+// The calendar date an instant falls on in the couple's zone, as YYYY-MM-DD. Gaps are
+// measured between calendar days rather than raw milliseconds so that 11pm Monday to 7am
+// Tuesday reads as "1 day" -- the way a person counts days, and the way the dates either
+// side of the gap are printed.
+function calendarDay(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
+  const parts = tzFormatter("en", { year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+function daysBetweenDays(fromDay: string, toDay: string): number {
+  const a = Date.parse(`${fromDay}T00:00:00Z`);
+  const b = Date.parse(`${toDay}T00:00:00Z`);
+  if (Number.isNaN(a) || Number.isNaN(b)) return 0;
+  return Math.round((b - a) / 86400000);
+}
+
+function daysAgo(iso: string, nowIso: string): number {
+  return daysBetweenDays(calendarDay(iso), calendarDay(nowIso));
+}
+
+// Reduces a day count to the coarsest unit a person would say it in. Past two years the
+// phrase rounds to whole years, which is deliberate: the exact date is printed directly
+// beside every span, so the span only has to convey scale.
+function durationUnits(days: number): { n: number; unit: "day" | "week" | "month" | "year" } | null {
+  const d = Math.max(0, Math.round(days));
+  if (d === 0) return null;
+  if (d < 14) return { n: d, unit: "day" };
+  if (d < 60) return { n: Math.round(d / 7), unit: "week" };
+  const months = Math.round(d / 30.44);
+  if (months < 24) return { n: months, unit: "month" };
+  return { n: Math.round(d / 365.25), unit: "year" };
+}
+
+// A bare span ("5 months") in the answer language. Plural agreement comes from Intl
+// rather than a hand-written table -- Ukrainian picks one of three forms by the last
+// digits of the count, and a bot whose job is teaching the language cannot be the thing
+// that gets it wrong. Callers supply the connective ("ago", "before").
+function durationPhrase(days: number, lang: LangCode): string {
+  const u = durationUnits(days);
+  if (!u) return lang === "uk" ? "\u043c\u0435\u043d\u0448\u0435 \u043d\u0456\u0436 \u0434\u0435\u043d\u044c" : "less than a day";
+  try {
+    return new Intl.NumberFormat(recapLocale(lang), {
+      style: "unit", unit: u.unit, unitDisplay: "long",
+    }).format(u.n);
+  } catch {
+    return `${u.n} ${u.unit}${u.n === 1 ? "" : "s"}`;
+  }
+}
+
+// "5 months ago" in the answer language, via Intl so the connective and the plural agree
+// without a per-language phrasebook.
+function agoPhrase(days: number, lang: LangCode): string {
+  const u = durationUnits(days);
+  if (!u) return lang === "uk" ? "\u0441\u044c\u043e\u0433\u043e\u0434\u043d\u0456" : "today";
+  try {
+    return new Intl.RelativeTimeFormat(recapLocale(lang), { numeric: "auto" }).format(-u.n, u.unit);
+  } catch {
+    return `${durationPhrase(days, lang)} ago`;
+  }
+}
+
+type Recency = "latest" | "earliest" | null;
+
 type ParseOutput = {
   language: LangCode;
   time_window: { start: string; end: string } | null;
   shape: "narrow" | "broad";
+  // Set when the question asks WHICH OCCURRENCE rather than what was said -- "when did I
+  // last donate blood?", "when did we first meet?". It changes both how much is
+  // retrieved and how the answer is shaped, so it is the one parsed field that survives
+  // all the way to the rendered footer.
+  recency: Recency;
   k: number;
 };
 
 function defaultParse(fallbackLang: LangCode): ParseOutput {
-  return { language: fallbackLang, time_window: null, shape: "broad", k: RECAP_K_BROAD };
+  return { language: fallbackLang, time_window: null, shape: "broad", recency: null, k: RECAP_K_BROAD };
 }
 
 async function parseQuestion(question: string, fallbackLang: LangCode, langs: LangCode[]): Promise<ParseOutput> {
@@ -4473,13 +4609,18 @@ async function parseQuestion(question: string, fallbackLang: LangCode, langs: La
     `{\n` +
     `  "language": "${langs[0]}" | "${langs[1]}",\n` +
     `  "time_window": null | { "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" },\n` +
-    `  "shape": "narrow" | "broad"\n` +
+    `  "shape": "narrow" | "broad",\n` +
+    `  "recency": null | "latest" | "earliest"\n` +
     `}\n\n` +
     `Today's date is ${today}.\n\n` +
     `Rules:\n` +
     `- "language" is the dominant language of the question (${langs[0]} or ${langs[1]}). Detect from script and word content.\n` +
     `- "time_window" is null unless the question has an explicit time marker. If present, return an inclusive [start, end] range (YYYY-MM-DD).\n` +
-    `- "shape" is "narrow" for specific factual questions and "broad" for open-ended ones.\n\n` +
+    `- "shape" is "narrow" for specific factual questions and "broad" for open-ended ones.\n` +
+    `- "recency" marks a question asking WHEN something happened / WHICH occurrence, not what was said about it. ` +
+    `Use "latest" for the most recent time ("when did I last donate blood?", "when was the last time we saw the dentist?", ` +
+    `"how long since I got a haircut?"). Use "earliest" for the first ("when did we first meet?", "when did I start running?"). ` +
+    `Use null for everything else, including questions that merely mention a date or ask what someone said.\n\n` +
     `Do NOT wrap in markdown code fences. Do NOT include preamble.`;
   let result;
   try {
@@ -4512,9 +4653,11 @@ async function parseQuestion(question: string, fallbackLang: LangCode, langs: La
   const tw = parsed.time_window;
   const isDate = (s: any) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
   const time_window = (tw && isDate(tw.start) && isDate(tw.end)) ? { start: tw.start, end: tw.end } : null;
-  const rawK = shape === "narrow" ? RECAP_K_NARROW : RECAP_K_BROAD;
+  const recency: Recency = parsed.recency === "latest" || parsed.recency === "earliest" ? parsed.recency : null;
+  // A recency question is narrow in shape but needs the wider slice -- see RECAP_K_RECENCY.
+  const rawK = recency ? RECAP_K_RECENCY : (shape === "narrow" ? RECAP_K_NARROW : RECAP_K_BROAD);
   const k = Math.max(RECAP_K_FLOOR, Math.min(RECAP_K_CEILING, rawK));
-  return { language, time_window, shape, k };
+  return { language, time_window, shape, recency, k };
 }
 
 type RetrievedItem = {
@@ -4567,40 +4710,132 @@ function rrfMerge(semantic: RetrievedItem[], keyword: RetrievedItem[]): Map<stri
   return merged;
 }
 
+function itemKey(item: RetrievedItem): string {
+  return `${item.source_type}:${item.source_id}`;
+}
+
+// Chronological order, by parsed instant rather than by string. Ordering used to be
+// incidental -- the context block just read better oldest-first -- but it is now
+// load-bearing: it decides which item a "when did I last" answer leads with, and it fixes
+// the index numbers the model cites back. String comparison is not safe for that, because
+// PostgREST emits fractional seconds on some rows and not others, and collation can
+// reorder punctuation. Parsing removes the question.
+function compareByTime(a: RetrievedItem, b: RetrievedItem): number {
+  const ta = Date.parse(a.created_at);
+  const tb = Date.parse(b.created_at);
+  if (Number.isNaN(ta) || Number.isNaN(tb)) {
+    return a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0;
+  }
+  return ta - tb;
+}
+
+// Note: messages used to be held back from /recap for 24 hours (a deliberate cooling-off,
+// notes exempt). That buffer was removed: the bot is used as a day-to-day log, and the
+// single most common question put to it is "when did I last X" -- a question the buffer
+// answered wrong whenever X happened yesterday, silently reporting the previous
+// occurrence instead. A memory tool that omits the most recent day without saying so is
+// worse than one with no buffer at all.
 function filterAndRank(
   merged: Map<string, { item: RetrievedItem; score: number }>,
   askerId: string,
   k: number,
+  recency: Recency,
 ): RetrievedItem[] {
-  const coolingOffMs = RECAP_COOLING_OFF_HOURS * 3600 * 1000;
-  const now = Date.now();
-  const out: { item: RetrievedItem; score: number }[] = [];
+  const eligible: { item: RetrievedItem; score: number }[] = [];
   for (const entry of merged.values()) {
     const { item } = entry;
-    const itemTimeMs = new Date(item.created_at).getTime();
-    if (item.source_type === "message" && now - itemTimeMs < coolingOffMs) continue;
+    // Notes stay private to whoever wrote them; messages are shared by construction.
     if (item.source_type === "note" && item.author_id !== askerId) continue;
-    const finalScore = entry.score + (item.is_pinned ? RECAP_PIN_BOOST : 0);
-    out.push({ item, score: finalScore });
+    eligible.push({ item, score: entry.score + (item.is_pinned ? RECAP_PIN_BOOST : 0) });
   }
-  out.sort((a, b) => b.score - a.score);
-  return out.slice(0, k).map((e) => e.item);
+  eligible.sort((a, b) => b.score - a.score);
+  if (!recency) return eligible.slice(0, k).map((e) => e.item);
+
+  // Reserve seats at the end of the timeline the question points at -- see
+  // RECAP_RECENCY_RESERVED. The reservation is drawn from the better-matching half of the
+  // pool rather than the pool at large: the candidate pool is the top N by similarity
+  // with no relevance floor, so its newest member is often just the newest thing that
+  // scored at all, and promoting that on date alone would answer a different question.
+  const onTopic = eligible.slice(0, Math.max(k * 2, RECAP_RECENCY_RESERVED));
+  const byTime = [...onTopic].sort((a, b) =>
+    recency === "latest" ? compareByTime(b.item, a.item) : compareByTime(a.item, b.item));
+  const picked = new Map<string, RetrievedItem>();
+  for (const e of byTime.slice(0, Math.min(RECAP_RECENCY_RESERVED, k))) picked.set(itemKey(e.item), e.item);
+  for (const e of eligible) {
+    if (picked.size >= k) break;
+    picked.set(itemKey(e.item), e.item);
+  }
+  return [...picked.values()];
 }
 
-function formatContextForSynthesis(items: RetrievedItem[]): string {
-  const lines: string[] = [];
-  const sorted = [...items].sort((a, b) => a.created_at.localeCompare(b.created_at));
-  for (const item of sorted) {
-    const dt = item.created_at.replace("T", " ").slice(0, 16);
-    if (item.source_type === "message") {
-      const sender = item.sender_name ?? "?";
-      lines.push(`[message] ${dt} | ${sender} (${item.language}) | \u00ab${item.content}\u00bb`);
-    } else {
-      const author = item.sender_name ?? "?";
-      lines.push(`[note]    ${dt} | ${author} | ${item.content}`);
-    }
+// The canonical order for a retrieved set: oldest first, so the context block reads as a
+// timeline. Fixed here rather than inside the formatter because the index numbers the
+// model cites back in its OCCURRENCES line are positions in exactly this ordering -- the
+// formatter and the footer builder have to be looking at the same list.
+function orderForSynthesis(items: RetrievedItem[]): RetrievedItem[] {
+  return [...items].sort(compareByTime);
+}
+
+function formatContextForSynthesis(ordered: RetrievedItem[], lang: LangCode, nowIso: string): string {
+  return ordered.map((item, idx) => {
+    // Spelled out in full, in the answer language, so the model never has to parse a
+    // timestamp or work out an elapsed span -- it only has to quote what it was given.
+    const when = `${formatFullDate(item.created_at, lang)} ${formatTimeOfDay(item.created_at, lang)} (${agoPhrase(daysAgo(item.created_at, nowIso), lang)})`;
+    const who = item.sender_name ?? "?";
+    return item.source_type === "message"
+      ? `[${idx + 1}] [message] ${when} | ${who} (${item.language}) | \u00ab${item.content}\u00bb`
+      : `[${idx + 1}] [note] ${when} | ${who} | ${item.content}`;
+  }).join("\n");
+}
+
+// Deliberately permissive about what follows the label, and tolerant of a model that
+// bolds it or answers "OCCURRENCES: none". Anything matching this line is stripped and
+// the digits are picked out of whatever was on it -- a strict pattern would fail to match
+// an off-format line and leak the protocol into the chat, which is the one outcome worth
+// engineering against.
+const OCCURRENCES_LINE = /^[ \t>*_]*OCCURRENCES\b:?[ \t*_]*(.*)$/im;
+
+// Splits the model's reply into the prose the asker sees and the occurrence indices it
+// tagged. The split is the whole point of the protocol: deciding which retrieved items
+// record the event actually happening (rather than planning it, or reminiscing about it)
+// is a judgment call the model is good at, while stating what day each one fell on is
+// arithmetic it is not. So the model returns indices and this code returns dates.
+function extractOccurrences(answer: string, ordered: RetrievedItem[]): { prose: string; occurrences: RetrievedItem[] } {
+  const m = answer.match(OCCURRENCES_LINE);
+  if (!m) return { prose: answer.trim(), occurrences: [] };
+  const prose = answer.replace(OCCURRENCES_LINE, "").trim();
+  const seen = new Set<number>();
+  const occurrences: RetrievedItem[] = [];
+  for (const token of m[1].match(/\d+/g) ?? []) {
+    const n = Number(token);
+    if (!Number.isInteger(n) || n < 1 || n > ordered.length || seen.has(n)) continue;
+    seen.add(n);
+    occurrences.push(ordered[n - 1]);
   }
-  return lines.join("\n");
+  occurrences.sort((a, b) => compareByTime(b, a));
+  return { prose, occurrences };
+}
+
+// The block under the answer: every occurrence before the one the answer leads with, each
+// with the gap to the occurrence after it. The gaps are what make this worth printing --
+// three dates tell you when, but "4 months, then 4 months" tells you the rhythm, which is
+// usually the thing actually being asked.
+function buildOccurrenceFooter(occurrences: RetrievedItem[], lang: LangCode): string {
+  if (occurrences.length < 2) return "";
+  const earlier = occurrences.slice(1);
+  const shown = earlier.slice(0, RECAP_FOOTER_MAX);
+  const lines = shown.map((item, idx) => {
+    const gap = daysBetweenDays(calendarDay(item.created_at), calendarDay(occurrences[idx].created_at));
+    const before = lang === "uk" ? "\u0434\u043e \u0446\u044c\u043e\u0433\u043e" : "before";
+    const gapText = gap > 0 ? ` (${durationPhrase(gap, lang)} ${before})` : "";
+    return `\u2022 ${formatShortDate(item.created_at, lang)}${gapText}`;
+  });
+  const hidden = earlier.length - shown.length;
+  if (hidden > 0) {
+    lines.push(lang === "uk" ? `\u2022 \u0442\u0430 \u0449\u0435 ${hidden}` : `\u2022 and ${hidden} more`);
+  }
+  const header = lang === "uk" ? "\u0420\u0430\u043d\u0456\u0448\u0435:" : "Earlier mentions:";
+  return `\n\n${header}\n${lines.join("\n")}`;
 }
 
 // Describes one partner for the synthesis prompt's identity clause, e.g.
@@ -4628,21 +4863,36 @@ function buildSynthesisPrompt(
   answerLanguage: LangCode,
   retrievedItems: string,
   question: string,
+  recency: Recency,
 ): string {
   const answerLangName = langMeta(answerLanguage).englishName;
   const answerNotes = langMeta(answerLanguage).translationNotes ? `\n\n${langMeta(answerLanguage).translationNotes}` : "";
-  return `You are answering a question about a shared conversational history between two people in a relationship: ${coupleIdentity}. You are the /recap feature of their translation bot \u2014 a private memory tool either of them can query.\n\nThe person asking is: ${askerName}.\nAnswer in: ${answerLangName}. Match the dominant language of their question.\n\nRules:\n1. Ground every claim in the CONTEXT. If the context doesn't contain the answer, say so plainly \u2014 never guess or fill in from general knowledge.\n2. Quote sparingly: 1-2 short quotes total, hard maximum 3, woven naturally into the answer.\n3. Quotes appear in their ORIGINAL language, exactly as written. Do not translate quotes; the narrative around them is in the answer language.\n4. Distinguish messages from notes when citing. Message: "[name] said on March 14: \u00ab...\u00bb". Note: "you noted on March 14: ...". Notes are private observations the writer recorded \u2014 not things the other person said. Never blur this.\n5. Be concise. Narrow questions get 1-4 sentences; broad get a short paragraph. Don't pad or editorialize.\n6. If views conflict or evolve over time, say so.\n7. Do not infer emotional states unless the source text explicitly conveys them.\n8. You do recall and synthesis of what was said or noted \u2014 you are not an advisor, predictor, or judge. If asked what someone will do/want/feel in future, who was right in a disagreement, or for relationship advice: decline warmly and briefly, point to what you CAN do (recall), and suggest a regular chat with Claude or talking with someone who knows them.\n9. If the CONTEXT has nothing relevant, say so in one sentence. "I don't see anything about that in your conversations" is enough.\n10. Preserve tone \u2014 if the messages were playful or affectionate, reflect that.\n\nOutput format: plain text, no headers or markdown beyond the quote guillemets. Speak directly to the asker in second person.${answerNotes}\n\n# CONTEXT\n${retrievedItems}\n\n# QUESTION\n${question}`;
+  // A "when did I last X" question wants the date up front, not buried in a paragraph --
+  // the asker is looking something up, not reading a summary. Rule 5's concision budget
+  // would otherwise push the date into the middle of a sentence.
+  const recencyRules = recency
+    ? `\n13. THIS IS A ${recency === "latest" ? "MOST-RECENT" : "FIRST-TIME"} QUESTION. Open with the answer on its own line: the full date exactly as the CONTEXT prints it, then how long ago. Example: "Last time: Saturday, 14 March 2026 \u2014 5 months ago." Follow it with one short quote as evidence, and stop. Do not lead with context, caveats, or a summary of the surrounding conversation. If two items could each be the ${recency === "latest" ? "most recent" : "first"} occurrence, lead with the one you judge correct and note the other in one clause.`
+    : "";
+  // The indices come back as data and are replaced by dates computed in code -- see
+  // extractOccurrences. Asking for them only on recency questions keeps the line off
+  // every other answer, where it would be noise the stripper has to clean up.
+  const occurrenceProtocol = recency
+    ? `\n\nAFTER your answer, add a final line in exactly this form:\nOCCURRENCES: 3, 7, 12\nList the CONTEXT index numbers of the items that record the event ACTUALLY HAPPENING \u2014 one index per distinct occasion, most recent first. Exclude items that only plan, propose, or reminisce about it, and exclude two indices that describe the same occasion. Write the line even if there is only one occurrence. Omit it entirely only if nothing in the CONTEXT records the event happening at all. This line is stripped before the asker sees the answer \u2014 never refer to it, and never put it anywhere but the very end.`
+    : "";
+  return `You are answering a question about a shared conversational history between two people in a relationship: ${coupleIdentity}. You are the /recap feature of their translation bot \u2014 a private memory tool either of them can query.\n\nThe person asking is: ${askerName}.\nAnswer in: ${answerLangName}. Match the dominant language of their question.\n\nRules:\n1. Ground every claim in the CONTEXT. If the context doesn't contain the answer, say so plainly \u2014 never guess or fill in from general knowledge.\n2. Quote sparingly: 1-2 short quotes total, hard maximum 3, woven naturally into the answer.\n3. Quotes appear in their ORIGINAL language, exactly as written. Do not translate quotes; the narrative around them is in the answer language.\n4. Distinguish messages from notes when citing. Message: "[name] said on March 14: \u00ab...\u00bb". Note: "you noted on March 14: ...". Notes are private observations the writer recorded \u2014 not things the other person said. Never blur this.\n5. Be concise. Narrow questions get 1-4 sentences; broad get a short paragraph. Don't pad or editorialize.\n6. If views conflict or evolve over time, say so.\n7. Do not infer emotional states unless the source text explicitly conveys them.\n8. You do recall and synthesis of what was said or noted \u2014 you are not an advisor, predictor, or judge. If asked what someone will do/want/feel in future, who was right in a disagreement, or for relationship advice: decline warmly and briefly, point to what you CAN do (recall), and suggest a regular chat with Claude or talking with someone who knows them.\n9. If the CONTEXT has nothing relevant, say so in one sentence. "I don't see anything about that in your conversations" is enough.\n10. Preserve tone \u2014 if the messages were playful or affectionate, reflect that.\n11. DATES: each CONTEXT item is numbered and carries its date already written out for you ("Saturday, 14 March 2026 09:22 (5 months ago)"). Reuse those strings verbatim. Never compute, re-derive, abbreviate, or convert a date yourself, and never state a date that is not printed in the CONTEXT.\n12. Do not treat a plan as an event. "I am donating blood tomorrow" records an intention on the day it was sent; only a later message describing it as done establishes that it happened. If the CONTEXT only ever shows the plan, say that is all you can see.${recencyRules}\n\nOutput format: plain text, no headers or markdown beyond the quote guillemets. Speak directly to the asker in second person.${answerNotes}${occurrenceProtocol}\n\n# CONTEXT\n${retrievedItems}\n\n# QUESTION\n${question}`;
 }
 
 async function synthesizeAnswer(
   question: string,
-  items: RetrievedItem[],
+  ordered: RetrievedItem[],
   askerName: string,
   coupleIdentity: string,
   answerLanguage: LangCode,
+  recency: Recency,
+  nowIso: string,
 ): Promise<string | null> {
-  const context = formatContextForSynthesis(items);
-  const systemPrompt = buildSynthesisPrompt(askerName, coupleIdentity, answerLanguage, context, question);
+  const context = formatContextForSynthesis(ordered, answerLanguage, nowIso);
+  const systemPrompt = buildSynthesisPrompt(askerName, coupleIdentity, answerLanguage, context, question, recency);
   let result;
   try {
     result = await anthropic.messages.create({
@@ -4689,6 +4939,9 @@ async function handleRecap(msg: any, user: any) {
   }
   scheduleBackgroundWork(`recap typing (${msg.chat.id})`, sendChatAction(msg.chat.id, "typing"));
 
+  // One clock for the whole answer: every "N ago" in the context block and the footer is
+  // measured from this instant, so a slow synthesis call can't make two spans disagree.
+  const nowIso = new Date().toISOString();
   const askerFallbackLang: LangCode = user.native_language;
   const parsed = await parseQuestion(question, askerFallbackLang, [user.native_language, user.learning_language]);
 
@@ -4702,7 +4955,7 @@ async function handleRecap(msg: any, user: any) {
 
   const { semantic, keyword } = await retrieveCandidates(question, qEmb, parsed.time_window);
   const merged = rrfMerge(semantic, keyword);
-  const top = filterAndRank(merged, user.id, parsed.k);
+  const top = filterAndRank(merged, user.id, parsed.k, parsed.recency);
   if (top.length === 0) {
     await sendMessage(msg.chat.id, parsed.language === "uk"
       ? "\u042f \u043d\u0456\u0447\u043e\u0433\u043e \u043d\u0435 \u0437\u043d\u0430\u0439\u0448\u043e\u0432 \u043f\u0440\u043e \u0446\u0435 \u0443 \u0432\u0430\u0448\u0438\u0445 \u0440\u043e\u0437\u043c\u043e\u0432\u0430\u0445."
@@ -4712,14 +4965,19 @@ async function handleRecap(msg: any, user: any) {
 
   const partner = await lookupPartner(user.id);
   const coupleIdentity = buildCoupleIdentity(user, partner);
-  const answer = await synthesizeAnswer(question, top, user.display_name, coupleIdentity, parsed.language);
+  const ordered = orderForSynthesis(top);
+  const answer = await synthesizeAnswer(
+    question, ordered, user.display_name, coupleIdentity, parsed.language, parsed.recency, nowIso);
   if (!answer) {
     await sendMessage(msg.chat.id, parsed.language === "uk"
       ? "\u041d\u0435 \u0432\u0434\u0430\u043b\u043e\u0441\u044f \u0437\u0433\u0435\u043d\u0435\u0440\u0443\u0432\u0430\u0442\u0438 \u0432\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c. \u0421\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0449\u0435 \u0440\u0430\u0437."
       : "Couldn't generate an answer. Try again in a moment.");
     return;
   }
-  await sendMessage(msg.chat.id, answer);
+  // The model's prose, then dates this code computed -- the OCCURRENCES line itself never
+  // reaches the chat.
+  const { prose, occurrences } = extractOccurrences(answer, ordered);
+  await sendMessage(msg.chat.id, prose + buildOccurrenceFooter(occurrences, parsed.language));
 }
 
 async function recapBackfillRemaining(): Promise<number | null> {
