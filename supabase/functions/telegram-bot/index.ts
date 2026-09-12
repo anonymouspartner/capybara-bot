@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v99";
+const BUILD_VERSION = "v100";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -197,6 +197,18 @@ const RECAP_K_RECENCY = 15;
 // one. Without reserved seats the newest occurrence loses its seat to older text that
 // happens to match the query better -- which is the whole question, answered wrong.
 const RECAP_RECENCY_RESERVED = 6;
+// Relevance floor for a reserved seat, as cosine similarity from the semantic search.
+// Reserving by date out of a pool with no floor is what made v99 answer "when did I last
+// donate blood?" with the date of "It will feed the homeless today" -- that message
+// scored 0.313, thirty-odd ranks down, and got a guaranteed seat purely for being recent.
+//
+// The floor is relative to the best match in the pool, with an absolute minimum, because
+// this corpus has no fixed signal/noise boundary: short chat messages all land in a
+// 0.30-0.40 band, so a constant threshold either admits everything or nothing. Scoring
+// well relative to the best on-topic message is the only stable signal. When nothing
+// clears the floor, no seat is reserved and ranking stays pure relevance.
+const RECAP_RESERVE_FLOOR_ABS = 0.35;
+const RECAP_RESERVE_FLOOR_REL = 0.7;
 // Cap on earlier-mention lines under the answer. A daily-schedule chat can produce
 // dozens of hits for a recurring errand; past half a dozen the footer stops being a
 // cadence and starts being a wall.
@@ -4693,19 +4705,25 @@ async function retrieveCandidates(
   };
 }
 
-function rrfMerge(semantic: RetrievedItem[], keyword: RetrievedItem[]): Map<string, { item: RetrievedItem; score: number }> {
+type MergedEntry = { item: RetrievedItem; score: number; semSim: number | null };
+
+// semSim is carried alongside the fused score because the two search arms report
+// similarity on incomparable scales -- cosine from pgvector, trigram from pg_trgm -- and
+// the relevance floor has to compare like with like. Only the semantic arm's cosine is
+// kept; an item found by keyword alone has no cosine and is never eligible for a reserved
+// seat on similarity it doesn't have.
+function rrfMerge(semantic: RetrievedItem[], keyword: RetrievedItem[]): Map<string, MergedEntry> {
   const RRF_K = 60;
-  const merged = new Map<string, { item: RetrievedItem; score: number }>();
+  const merged = new Map<string, MergedEntry>();
   semantic.forEach((item, idx) => {
-    const key = `${item.source_type}:${item.source_id}`;
-    merged.set(key, { item, score: 1 / (RRF_K + idx + 1) });
+    merged.set(itemKey(item), { item, score: 1 / (RRF_K + idx + 1), semSim: item.similarity });
   });
   keyword.forEach((item, idx) => {
-    const key = `${item.source_type}:${item.source_id}`;
+    const key = itemKey(item);
     const add = 1 / (RRF_K + idx + 1);
     const existing = merged.get(key);
     if (existing) existing.score += add;
-    else merged.set(key, { item, score: add });
+    else merged.set(key, { item, score: add, semSim: null });
   });
   return merged;
 }
@@ -4736,31 +4754,33 @@ function compareByTime(a: RetrievedItem, b: RetrievedItem): number {
 // occurrence instead. A memory tool that omits the most recent day without saying so is
 // worse than one with no buffer at all.
 function filterAndRank(
-  merged: Map<string, { item: RetrievedItem; score: number }>,
+  merged: Map<string, MergedEntry>,
   askerId: string,
   k: number,
   recency: Recency,
 ): RetrievedItem[] {
-  const eligible: { item: RetrievedItem; score: number }[] = [];
+  const eligible: MergedEntry[] = [];
   for (const entry of merged.values()) {
-    const { item } = entry;
     // Notes stay private to whoever wrote them; messages are shared by construction.
-    if (item.source_type === "note" && item.author_id !== askerId) continue;
-    eligible.push({ item, score: entry.score + (item.is_pinned ? RECAP_PIN_BOOST : 0) });
+    if (entry.item.source_type === "note" && entry.item.author_id !== askerId) continue;
+    eligible.push({ ...entry, score: entry.score + (entry.item.is_pinned ? RECAP_PIN_BOOST : 0) });
   }
   eligible.sort((a, b) => b.score - a.score);
   if (!recency) return eligible.slice(0, k).map((e) => e.item);
 
-  // Reserve seats at the end of the timeline the question points at -- see
-  // RECAP_RECENCY_RESERVED. The reservation is drawn from the better-matching half of the
-  // pool rather than the pool at large: the candidate pool is the top N by similarity
-  // with no relevance floor, so its newest member is often just the newest thing that
-  // scored at all, and promoting that on date alone would answer a different question.
-  const onTopic = eligible.slice(0, Math.max(k * 2, RECAP_RECENCY_RESERVED));
-  const byTime = [...onTopic].sort((a, b) =>
-    recency === "latest" ? compareByTime(b.item, a.item) : compareByTime(a.item, b.item));
+  // Reserve seats at the end of the timeline the question points at, but only among items
+  // that actually look like the thing being asked about -- see RECAP_RESERVE_FLOOR_ABS.
+  // Reserving on date alone answers "what did I do most recently", which is a different
+  // question and the one v99 kept answering.
+  const best = eligible.reduce((m, e) => Math.max(m, e.semSim ?? 0), 0);
+  const floor = Math.max(RECAP_RESERVE_FLOOR_ABS, best * RECAP_RESERVE_FLOOR_REL);
+  const onTopic = eligible.filter((e) => (e.semSim ?? 0) >= floor);
   const picked = new Map<string, RetrievedItem>();
-  for (const e of byTime.slice(0, Math.min(RECAP_RECENCY_RESERVED, k))) picked.set(itemKey(e.item), e.item);
+  if (onTopic.length > 0) {
+    const byTime = [...onTopic].sort((a, b) =>
+      recency === "latest" ? compareByTime(b.item, a.item) : compareByTime(a.item, b.item));
+    for (const e of byTime.slice(0, Math.min(RECAP_RECENCY_RESERVED, k))) picked.set(itemKey(e.item), e.item);
+  }
   for (const e of eligible) {
     if (picked.size >= k) break;
     picked.set(itemKey(e.item), e.item);
@@ -4800,9 +4820,19 @@ const OCCURRENCES_LINE = /^[ \t>*_]*OCCURRENCES\b:?[ \t*_]*(.*)$/im;
 // record the event actually happening (rather than planning it, or reminiscing about it)
 // is a judgment call the model is good at, while stating what day each one fell on is
 // arithmetic it is not. So the model returns indices and this code returns dates.
-function extractOccurrences(answer: string, ordered: RetrievedItem[]): { prose: string; occurrences: RetrievedItem[] } {
+const EVIDENCE_LINE = /^[ \t>*_]*EVIDENCE\b:?[ \t*_]*(.*)$/im;
+
+function extractOccurrences(
+  answer: string,
+  ordered: RetrievedItem[],
+): { prose: string; occurrences: RetrievedItem[]; explicit: boolean } {
+  const ev = answer.match(EVIDENCE_LINE);
+  // Default to the weaker claim: "discussed" only asserts the conversation happened that
+  // day, which the context always supports, whereas "explicit" asserts the event itself.
+  const explicit = /\bexplicit\b/i.test(ev?.[1] ?? "");
+  answer = answer.replace(EVIDENCE_LINE, "");
   const m = answer.match(OCCURRENCES_LINE);
-  if (!m) return { prose: answer.trim(), occurrences: [] };
+  if (!m) return { prose: answer.trim(), occurrences: [], explicit };
   const prose = answer.replace(OCCURRENCES_LINE, "").trim();
   const seen = new Set<number>();
   const occurrences: RetrievedItem[] = [];
@@ -4812,17 +4842,44 @@ function extractOccurrences(answer: string, ordered: RetrievedItem[]): { prose: 
     seen.add(n);
     occurrences.push(ordered[n - 1]);
   }
+  // The model is told to list most-recent-first, but the headline must not depend on it
+  // having obeyed: sort here so occurrences[0] is genuinely the newest.
   occurrences.sort((a, b) => compareByTime(b, a));
-  return { prose, occurrences };
+  return { prose, occurrences, explicit };
+}
+
+// The date line, built here rather than written by the model. This is the structural fix
+// for v99 answering with a date no message supported: the headline can only ever be the
+// created_at of an item the model pointed at, so an invented date is not expressible.
+// The label tracks how good the evidence actually is -- "Last time" asserts the event,
+// "Most recent mention" asserts only that it came up that day.
+function buildOccurrenceHeadline(
+  occurrences: RetrievedItem[],
+  recency: Recency,
+  explicit: boolean,
+  lang: LangCode,
+  nowIso: string,
+): string {
+  if (!recency || occurrences.length === 0) return "";
+  const item = recency === "latest" ? occurrences[0] : occurrences[occurrences.length - 1];
+  const uk = lang === "uk";
+  const label = recency === "latest"
+    ? (explicit ? (uk ? "\u041e\u0441\u0442\u0430\u043d\u043d\u0456\u0439 \u0440\u0430\u0437" : "Last time")
+                : (uk ? "\u041e\u0441\u0442\u0430\u043d\u043d\u044f \u0437\u0433\u0430\u0434\u043a\u0430" : "Most recent mention"))
+    : (explicit ? (uk ? "\u041f\u0435\u0440\u0448\u0438\u0439 \u0440\u0430\u0437" : "First time")
+                : (uk ? "\u041f\u0435\u0440\u0448\u0430 \u0437\u0433\u0430\u0434\u043a\u0430" : "First mention"));
+  return `${label}: ${formatFullDate(item.created_at, lang)} \u2014 ${agoPhrase(daysAgo(item.created_at, nowIso), lang)}\n\n`;
 }
 
 // The block under the answer: every occurrence before the one the answer leads with, each
 // with the gap to the occurrence after it. The gaps are what make this worth printing --
 // three dates tell you when, but "4 months, then 4 months" tells you the rhythm, which is
 // usually the thing actually being asked.
-function buildOccurrenceFooter(occurrences: RetrievedItem[], lang: LangCode): string {
+function buildOccurrenceFooter(occurrences: RetrievedItem[], recency: Recency, lang: LangCode): string {
   if (occurrences.length < 2) return "";
-  const earlier = occurrences.slice(1);
+  // occurrences is newest-first; the headline consumed the newest for a "latest" question
+  // and the oldest for an "earliest" one, so drop that end rather than always the first.
+  const earlier = recency === "earliest" ? occurrences.slice(0, -1) : occurrences.slice(1);
   const shown = earlier.slice(0, RECAP_FOOTER_MAX);
   const lines = shown.map((item, idx) => {
     const gap = daysBetweenDays(calendarDay(item.created_at), calendarDay(occurrences[idx].created_at));
@@ -4834,7 +4891,9 @@ function buildOccurrenceFooter(occurrences: RetrievedItem[], lang: LangCode): st
   if (hidden > 0) {
     lines.push(lang === "uk" ? `\u2022 \u0442\u0430 \u0449\u0435 ${hidden}` : `\u2022 and ${hidden} more`);
   }
-  const header = lang === "uk" ? "\u0420\u0430\u043d\u0456\u0448\u0435:" : "Earlier mentions:";
+  const header = recency === "earliest"
+    ? (lang === "uk" ? "\u041f\u0456\u0437\u043d\u0456\u0448\u0435:" : "Later mentions:")
+    : (lang === "uk" ? "\u0420\u0430\u043d\u0456\u0448\u0435:" : "Earlier mentions:");
   return `\n\n${header}\n${lines.join("\n")}`;
 }
 
@@ -4871,15 +4930,15 @@ function buildSynthesisPrompt(
   // the asker is looking something up, not reading a summary. Rule 5's concision budget
   // would otherwise push the date into the middle of a sentence.
   const recencyRules = recency
-    ? `\n13. THIS IS A ${recency === "latest" ? "MOST-RECENT" : "FIRST-TIME"} QUESTION. Open with the answer on its own line: the full date exactly as the CONTEXT prints it, then how long ago. Example: "Last time: Saturday, 14 March 2026 \u2014 5 months ago." Follow it with one short quote as evidence, and stop. Do not lead with context, caveats, or a summary of the surrounding conversation. If two items could each be the ${recency === "latest" ? "most recent" : "first"} occurrence, lead with the one you judge correct and note the other in one clause.`
+    ? `\n13. THIS IS A ${recency === "latest" ? "MOST-RECENT" : "FIRST-TIME"} QUESTION. The date line is added for you from the item you name first in OCCURRENCES \u2014 do NOT write a date, a weekday, or an elapsed span anywhere in your reply. Write one or two sentences saying what the ${recency === "latest" ? "most recent" : "first"} occasion actually shows: who said what, and whether it records the thing as done or only as discussed. Quote at most once, briefly. If the CONTEXT has nothing that plausibly records this at all, say so plainly and omit OCCURRENCES entirely.`
     : "";
   // The indices come back as data and are replaced by dates computed in code -- see
   // extractOccurrences. Asking for them only on recency questions keeps the line off
   // every other answer, where it would be noise the stripper has to clean up.
   const occurrenceProtocol = recency
-    ? `\n\nAFTER your answer, add a final line in exactly this form:\nOCCURRENCES: 3, 7, 12\nList the CONTEXT index numbers of the items that record the event ACTUALLY HAPPENING \u2014 one index per distinct occasion, most recent first. Exclude items that only plan, propose, or reminisce about it, and exclude two indices that describe the same occasion. Write the line even if there is only one occurrence. Omit it entirely only if nothing in the CONTEXT records the event happening at all. This line is stripped before the asker sees the answer \u2014 never refer to it, and never put it anywhere but the very end.`
+    ? `\n\nAFTER your answer, add these two lines, in exactly this form and nothing else:\nOCCURRENCES: 3, 7, 12\nEVIDENCE: discussed\n\nOCCURRENCES lists the CONTEXT index numbers for the occasions this happened \u2014 one index per distinct occasion, MOST RECENT FIRST, so the first number is the occasion the answer is about. Several messages from the same conversation are ONE occasion: pick the single best index for it. Exclude stated future intentions. Omit both lines entirely if nothing in the CONTEXT plausibly records this.\n\nEVIDENCE describes the FIRST index only: "explicit" if a message says outright that it was done, "discussed" if the occasion is only evident from the conversation around it. When in doubt use "discussed".\n\nThese lines are stripped before the asker sees the answer \u2014 never refer to them, and never put them anywhere but the very end.`
     : "";
-  return `You are answering a question about a shared conversational history between two people in a relationship: ${coupleIdentity}. You are the /recap feature of their translation bot \u2014 a private memory tool either of them can query.\n\nThe person asking is: ${askerName}.\nAnswer in: ${answerLangName}. Match the dominant language of their question.\n\nRules:\n1. Ground every claim in the CONTEXT. If the context doesn't contain the answer, say so plainly \u2014 never guess or fill in from general knowledge.\n2. Quote sparingly: 1-2 short quotes total, hard maximum 3, woven naturally into the answer.\n3. Quotes appear in their ORIGINAL language, exactly as written. Do not translate quotes; the narrative around them is in the answer language.\n4. Distinguish messages from notes when citing. Message: "[name] said on March 14: \u00ab...\u00bb". Note: "you noted on March 14: ...". Notes are private observations the writer recorded \u2014 not things the other person said. Never blur this.\n5. Be concise. Narrow questions get 1-4 sentences; broad get a short paragraph. Don't pad or editorialize.\n6. If views conflict or evolve over time, say so.\n7. Do not infer emotional states unless the source text explicitly conveys them.\n8. You do recall and synthesis of what was said or noted \u2014 you are not an advisor, predictor, or judge. If asked what someone will do/want/feel in future, who was right in a disagreement, or for relationship advice: decline warmly and briefly, point to what you CAN do (recall), and suggest a regular chat with Claude or talking with someone who knows them.\n9. If the CONTEXT has nothing relevant, say so in one sentence. "I don't see anything about that in your conversations" is enough.\n10. Preserve tone \u2014 if the messages were playful or affectionate, reflect that.\n11. DATES: each CONTEXT item is numbered and carries its date already written out for you ("Saturday, 14 March 2026 09:22 (5 months ago)"). Reuse those strings verbatim. Never compute, re-derive, abbreviate, or convert a date yourself, and never state a date that is not printed in the CONTEXT.\n12. Do not treat a plan as an event. "I am donating blood tomorrow" records an intention on the day it was sent; only a later message describing it as done establishes that it happened. If the CONTEXT only ever shows the plan, say that is all you can see.${recencyRules}\n\nOutput format: plain text, no headers or markdown beyond the quote guillemets. Speak directly to the asker in second person.${answerNotes}${occurrenceProtocol}\n\n# CONTEXT\n${retrievedItems}\n\n# QUESTION\n${question}`;
+  return `You are answering a question about a shared conversational history between two people in a relationship: ${coupleIdentity}. You are the /recap feature of their translation bot \u2014 a private memory tool either of them can query.\n\nThe person asking is: ${askerName}.\nAnswer in: ${answerLangName}. Match the dominant language of their question.\n\nRules:\n1. Ground every claim in the CONTEXT. If the context doesn't contain the answer, say so plainly \u2014 never guess or fill in from general knowledge.\n2. Quote sparingly: 1-2 short quotes total, hard maximum 3, woven naturally into the answer.\n3. Quotes appear in their ORIGINAL language, exactly as written. Do not translate quotes; the narrative around them is in the answer language.\n4. Distinguish messages from notes when citing. Message: "[name] said on March 14: \u00ab...\u00bb". Note: "you noted on March 14: ...". Notes are private observations the writer recorded \u2014 not things the other person said. Never blur this.\n5. Be concise. Narrow questions get 1-4 sentences; broad get a short paragraph. Don't pad or editorialize.\n6. If views conflict or evolve over time, say so.\n7. Do not infer emotional states unless the source text explicitly conveys them.\n8. You do recall and synthesis of what was said or noted \u2014 you are not an advisor, predictor, or judge. If asked what someone will do/want/feel in future, who was right in a disagreement, or for relationship advice: decline warmly and briefly, point to what you CAN do (recall), and suggest a regular chat with Claude or talking with someone who knows them.\n9. If the CONTEXT has nothing relevant, say so in one sentence. "I don't see anything about that in your conversations" is enough.\n10. Preserve tone \u2014 if the messages were playful or affectionate, reflect that.\n11. DATES: each CONTEXT item is numbered and carries its date already written out for you ("Saturday, 14 March 2026 09:22 (5 months ago)"). Reuse those strings verbatim. Never compute, re-derive, abbreviate, or convert a date yourself, and never state a date that is not printed in the CONTEXT.\n12. EVIDENCE. These are chat logs, not a diary: people rarely write "I did X today". A conversation ABOUT doing something, on the day it happened, is usually the only trace it leaves \u2014 treat that as real evidence of the occasion, not as nothing. What does NOT count as the occasion is a stated future intention ("I have to sign up again", "I am going tomorrow"); that belongs to the day it was said, and only a later message shows whether it happened. Say which kind of evidence you actually have.${recencyRules}\n\nOutput format: plain text, no headers or markdown beyond the quote guillemets. Speak directly to the asker in second person.${answerNotes}${occurrenceProtocol}\n\n# CONTEXT\n${retrievedItems}\n\n# QUESTION\n${question}`;
 }
 
 async function synthesizeAnswer(
@@ -4974,10 +5033,13 @@ async function handleRecap(msg: any, user: any) {
       : "Couldn't generate an answer. Try again in a moment.");
     return;
   }
-  // The model's prose, then dates this code computed -- the OCCURRENCES line itself never
-  // reaches the chat.
-  const { prose, occurrences } = extractOccurrences(answer, ordered);
-  await sendMessage(msg.chat.id, prose + buildOccurrenceFooter(occurrences, parsed.language));
+  // Code-computed date line, the model's prose, then code-computed earlier mentions. The
+  // OCCURRENCES / EVIDENCE lines never reach the chat, and no date in the output comes
+  // from the model.
+  const { prose, occurrences, explicit } = extractOccurrences(answer, ordered);
+  const headline = buildOccurrenceHeadline(occurrences, parsed.recency, explicit, parsed.language, nowIso);
+  const footer = buildOccurrenceFooter(occurrences, parsed.recency, parsed.language);
+  await sendMessage(msg.chat.id, headline + prose + footer);
 }
 
 async function recapBackfillRemaining(): Promise<number | null> {
