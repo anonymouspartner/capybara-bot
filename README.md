@@ -191,7 +191,9 @@ Earlier mentions:
 • 19 Jun 2024 (16 months before)
 ```
 
-Dates render against `COUPLE_TIMEZONE` (see Secrets); unset means UTC.
+Dates render in **UTC**, as every `/recap` date always has. A message sent late in the
+evening from a zone behind UTC is stamped on the following UTC day, so a date answer about
+it can read a day late; the message itself is in the chat with its local time on it.
 
 ## The model: one instance per pair
 
@@ -581,9 +583,6 @@ deploy-safety and reproducibility handoffs that shaped them.
 - **A freshly-sent message doesn't appear in `/recap`** — embedding happens in the
   background a few seconds after the message lands; give it a moment. If it never shows
   up, run `/recap_backfill` (admin) to embed the backlog.
-- **`/recap` dates are a day off** — `COUPLE_TIMEZONE` is unset (or wrong), so dates
-  render in UTC and late-evening messages land on the next calendar day. Set it to an
-  IANA zone name and redeploy.
 - **Voice transcription works but no audio is archived** — the `voice-messages` storage
   bucket is missing; the upload error is logged and ignored. Create the bucket.
 - **`getWebhookInfo` shows a `last_error_message`** — usually a wrong webhook URL or a

@@ -83,11 +83,6 @@ Optional (enable the admin `/update` self-deploy command; the feature is inert i
 `/update` only reports version status, no deploy button), `GITHUB_REPO` (`owner/name`),
 `GITHUB_DEPLOY_BRANCH` (defaults to `main`).
 
-Optional (date rendering for `/recap`): `COUPLE_TIMEZONE` — an IANA zone name
-(`America/New_York`, `Europe/Kyiv`). Unset means UTC, which renders late-evening messages
-under the next calendar day and so mis-dates "when did I last …" answers by one day. An
-unrecognized value falls back to UTC rather than throwing.
-
 Optional (enable the admin `/bug` report command; inert if unset): `GITHUB_ISSUE_TOKEN` (GitHub PAT
 with `Issues: write` — files issues on `GITHUB_REPO`). Falls back to `GITHUB_DEPLOY_TOKEN`, which
 then needs both `Issues: write` and `Actions: write`; keeping them separate means the issue-filing

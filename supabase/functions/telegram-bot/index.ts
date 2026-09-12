@@ -204,18 +204,17 @@ const RECAP_FOOTER_MAX = 6;
 const RECAP_PIN_BOOST = 0.005;
 const RECAP_CANDIDATE_POOL = 50;
 const RECAP_BACKFILL_BATCH_SIZE = 50;
-// Which wall clock /recap renders dates against. messages.created_at is now() at insert:
-// an absolute UTC instant with no zone attached. The Telegram app only looks right
-// because the phone applies its own zone when drawing the bubble; server-side there is no
-// phone, so the zone has to be configuration. Unset means UTC, which is what every
-// instance rendered before this setting existed -- so leaving it unset changes nothing.
-// Set it to an IANA name (e.g. "America/New_York") to make /recap agree with the calendar
-// day the message appears under in the chat.
-// ?? would keep an empty string: provision.sh and setup.ts upload EVERY key in .env, so
-// an untouched "COUPLE_TIMEZONE=" line arrives as "" rather than unset, and "" makes
-// every Intl call throw into its UTC fallback. || collapses both cases to the same
-// default without paying for an exception per formatted date.
-const COUPLE_TIMEZONE = Deno.env.get("COUPLE_TIMEZONE")?.trim() || "UTC";
+// Which wall clock /recap renders dates against. messages.created_at is now() at insert
+// -- an absolute UTC instant -- and every /recap date is rendered back in UTC, which is
+// what the bot has always done (the old context block sliced the raw timestamp). Named
+// rather than inlined at each formatter so the choice is visible in one place, and so
+// moving off it later is a one-line change.
+//
+// The known edge: a message sent late in the evening in a zone behind UTC is stamped on
+// the following UTC day, so a date question about it can read one day late. The exact
+// message is still right there in the chat with its local time on it, which is where that
+// gets resolved.
+const RECAP_TIMEZONE = "UTC";
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
@@ -4492,14 +4491,8 @@ function recapLocale(lang: LangCode): string {
   return lang === "uk" ? "uk-UA" : "en-GB";
 }
 
-// An invalid COUPLE_TIMEZONE is a typo in a secret, not a reason for /recap to start
-// throwing, so every formatter falls back to UTC rather than propagating the RangeError.
 function tzFormatter(lang: LangCode, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
-  try {
-    return new Intl.DateTimeFormat(recapLocale(lang), { ...options, timeZone: COUPLE_TIMEZONE });
-  } catch {
-    return new Intl.DateTimeFormat(recapLocale(lang), { ...options, timeZone: "UTC" });
-  }
+  return new Intl.DateTimeFormat(recapLocale(lang), { ...options, timeZone: RECAP_TIMEZONE });
 }
 
 function formatInTz(iso: string, lang: LangCode, options: Intl.DateTimeFormatOptions): string {

@@ -207,10 +207,6 @@ Expect `"url"` set, `"pending_update_count"` small, and no `"last_error_message"
 > reading it as a broken deploy. (Messages used to be held back for 24 hours; that
 > cooling-off was removed — see README, "The `/recap` memory pipeline".)
 
-> **Dates in `/recap` answers** render against the optional `COUPLE_TIMEZONE` secret. If
-> it's unset they render in UTC, which puts late-evening messages on the following
-> calendar day. Set it during setup if this couple cares about date questions.
-
 ---
 
 ## Notes
