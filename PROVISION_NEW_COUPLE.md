@@ -201,10 +201,15 @@ Expect `"url"` set, `"pending_update_count"` small, and no `"last_error_message"
 6. **/remember `a private note`**, wait a few seconds (background embedding), then
    **/recap `ask about that note`** → returns the note, cited *as a note*.
 
-> **Recap gotcha — not a bug:** a freshly-sent **message** will **not** appear in
-> `/recap` for **24 hours** (by-design cooling-off, messages only). `/remember` notes
-> are exempt, which is why the recap smoke test uses a note. Don't read the 24h
-> message delay as a broken deploy.
+> **Recap timing — not a bug:** both messages and notes are searchable as soon as
+> they're embedded, which happens in the background a few seconds after they land. If
+> `/recap` comes up empty right after sending, wait a beat and ask again rather than
+> reading it as a broken deploy. (Messages used to be held back for 24 hours; that
+> cooling-off was removed — see README, "The `/recap` memory pipeline".)
+
+> **Dates in `/recap` answers** render against the optional `COUPLE_TIMEZONE` secret. If
+> it's unset they render in UTC, which puts late-evening messages on the following
+> calendar day. Set it during setup if this couple cares about date questions.
 
 ---
 
