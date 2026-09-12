@@ -156,7 +156,11 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
 2. **Embed** the question (OpenAI `text-embedding-3-small`, 1536-dim).
 3. **Retrieve** a candidate pool two ways in parallel:
    - **Semantic** — cosine distance over `pgvector` (ivfflat index).
-   - **Keyword** — trigram similarity (`pg_trgm`).
+   - **Keyword** — Postgres full-text search over each message's **original text plus its
+     stored translation**, so an English question reaches a Ukrainian message through the
+     translation written at ingest. The question's terms are ORed and ranked with
+     `ts_rank_cd`; filler words are dropped by how common they are *within that question*,
+     which removes language-specific stopwords without hardcoding a language.
 4. **Merge** the two rankings with **Reciprocal Rank Fusion** (RRF), then **filter and
    rank**:
    - **Note privacy** — notes are only visible to their author.
@@ -164,7 +168,9 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
    - **Reconciled messages are excluded** entirely.
    - **Recency reservation** — on a "when did I last…" question, the newest on-topic
      candidates get reserved seats instead of being out-ranked by older text that happens
-     to match the wording better.
+     to match the wording better. A reserved seat requires clearing a relevance floor
+     relative to the best match in the pool; without one a recent but barely-related
+     message takes the seat and the answer becomes a date for the wrong event.
 5. **Synthesize** (Claude Sonnet) a grounded answer: quotes appear in their original
    language, messages and notes are cited distinctly, and the model is instructed never
    to guess beyond the retrieved context or to play advisor/predictor/judge.
@@ -175,11 +181,16 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
 it gets its own path. The parser tags a question as `latest` or `earliest`; that tag
 widens retrieval, tells the synthesis prompt to lead with the date on its own line, and
 asks the model to return the context indices of the items that record the event *actually
-happening* (as opposed to planning it). Those indices come back as data — **every date the
-answer states is computed in code from `created_at`, never by the model**, which is
-unreliable at date arithmetic and will happily drop a year or misjudge an elapsed span.
-The result is a dated headline plus an *Earlier mentions* footer showing the gaps between
-occurrences:
+happening* (as opposed to planning it). Those indices come back as data — **the date line is
+built in code from the `created_at` of an item the model pointed at**, so a date no
+message supports cannot be expressed. The model writes only the narrative, and is told not
+to write a date at all.
+
+Because these are chat logs rather than a diary, a day's *conversation* about something
+counts as evidence of it; a stated future intention does not. The headline says which it
+has: "Last time" when a message records the thing as done, "Most recent mention" when the
+day is only evident from the conversation around it. The result is a dated headline plus
+an *Earlier mentions* footer showing the gaps between occurrences:
 
 ```
 Last time: Saturday, 14 March 2026 — 6 months ago
