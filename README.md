@@ -587,6 +587,21 @@ deploy-safety and reproducibility handoffs that shaped them.
   bucket is missing; the upload error is logged and ignored. Create the bucket.
 - **`getWebhookInfo` shows a `last_error_message`** — usually a wrong webhook URL or a
   `secret_token` that doesn't match `WEBHOOK_SECRET`. Re-run `setWebhook`.
+- **The bot stops answering entirely, and its logs show nothing at all** — suspect a
+  *stolen webhook*. A Telegram bot token has exactly **one** webhook URL, so any other
+  project that runs `setWebhook` with this bot's token silently takes every update: this
+  function is simply never called again, which is why nothing turns up in its logs. The
+  tell is that the bot answers `/start` with **another app's** greeting. Check it without
+  going through Telegram at all:
+
+  ```
+  GET https://<REF>.supabase.co/functions/v1/telegram-bot?health&webhook
+  ```
+
+  `webhook.pointsHere: false` confirms it, and `webhook.registeredUrl` names the thief.
+  `/diag` (admin) reports the same thing in-chat once the webhook is back. To fix it:
+  give the other service its **own** bot from @BotFather, then re-run `setWebhook` here
+  to reclaim the token — see PROVISION_NEW_COUPLE.md step 6.
 - **Deploy aborted by the gate** — `predeploy-check.ps1` failed (`deno check`, line
   count, or missing anchors). Fix the reported issue; nothing was deployed.
 

@@ -8,10 +8,14 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v99";
+const BUILD_VERSION = "v100";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
+// Where Telegram SHOULD be delivering this bot's updates. Derived from the injected
+// SUPABASE_URL rather than configured, so it is right on every instance with nothing to
+// set -- see fetchWebhookStatus for why anything else is an emergency.
+const EXPECTED_WEBHOOK_URL = `${SUPABASE_URL}/functions/v1/telegram-bot`;
 // CLAUDE_MODEL does the language-quality work: translation, /recap synthesis,
 // vocabulary annotation, and dictionary-form translation on nuanced EN<->UK text
 // (register, Ukrainian gender agreement, literary-Ukrainian / no-Russian discipline,
@@ -309,6 +313,23 @@ Deno.serve(async (req) => {
         body.seedCheckError = (e as Error)?.message ?? String(e);
       }
     }
+    // Opt-in webhook check (?webhook): asks Telegram where it is actually delivering
+    // this bot's updates. Kept off the default probe because it is a third-party call
+    // and plain health must stay dependency-free -- but it is the ONLY check that
+    // catches a stolen webhook, and it is reachable over plain HTTP precisely when the
+    // bot itself is not answering in Telegram, which is when you need it.
+    if (url.searchParams.has("webhook")) {
+      const w = await fetchWebhookStatus();
+      body.webhook = {
+        reachable: w.reachable,
+        registeredUrl: w.url,
+        pointsHere: w.pointsHere,
+        expectedUrl: EXPECTED_WEBHOOK_URL,
+        pendingUpdates: w.pending,
+        lastError: w.lastError,
+        detail: w.detail,
+      };
+    }
     return new Response(
       JSON.stringify(body),
       { status: 200, headers: { "content-type": "application/json" } },
@@ -349,6 +370,28 @@ Deno.serve(async (req) => {
       await handleUpdate(update);
     } catch (e) {
       console.error("handleUpdate error:", e);
+      // The infrastructure underneath us was down, not the message. Answer non-2xx and
+      // Telegram keeps the update and redelivers it shortly. Returning 200 here is what
+      // made a Supabase blip indistinguishable from the bot ignoring someone: the sender
+      // got no reply, and the update was discarded by Telegram as delivered, so the
+      // message was never stored, never translated and never came back.
+      if (e instanceof RetryableInfraError) {
+        return new Response("retry", { status: 503 });
+      }
+      // Anything else is a bug of ours and would fail again on every redelivery, so take
+      // the 200 and say so instead. An unanswered message reads as a broken bot; a
+      // sender who is told it failed can simply send it again. Bilingual and best-effort
+      // -- the user row may be exactly what we could not read.
+      try {
+        const chatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id;
+        if (typeof chatId === "number") {
+          await sendMessage(chatId,
+            "\u26a0\ufe0f \u0429\u043e\u0441\u044c \u043f\u0456\u0448\u043b\u043e \u043d\u0435 \u0442\u0430\u043a \u2014 \u0446\u0435 \u043f\u043e\u0432\u0456\u0434\u043e\u043c\u043b\u0435\u043d\u043d\u044f \u043d\u0435 \u0437\u0431\u0435\u0440\u0435\u0436\u0435\u043d\u043e. \u0421\u043f\u0440\u043e\u0431\u0443\u0439 \u043d\u0430\u0434\u0456\u0441\u043b\u0430\u0442\u0438 \u0449\u0435 \u0440\u0430\u0437.\n\n" +
+            "\u26a0\ufe0f Something went wrong on my side \u2014 that message wasn't saved. Please send it again.");
+        }
+      } catch (notifyErr) {
+        console.error("failed to notify sender of handleUpdate error:", notifyErr);
+      }
     }
     return new Response("ok");
   } catch (e) {
@@ -575,15 +618,35 @@ async function handleUpdate(update: any) {
   else { await sendMessage(msg.chat.id, "I can handle text, voice, photos, videos, files, stickers, GIFs, audio, locations, and contacts. Other types aren't supported yet."); }
 }
 
+// Thrown when the thing that failed is the infrastructure underneath us -- a Supabase
+// read that keeps timing out -- rather than anything about the message itself. The
+// webhook turns this into a non-2xx so TELEGRAM holds the update and redelivers it a few
+// seconds later, which is the only answer that neither misinforms the sender nor throws
+// away what they wrote. Every other error still answers 200: a deterministic bug would
+// be redelivered on a loop forever, and the sender would watch the same failure repeat.
+class RetryableInfraError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RetryableInfraError";
+  }
+}
+
 async function lookupUser(tgUser: any) {
   // Distinguish "no such user" (a clean read that returns no row) from a transient
   // read failure. Swallowing the error here made a *registered* user see the
   // "not registered" message whenever this users read blipped (pooler hiccup,
   // cold-start race, dropped connection) -- the caller treats any null as
   // unregistered. Capture the error (like lookupPartner / lookupLearnerOfLanguage
-  // below), retry, and if the read keeps failing THROW so the caller aborts
-  // silently instead of misinforming the user. The "not registered" branch must
-  // fire only on a genuine, error-free absence.
+  // below), retry, and if the read keeps failing throw RetryableInfraError instead
+  // of misinforming the user. The "not registered" branch must fire only on a
+  // genuine, error-free absence.
+  //
+  // That throw used to abort SILENTLY behind a 200: the sender saw nothing at all,
+  // and because Telegram had been told the update was delivered, the message was
+  // never stored, never translated, and never redelivered -- it just vanished.
+  // Gateway Timeouts from this project's data API are a recurring fact of life, so
+  // that path gets hit for real, and it reads to the sender as the bot ignoring
+  // them. The webhook now answers non-2xx for this error so Telegram redelivers.
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const { data, error } = await supabase.from("users").select("*")
@@ -593,7 +656,7 @@ async function lookupUser(tgUser: any) {
     console.error(`lookupUser read failed (attempt ${attempt}):`, error);
     if (attempt < 3) await new Promise((r) => setTimeout(r, 200 * attempt));
   }
-  throw new Error(
+  throw new RetryableInfraError(
     `lookupUser: users read failed after retries: ${(lastErr as { message?: string })?.message ?? String(lastErr)}`,
   );
 }
@@ -1361,7 +1424,7 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
   }
 }
 
-async function sendMessage(chatId: number, text: string, parseMode?: string, replyMarkup?: any) {
+async function sendMessage(chatId: number, text: string, parseMode?: string, replyMarkup?: any): Promise<boolean> {
   // A force_reply prompt occupies the same reply_markup slot as the menu keyboard, so
   // Telegram swaps the keyboard out to show the reply box and never puts it back. The
   // answered command's own reply has to carry it -- see pendingKeyboardRestore. Riding
@@ -1371,20 +1434,53 @@ async function sendMessage(chatId: number, text: string, parseMode?: string, rep
     replyMarkup = buildMenuKeyboard(pendingKeyboardRestore.menu, pendingKeyboardRestore.isAdmin);
     pendingKeyboardRestore = null;
   }
-  const body: any = { chat_id: chatId, text };
-  if (parseMode) body.parse_mode = parseMode;
-  if (replyMarkup) body.reply_markup = replyMarkup;
-  const resp = await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    const respBodyRaw = await resp.text().catch(() => "<no body>");
-    const respBody = respBodyRaw.length > 500 ? respBodyRaw.slice(0, 500) + "\u2026" : respBodyRaw;
-    const preview = text.length > 200 ? text.slice(0, 200) + "\u2026" : text;
-    console.error(`sendMessage failed: chat=${chatId} status=${resp.status} body=${respBody} preview=${JSON.stringify(preview)}`);
+  // One POST attempt. Never throws: a rejected fetch comes back as status 0 so the
+  // caller below can treat "Telegram unreachable" and "Telegram said no" uniformly.
+  const attempt = async (mode?: string): Promise<{ ok: boolean; status: number; body: string }> => {
+    const body: any = { chat_id: chatId, text };
+    if (mode) body.parse_mode = mode;
+    if (replyMarkup) body.reply_markup = replyMarkup;
+    try {
+      const resp = await fetch(`${TELEGRAM_API}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (resp.ok) return { ok: true, status: resp.status, body: "" };
+      const raw = await resp.text().catch(() => "<no body>");
+      return { ok: false, status: resp.status, body: raw.length > 500 ? raw.slice(0, 500) + "\u2026" : raw };
+    } catch (e) {
+      return { ok: false, status: 0, body: `fetch threw: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  };
+
+  let mode = parseMode;
+  let result = await attempt(mode);
+
+  // Telegram rejects the WHOLE message when its Markdown doesn't parse, and the text we
+  // format is text we don't control: a model's translation, or whatever the partner
+  // typed. One stray "_", "*" or "`" in there used to cost the reader the entire
+  // translation -- logged here, invisible to them, indistinguishable from the bot being
+  // down. Resend it as plain text instead; a translation with a literal asterisk in it
+  // beats no translation at all.
+  if (!result.ok && mode && result.status === 400) {
+    console.error(`sendMessage: ${mode} rejected, retrying unformatted: chat=${chatId} body=${result.body}`);
+    mode = undefined;
+    result = await attempt(mode);
   }
+
+  // Telegram unreachable or briefly broken -- worth exactly one more try before the
+  // reader is left with nothing.
+  if (!result.ok && (result.status === 0 || result.status >= 500)) {
+    await new Promise((r) => setTimeout(r, 500));
+    result = await attempt(mode);
+  }
+
+  if (!result.ok) {
+    const preview = text.length > 200 ? text.slice(0, 200) + "\u2026" : text;
+    console.error(`sendMessage failed: chat=${chatId} status=${result.status} body=${result.body} preview=${JSON.stringify(preview)}`);
+  }
+  return result.ok;
 }
 
 // Acknowledge an inline-button tap. Telegram shows the user a spinner until this
@@ -1521,6 +1617,84 @@ async function sendContact(chatId: number, phoneNumber: string, firstName: strin
     body: JSON.stringify({ chat_id: chatId, phone_number: phoneNumber, first_name: firstName, last_name: lastName, vcard }),
   });
   if (!resp.ok) console.error("sendContact failed:", resp.status, await resp.text().catch(() => "<no body>"));
+}
+
+// --- Webhook ownership -------------------------------------------------------
+// A Telegram bot token has exactly ONE webhook URL. Point a second service at the same
+// token -- another project's setWebhook run with this bot's token pasted into its .env --
+// and every update silently moves to that service. This function stops being called at
+// all, so there is no error in its logs, no failed send, nothing: from the chat it looks
+// precisely like the bot refusing to answer. That has happened here, with a job-triage
+// bot answering /start in the couple's translation chat. getWebhookInfo is the only
+// place the truth lives, so both /diag and the health route expose it.
+type WebhookStatus = {
+  reachable: boolean;       // the probe itself got an answer out of Telegram
+  url: string | null;       // where Telegram is delivering right now
+  pointsHere: boolean;      // ...and whether that is this function
+  pending: number | null;   // updates accepted but not yet delivered
+  lastError: string | null;
+  detail: string | null;
+};
+
+// Origin + path only: the registered URL never carries the webhook secret (that rides in
+// a header), and a trailing slash is not a difference worth alarming anyone about.
+function sameEndpoint(a: string, b: string): boolean {
+  try {
+    const ua = new URL(a), ub = new URL(b);
+    return ua.origin === ub.origin &&
+      ua.pathname.replace(/\/+$/, "") === ub.pathname.replace(/\/+$/, "");
+  } catch {
+    return false;
+  }
+}
+
+async function fetchWebhookStatus(): Promise<WebhookStatus> {
+  const dead = (detail: string): WebhookStatus =>
+    ({ reachable: false, url: null, pointsHere: false, pending: null, lastError: null, detail });
+  try {
+    const resp = await fetch(`${TELEGRAM_API}/getWebhookInfo`);
+    const body = await resp.json().catch(() => null);
+    if (!resp.ok || !body?.ok) {
+      return dead(`HTTP ${resp.status}${body?.description ? `: ${body.description}` : ""}`);
+    }
+    const info = body.result ?? {};
+    const url: string | null = info.url || null;
+    return {
+      reachable: true,
+      url,
+      pointsHere: url ? sameEndpoint(url, EXPECTED_WEBHOOK_URL) : false,
+      pending: typeof info.pending_update_count === "number" ? info.pending_update_count : null,
+      lastError: info.last_error_message
+        ? `${info.last_error_message}${info.last_error_date ? ` (${new Date(info.last_error_date * 1000).toISOString()})` : ""}`
+        : null,
+      detail: null,
+    };
+  } catch (e) {
+    return dead(`transport fail: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+// The webhook lines for /diag, sharpest problem first.
+function webhookDiagLines(w: WebhookStatus): string[] {
+  if (!w.reachable) return [`\u274c Telegram webhook check FAIL: ${w.detail}`];
+  if (!w.url) {
+    return [
+      "\u274c Telegram webhook NOT SET \u2014 Telegram is delivering nothing to this function.",
+      `   Re-run setWebhook against ${EXPECTED_WEBHOOK_URL}`,
+    ];
+  }
+  if (!w.pointsHere) {
+    return [
+      "\ud83d\udea8 Telegram webhook HIJACKED \u2014 this bot token now delivers to:",
+      `   ${w.url}`,
+      `   Expected: ${EXPECTED_WEBHOOK_URL}`,
+      "   Another service ran setWebhook with THIS bot's token. Give that service its own",
+      "   bot from @BotFather, then re-run setWebhook here to take the token back.",
+    ];
+  }
+  const lines = [`\u2705 Telegram webhook OK (${w.pending ?? 0} pending)`];
+  if (w.lastError) lines.push(`\u26a0\ufe0f Last delivery error: ${w.lastError}`);
+  return lines;
 }
 
 // --- Command menu (deleteMyCommands) -----------------------------------------
@@ -4128,6 +4302,11 @@ async function handleCallbackQuery(cq: any) {
 async function handleDiag(msg: any, user: any) {
   if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
   const lines: string[] = ["\ud83d\udd0d Diagnostic check..."];
+
+  // First, because a stolen webhook makes every other probe here meaningless: the
+  // services can all be green while Telegram quietly delivers this couple's messages
+  // to somebody else's server.
+  lines.push(...webhookDiagLines(await fetchWebhookStatus()));
 
   const anthropicStart = Date.now();
   try {
