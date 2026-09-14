@@ -1,0 +1,117 @@
+name: webhook-watch
+
+# Watches, from OUTSIDE, whether this bot still owns its own Telegram webhook.
+#
+# Why this exists: a Telegram bot token can be served by exactly one consumer. When
+# another service is configured with this bot's token it takes the updates -- a second
+# webhook consumer overwrites the URL, and a POLLING client is worse, because polling and
+# webhooks are mutually exclusive so those libraries call deleteWebhook on every startup.
+# Either way Telegram stops delivering here, this function is never invoked, and NOTHING
+# appears in its logs. There is no in-band signal at all: the chat simply goes quiet, and
+# the couple assumes the bot is ignoring them. That is exactly how it went unnoticed for
+# hours. The check therefore cannot live inside the bot.
+#
+# ?health&webhook asks Telegram where it is actually delivering (fetchWebhookStatus in
+# index.ts). It is plain HTTP, so it answers precisely when the bot is NOT answering in
+# Telegram -- which is when you need it.
+#
+# A failing scheduled run emails the repo owner. That is the entire point of this
+# workflow: do not quiet a red run by loosening the assertions below.
+#
+# NOTE: GitHub disables scheduled workflows after 60 days with no repo activity. If this
+# stops firing, re-enable it in the Actions tab.
+
+on:
+  schedule:
+    # Every 30 minutes -- worst-case 30 minutes of silence instead of hours. Tune freely;
+    # scheduled runs are free on a public repo, and GitHub may delay a tick under load.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+# A manual dispatch landing on top of a scheduled tick would just probe twice.
+concurrency:
+  group: webhook-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe the webhook owner
+        env:
+          # Same secret the deploy workflow uses. Being a secret, it is masked in these
+          # logs, so the URLs printed below appear partly redacted -- the field that
+          # matters on a hijack (a FOREIGN host) is not masked and will show.
+          REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${REF:-}" ]; then
+            echo "FAIL: SUPABASE_PROJECT_REF is not set on this repo."
+            exit 1
+          fi
+
+          if ! body=$(curl -fsS --max-time 30 "https://${REF}.supabase.co/functions/v1/telegram-bot?health&webhook"); then
+            echo "FAIL: health route unreachable -- the edge function itself may be down."
+            exit 1
+          fi
+
+          echo "$body" | jq .
+          echo
+
+          field() { echo "$body" | jq -r "$1"; }
+
+          status=$(field '.status // "missing"')
+          if [ "$status" != "ok" ]; then
+            echo "FAIL: health status is '$status', expected 'ok'."
+            exit 1
+          fi
+
+          if [ "$(field '.webhook.reachable // false')" != "true" ]; then
+            echo "FAIL: could not reach Telegram to ask who owns the webhook."
+            echo "  $(field '.webhook.detail // "no detail given"')"
+            echo "  Usually a bad TELEGRAM_BOT_TOKEN or a Telegram API outage."
+            exit 1
+          fi
+
+          if [ "$(field '.webhook.pointsHere // false')" != "true" ]; then
+            echo "FAIL: THIS BOT NO LONGER OWNS ITS WEBHOOK."
+            echo "  Telegram delivers to: $(field '.webhook.registeredUrl // "(nothing -- the webhook was deleted)"')"
+            echo "  Expected:             $(field '.webhook.expectedUrl')"
+            echo
+            echo "Another service is using this bot's token, so the couple's messages are"
+            echo "going to it, or nowhere at all. An empty URL means a polling client"
+            echo "deleted the webhook on startup and is draining updates via getUpdates."
+            echo "See README -> 'The bot stops answering entirely'."
+            exit 1
+          fi
+
+          last_error=$(field '.webhook.lastError // "null"')
+          if [ "$last_error" != "null" ]; then
+            echo "FAIL: Telegram reports a webhook delivery error."
+            echo "  $last_error"
+            echo
+            echo "A 401 here means secret_token does not match WEBHOOK_SECRET: the webhook"
+            echo "looks perfectly registered while every single update is rejected."
+            exit 1
+          fi
+
+          if [ "$(field '.adminConfigured // false')" != "true" ]; then
+            echo "FAIL: adminConfigured is false -- ADMIN_TELEGRAM_ID is unset on the project."
+            echo "  Admin commands (/diag, /update, /bug) are gated shut until it is set."
+            exit 1
+          fi
+
+          pending=$(field '.webhook.pendingUpdates // 0')
+          echo "OK: webhook points here, no delivery errors, admin configured."
+          echo "    version=$(field '.version')  pendingUpdates=${pending}"
+
+          # Not a failure -- Telegram queues during a brief outage and drains on its own.
+          # A number that stays high across runs means deliveries are not succeeding.
+          if [ "$pending" != "null" ] && [ "$pending" -gt 50 ] 2>/dev/null; then
+            echo "    NOTE: ${pending} updates are queued. If this does not fall on the next"
+            echo "    run, deliveries are failing even though the webhook is registered."
+          fi

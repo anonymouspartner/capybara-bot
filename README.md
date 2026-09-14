@@ -598,10 +598,17 @@ deploy-safety and reproducibility handoffs that shaped them.
   GET https://<REF>.supabase.co/functions/v1/telegram-bot?health&webhook
   ```
 
-  `webhook.pointsHere: false` confirms it, and `webhook.registeredUrl` names the thief.
+  `webhook.pointsHere: false` confirms it, and `webhook.registeredUrl` names the thief —
+  or is empty, which means a **polling** client deleted the webhook on startup (polling
+  and webhooks are mutually exclusive) and is draining updates via `getUpdates`.
   `/diag` (admin) reports the same thing in-chat once the webhook is back. To fix it:
   give the other service its **own** bot from @BotFather, then re-run `setWebhook` here
   to reclaim the token — see PROVISION_NEW_COUPLE.md step 6.
+
+  The `webhook-watch` workflow runs this check every 30 minutes and emails you when it
+  fails, so this can't go unnoticed for hours again. It needs the same
+  `SUPABASE_PROJECT_REF` repo secret the deploy workflow uses. Note that GitHub disables
+  scheduled workflows after 60 days of repo inactivity.
 - **Deploy aborted by the gate** — `predeploy-check.ps1` failed (`deno check`, line
   count, or missing anchors). Fix the reported issue; nothing was deployed.
 
