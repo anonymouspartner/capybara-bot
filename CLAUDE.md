@@ -30,7 +30,7 @@ couple (not multi-tenant).
 | `storage_setup.sql` | Creates the private `voice-messages` Storage bucket. |
 | `PROVISION_NEW_COUPLE.md` | The setup runbook — start here for a new instance. |
 | `.env.example` | Template for the five function secrets (copy to `.env`). |
-| `.github/workflows/` | CI gate (`check.yml`) + **primary deploy path** (`deploy.yml`, manual `workflow_dispatch`); `.devcontainer/` for Codespaces. |
+| `.github/workflows/` | CI gate (`check.yml`) + **primary deploy path** (`deploy.yml`, manual `workflow_dispatch`) + `webhook-watch.yml` (scheduled outside-in check that this bot still owns its Telegram webhook); `.devcontainer/` for Codespaces. |
 | `deploy.ps1` / `predeploy-check.ps1` | Fallback deploy spine for offline/local deploys (Windows PowerShell). |
 | `deploy.sh` / `predeploy-check.sh` / `provision.sh` | Same fallback spine, ported to bash, + provisioning glue. |
 | `docs/` | Background & design history (deploy-safety + reproducibility handoffs). |
@@ -77,6 +77,18 @@ below are set.
 `TELEGRAM_BOT_TOKEN`, `WEBHOOK_SECRET`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `ADMIN_TELEGRAM_ID` (the English-native partner's numeric Telegram ID).
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are auto-injected by Supabase — don't set them.
+
+**One token, one consumer.** `TELEGRAM_BOT_TOKEN` belongs to this bot and nothing else —
+not one *bot*, one *process*. Telegram serves a token to a single consumer, so any other
+service configured with it takes this bot's updates. A second webhook consumer overwrites
+the URL; a **polling** client is worse, because polling and webhooks are mutually exclusive
+and those libraries call `deleteWebhook` on every startup. Either way Telegram stops
+delivering here, the function is never invoked, and **nothing appears in its logs** — the
+chat just goes quiet, which reads as the bot ignoring the couple. This has happened (a
+job-triage bot on this token answered `/start` in the couple's chat). Never copy a `.env`
+between projects; give the other service its own @BotFather bot. `getWebhookInfo` is the
+only place the truth lives — `/diag`, `?health&webhook`, and the `webhook-watch` workflow
+all read it.
 
 Optional (enable the admin `/update` self-deploy command; the feature is inert if unset):
 `GITHUB_DEPLOY_TOKEN` (GitHub PAT with `Actions: write` — dispatches `deploy.yml`; without it
