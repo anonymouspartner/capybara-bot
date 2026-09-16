@@ -1405,6 +1405,34 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
   if (vocabRows.length > 0) {
     await supabase.from("vocabulary").upsert(vocabRows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
   }
+  // capybara-anki (its own repo, docs/DESIGN.md §2.2): the same words also become
+  // real, independently reviewable flashcards there -- one more upsert next to
+  // the one above, not a reconciliation job, and this table is never read back
+  // from here. anki_notes.language is constrained to 'uk'/'en' (unlike this
+  // table's free-text one), so this only fires for the languages that
+  // constraint actually allows; every other language this bot supports keeps
+  // writing to `vocabulary` exactly as before. anki_notes has its own
+  // (lemma, part_of_speech, language) uniqueness, matching vocabulary's, so a
+  // recurring word upserts instead of minting a duplicate card.
+  if ((language === "uk" || language === "en") && vocabRows.length > 0) {
+    const ankiNoteRows = vocabRows.map((v: any) => ({
+      lemma: v.lemma,
+      part_of_speech: v.part_of_speech,
+      gloss: v.gloss,
+      lemma_translation: v.lemma_translation,
+      example: v.example,
+      example_translation: v.example_translation,
+      language,
+      deck: langLabel(language),
+      kind: "vocab",
+      has_spelling: false,
+      source: "bot",
+    }));
+    const { error: ankiErr } = await supabase
+      .from("anki_notes")
+      .upsert(ankiNoteRows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
+    if (ankiErr) console.error("annotateMessage: anki_notes upsert failed:", ankiErr);
+  }
   const annotations: any[] = [];
   for (const v of parsed.vocabulary ?? []) {
     if (!v.lemma) continue;
