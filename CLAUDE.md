@@ -102,6 +102,33 @@ is also what capybara-anki verifies the Mini App's signed `initData` against. Th
 HMAC key only — it makes no call to Telegram's API, so it does not make that app a second
 *consumer* of the token in the sense warned about above.
 
+## How cards reach the study app
+
+`/export`'s CSV is no longer the road from this bot to capybara-anki. Cards are written
+into `anki_notes` at the moment someone chooses them, which the Mini App (`/study`) reads
+directly:
+
+| Source | Writes | Deck |
+|---|---|---|
+| `/learn <word>`, `/learn top N` | the words just added to `flashcards` | `Ukrainian` / `English` |
+| the grammar assistant (`/capybara`) | each correction, as a fill-in-the-blank card | `Grammar` |
+| `/syncanki` (admin) | the whole existing corpus, once | all of the above |
+
+**Annotation deliberately does not create cards.** `vocabulary` is every word the
+annotator has ever seen (11,329 rows); the deck is the subset someone deliberately chose
+(`flashcards`, 776). Mirroring the first would mint ~15 cards for every one actually
+asked for and empty `/learn` of meaning. An earlier version did exactly that — if you are
+tempted to move the write back into `annotateMessage`, this is why not.
+
+One builder shapes every card (`vocabCardFields` / `grammarCardFields`), used by the CSV,
+the live writes, and the backfill alike. Two would drift, and the copy the app reads is
+the one nobody is looking at while they review.
+
+`/syncanki` is idempotent — `writeAnkiNotes` upserts on `anki_notes`' own
+`(lemma, part_of_speech, language)` key, the same key the original Anki import wrote
+under, so re-running it matches rather than duplicates. `/export` stays forever as the
+backup and escape hatch (capybara-anki's D-§2.3), just not as the daily path.
+
 Optional (enable the admin `/bug` report command; inert if unset): `GITHUB_ISSUE_TOKEN` (GitHub PAT
 with `Issues: write` — files issues on `GITHUB_REPO`). Falls back to `GITHUB_DEPLOY_TOKEN`, which
 then needs both `Issues: write` and `Actions: write`; keeping them separate means the issue-filing

@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v102";
+const BUILD_VERSION = "v103";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -428,7 +428,7 @@ function leadingCommandToken(text: string): string | null {
 // consults this list (a command is unknown precisely because the table declined it), so
 // a name missing here costs a suggestion and nothing else.
 const SUGGESTIBLE_COMMANDS = [
-  "start", "help", "menu", "study", "vocab", "learn", "forget", "export", "pronounce", "capybara",
+  "start", "help", "menu", "study", "vocab", "learn", "forget", "export", "syncanki", "pronounce", "capybara",
   "pin", "unpin", "pinned", "remember", "note", "recap", "ask", "reconcile", "restore",
 ];
 
@@ -505,6 +505,7 @@ async function handleUpdate(update: any) {
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
     { match: t => t === "/export" || t.startsWith("/export@"),                          handle: handleExport },
+    { match: t => t === "/syncanki" || t.startsWith("/syncanki@"),                      handle: handleSyncAnki },
     { match: t => isCmd(t, "pronounce"),                                                 handle: handlePronounce },
     { match: t => t === "/capybara" || t.startsWith("/capybara ") || t.startsWith("/capybara@"), handle: handleCapybara },
     { match: t => isCmd(t, "bug"),                                                       handle: handleBug },
@@ -1185,6 +1186,28 @@ async function grammarAssist(chatId: number, text: string, user: any, messageId?
   });
   if (error) console.error("grammar correction insert failed:", error);
 
+  // The correction becomes a study card too, in the app's Grammar deck — the same
+  // deck /export has always built, now without the CSV round trip. Built from the
+  // verdict rather than re-read from the row, so a failed insert above still
+  // yields a card; the shape is grammarCardFields', identical to /export's.
+  const grammarCard = grammarCardFields({
+    original_text: text,
+    corrected_text: verdict.corrected,
+    explanation: verdict.explanation || null,
+    error_focus: verdict.errorFocus,
+    correction_focus: verdict.correctionFocus,
+    correction_lemma: verdict.correctionLemma,
+    correction_gloss: verdict.correctionGloss,
+    category: verdict.category,
+    language: user.learning_language,
+  });
+  if (grammarCard) {
+    scheduleBackgroundWork(
+      "writeAnkiNotes(grammar)",
+      writeAnkiNotes([grammarCard.fields], ANKI_GRAMMAR_DECK),
+    );
+  }
+
   const explanation = verdict.explanation ? `\n${verdict.explanation}` : "";
   await sendMessage(chatId, `${ui.noteHeader}\n${verdict.corrected}${explanation}`);
 }
@@ -1411,34 +1434,14 @@ async function annotateMessage(messageId: string, text: string, language: LangCo
   if (vocabRows.length > 0) {
     await supabase.from("vocabulary").upsert(vocabRows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
   }
-  // capybara-anki (its own repo, docs/DESIGN.md §2.2): the same words also become
-  // real, independently reviewable flashcards there -- one more upsert next to
-  // the one above, not a reconciliation job, and this table is never read back
-  // from here. anki_notes.language is constrained to 'uk'/'en' (unlike this
-  // table's free-text one), so this only fires for the languages that
-  // constraint actually allows; every other language this bot supports keeps
-  // writing to `vocabulary` exactly as before. anki_notes has its own
-  // (lemma, part_of_speech, language) uniqueness, matching vocabulary's, so a
-  // recurring word upserts instead of minting a duplicate card.
-  if ((language === "uk" || language === "en") && vocabRows.length > 0) {
-    const ankiNoteRows = vocabRows.map((v: any) => ({
-      lemma: v.lemma,
-      part_of_speech: v.part_of_speech,
-      gloss: v.gloss,
-      lemma_translation: v.lemma_translation,
-      example: v.example,
-      example_translation: v.example_translation,
-      language,
-      deck: langLabel(language),
-      kind: "vocab",
-      has_spelling: false,
-      source: "bot",
-    }));
-    const { error: ankiErr } = await supabase
-      .from("anki_notes")
-      .upsert(ankiNoteRows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
-    if (ankiErr) console.error("annotateMessage: anki_notes upsert failed:", ankiErr);
-  }
+  // NOTE: annotation deliberately does NOT create study cards. It used to, and
+  // that was wrong: `vocabulary` is the pool of every word the annotator has ever
+  // seen (11,329 rows at the time of writing), while the deck is the subset
+  // someone deliberately chose -- `flashcards`, 776 rows. /export has always been
+  // built from the second, so mirroring the first into the study app would have
+  // minted roughly fifteen cards for every one the couple actually asked for, and
+  // quietly emptied /learn of its meaning. Cards are created where the choosing
+  // happens: handleLearn, handleLearnTop, and grammarAssist.
   const annotations: any[] = [];
   for (const v of parsed.vocabulary ?? []) {
     if (!v.lemma) continue;
@@ -1905,6 +1908,7 @@ const MENUS: Record<string, MenuItem[][]> = {
     [{ label: "✂️ Приклади · Examples", command: "/backfill_examples", adminOnly: true },
      { label: "🧪 A/B анотацій · Annotate A/B", command: "/annotate_ab", adminOnly: true }],
     [{ label: "💰 Витрати · API spend", command: "/annotate_ab cost", adminOnly: true }],
+    [{ label: "🔄 У картки · Sync to app", command: "/syncanki", adminOnly: true }],
     [{ label: "🐛 Повідомити ваду · Report a bug", command: "/bug", prompt: ARG_PROMPTS["/bug"], adminOnly: true }],
     [{ label: BACK_TO_MAIN, menu: "main" }],
   ],
@@ -2332,6 +2336,206 @@ function mdEscapeItalicSlot(value: string): string {
   return value.replace(/_/g, "\\_");
 }
 
+// ---------------------------------------------------------------------------
+// One definition of a card
+// ---------------------------------------------------------------------------
+//
+// Everything this bot turns into a flashcard is shaped here, once, and then sent
+// to whichever sinks are listening: the CSV /export writes for real Anki, and
+// capybara-anki's `anki_notes` table, which the Telegram Mini App (/study) reads
+// directly. Before this, only /export knew how to build a card, so the app could
+// only ever receive a card by way of a file the maintainer exported by hand and
+// imported into Anki, and anything /export was careful about -- blanking a
+// mistyped command off the front, blanking an example in the wrong script,
+// turning a correction into a fill-in-the-blank -- stopped at the file's edge.
+//
+// Keeping one builder is the point. Two would drift, and the version the app
+// reads is the one nobody is looking at while they review in Anki.
+
+/** The seven content fields a card carries, independent of where it lands. CSV
+ * columns and anki_notes columns both project from this; neither is the source
+ * of truth for what a card *says*. */
+interface CardFields {
+  lemma: string;
+  gloss: string;
+  lemmaTranslation: string;
+  partOfSpeech: string;
+  language: LangCode;
+  example: string;
+  exampleTranslation: string;
+}
+
+/** Replaces `word` in `sentence` with a blank, matching it as a WHOLE word. JavaScript's
+ * \b is ASCII-only, so it cannot be used here: a Cyrillic "довго" would otherwise match
+ * inside "довгого" and blank only the stem, leaking "го" onto the card front. The
+ * lookarounds below use \p{L} (any letter) instead. Returns null when the word is not
+ * present as a standalone token, so the caller can fall back rather than emit a
+ * half-blanked sentence. */
+function blankWord(sentence: string, word: string): string | null {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let re: RegExp;
+  try {
+    re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "u");
+  } catch {
+    return null; // Malformed pattern from unexpected model output -- fall back.
+  }
+  return re.test(sentence) ? sentence.replace(re, "_____") : null;
+}
+
+/** Why an example sentence was dropped, for the counters /export logs. */
+type ExampleRejection = "command" | "script" | null;
+
+/**
+ * The example-sentence hygiene /export has always applied, available to every
+ * sink rather than only the file.
+ *
+ * Two things get blanked. An example opening with a command token was never
+ * something anyone said -- it is a mistyped command ("/lear <word>") from before
+ * the dispatch guard caught those, which fell through to translation and was
+ * annotated as conversation. And an example whose script does not match its
+ * language is the annotator having attached the wrong half of a translated pair.
+ * Either one puts nonsense on the front of a card, so it is dropped rather than
+ * shown; the card still works, it just loses its example.
+ */
+function sanitizeExample(
+  sentence: string,
+  translation: string,
+  language: LangCode,
+  lemma: string,
+): { example: string; exampleTranslation: string; rejected: ExampleRejection } {
+  if (sentence && leadingCommandToken(sentence)) {
+    console.warn(`card: blanking example for lemma="${lemma}" lang=${language} — example is a mistyped command line`);
+    return { example: "", exampleTranslation: "", rejected: "command" };
+  }
+  if (sentence && !exampleScriptMatchesLanguage(sentence, language)) {
+    const { cyrillicRatio, letters } = detectScriptRatios(sentence);
+    console.warn(`card: blanking example for lemma="${lemma}" lang=${language} — script mismatch (cyrillic=${Math.round(cyrillicRatio * 100)}%, letters=${letters})`);
+    return { example: "", exampleTranslation: "", rejected: "script" };
+  }
+  return { example: sentence, exampleTranslation: translation, rejected: null };
+}
+
+/**
+ * A grammar correction as a card.
+ *
+ * Preferred shape: blank the corrected word out of the *corrected* sentence, so
+ * the learner never re-reads their own mistake before recalling it. The wrong
+ * form is shown afterwards, on the back, as contrast.
+ *
+ * The blanked sentence alone is not answerable -- "Я дуже ____ тобою." could take
+ * any of several verbs -- so the front also names the word, via its dictionary
+ * form and meaning, leaving only the inflection to produce. Each part is
+ * optional and the clue is omitted entirely when none is present, so an older
+ * row still yields a usable card.
+ *
+ * Returns null for a row with nothing to build from.
+ */
+function grammarCardFields(g: any): { fields: CardFields; isCloze: boolean } | null {
+  if (!g.original_text || !g.corrected_text) return null;
+
+  const cloze = g.correction_focus ? blankWord(g.corrected_text, g.correction_focus) : null;
+  if (cloze) {
+    const wrote = g.error_focus ? ` (you wrote: ${g.error_focus})` : "";
+    const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
+    // The category is only shown alongside the word. On its own it names the KIND of
+    // mistake, not the missing word -- "(agreement)" reads as a hint but leads nowhere,
+    // which is worse than no parenthetical at all.
+    const front = word ? `${cloze}  (${[word, g.category].filter(Boolean).join(" · ")})` : cloze;
+    return {
+      isCloze: true,
+      fields: {
+        lemma: front,
+        gloss: g.category ?? "",
+        lemmaTranslation: g.correction_focus,
+        partOfSpeech: "grammar",
+        language: g.language,
+        example: `${g.explanation ?? ""}${wrote}`,
+        exampleTranslation: g.corrected_text,
+      },
+    };
+  }
+
+  // Fallback: no single-word substitution to blank (word order, a missing word, or the
+  // model declined to name the forms). Show the whole sentence and its correction.
+  return {
+    isCloze: false,
+    fields: {
+      lemma: g.original_text,
+      gloss: g.error_focus ? `was: ${g.error_focus}` : "",
+      lemmaTranslation: g.corrected_text,
+      partOfSpeech: "grammar",
+      language: g.language,
+      example: g.explanation ?? "",
+      exampleTranslation: "",
+    },
+  };
+}
+
+/** capybara-anki's deck for corrections. Its decks are flat labels, so this is
+ * the plain name rather than /export's "Capybara::Grammar" path. */
+const ANKI_GRAMMAR_DECK = "Grammar";
+
+/**
+ * Writes cards into capybara-anki's `anki_notes`, the table the Mini App reads.
+ *
+ * Never throws: a card failing to reach the study app must not take down the
+ * thing the user is actually waiting on (a translation, a /learn confirmation,
+ * a grammar note). It logs and moves on, and the admin /syncanki backfill is the
+ * repair path for anything that was missed.
+ *
+ * `anki_notes.language` is constrained to 'uk'/'en', unlike this bot's free-text
+ * column, so rows in any other language are dropped here rather than rejected by
+ * Postgres. The table's own (lemma, part_of_speech, language) uniqueness makes a
+ * repeat an upsert rather than a duplicate card -- which is also what makes the
+ * backfill safe to run as often as you like.
+ */
+async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number> {
+  const rows = cards
+    .filter((c) => c.lemma && (c.language === "uk" || c.language === "en"))
+    .map((c) => ({
+      lemma: c.lemma,
+      gloss: c.gloss || null,
+      lemma_translation: c.lemmaTranslation || null,
+      part_of_speech: c.partOfSpeech,
+      language: c.language,
+      example: c.example || null,
+      example_translation: c.exampleTranslation || null,
+      deck,
+      kind: "vocab",
+      has_spelling: false,
+      source: "bot",
+    }));
+  if (rows.length === 0) return 0;
+  const { error } = await supabase
+    .from("anki_notes")
+    .upsert(rows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
+  if (error) {
+    console.error("writeAnkiNotes failed:", error);
+    return 0;
+  }
+  return rows.length;
+}
+
+/** A vocabulary row as a card. The example is sanitized on the way through, so
+ * the study app gets the same hygiene the CSV always had. */
+function vocabCardFields(v: any): CardFields {
+  const { example, exampleTranslation } = sanitizeExample(
+    v.example ?? "",
+    v.example_translation ?? "",
+    v.language,
+    v.lemma,
+  );
+  return {
+    lemma: v.lemma,
+    gloss: v.gloss ?? "",
+    lemmaTranslation: v.lemma_translation ?? "",
+    partOfSpeech: v.part_of_speech ?? "",
+    language: v.language,
+    example,
+    exampleTranslation,
+  };
+}
+
 function csvEscape(value: string | null | undefined): string {
   const s = value ?? "";
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
@@ -2343,6 +2547,87 @@ function csvEscape(value: string | null | undefined): string {
 // grows. Run it in the background so it can never approach the window Telegram waits
 // before retrying an update: a retry would re-run the whole build and deliver the file
 // twice. The user gets an immediate acknowledgement instead of a silent pause.
+/**
+ * /syncanki -- push the whole existing corpus into the study app, once.
+ *
+ * /learn and grammarAssist create cards from here on, but everything chosen
+ * before they did so exists only in `flashcards` and `grammar_corrections`. Until
+ * this runs, the only way those reach capybara-anki is the path this whole change
+ * exists to retire: /export a CSV, import it into Anki on a desktop, and migrate.
+ *
+ * Idempotent by construction -- every write goes through writeAnkiNotes, whose
+ * upsert ignores duplicates on anki_notes' (lemma, part_of_speech, language) key,
+ * which is also the key the original Anki import wrote under. So a word that came
+ * in through that import is matched, not duplicated, and running this twice
+ * changes nothing the second time.
+ *
+ * Admin-only and backgrounded: it reads the entire corpus, which is exactly the
+ * shape of work /export already runs in the background to stay clear of
+ * Telegram's retry window.
+ */
+async function handleSyncAnki(msg: any, user: any) {
+  if (msg.from?.id !== BACKFILL_ADMIN_TELEGRAM_ID) { await sendMessage(msg.chat.id, "Not authorized."); return; }
+  await sendMessage(msg.chat.id, "\u23f3 Sending your decks to the study app\u2026");
+  scheduleBackgroundWork("syncAnkiRun", syncAnkiRun(msg.chat.id, user));
+}
+
+async function syncAnkiRun(chatId: number, user: any) {
+  // Same read /export builds its vocabulary half from: the deliberately-learned
+  // deck, not the annotator's whole word pool.
+  const { data: cards, error } = await supabase
+    .from("flashcards")
+    .select(`vocabulary:vocabulary_id (lemma, gloss, part_of_speech, language, lemma_translation, example, example_translation)`);
+  if (error) {
+    console.error("syncanki: flashcards read failed:", error);
+    await sendMessage(chatId, "Couldn't read the decks. Check function logs.");
+    return;
+  }
+
+  const byDeck = new Map<string, CardFields[]>();
+  for (const card of (cards ?? []) as any[]) {
+    const v = card.vocabulary;
+    if (!v || !v.lemma) continue;
+    if (v.language !== "uk" && v.language !== "en") continue;
+    const deck = langLabel(v.language);
+    if (!byDeck.has(deck)) byDeck.set(deck, []);
+    byDeck.get(deck)!.push(vocabCardFields(v));
+  }
+
+  let vocabWritten = 0;
+  for (const [deck, fields] of byDeck) {
+    // Chunked: one upsert of several hundred rows is a large request body, and
+    // PostgREST is happier with batches than with the whole corpus at once.
+    for (let i = 0; i < fields.length; i += 200) {
+      vocabWritten += await writeAnkiNotes(fields.slice(i, i + 200), deck);
+    }
+  }
+
+  const { data: corrections, error: corrError } = await supabase
+    .from("grammar_corrections")
+    .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
+    .eq("user_id", user.id);
+  if (corrError) console.error("syncanki: grammar_corrections read failed:", corrError);
+
+  const grammarFields: CardFields[] = [];
+  for (const g of (corrections ?? []) as any[]) {
+    const built = grammarCardFields(g);
+    if (built) grammarFields.push(built.fields);
+  }
+  let grammarWritten = 0;
+  for (let i = 0; i < grammarFields.length; i += 200) {
+    grammarWritten += await writeAnkiNotes(grammarFields.slice(i, i + 200), ANKI_GRAMMAR_DECK);
+  }
+
+  const deckLines = [...byDeck.entries()].map(([deck, f]) => `\u2022 ${deck}: ${f.length}`).join("\n");
+  await sendMessage(
+    chatId,
+    `\u2705 Sent to the study app.\n\n${deckLines}\n\u2022 ${ANKI_GRAMMAR_DECK}: ${grammarFields.length}\n\n` +
+    `Words already there (from the original Anki import or an earlier run) were matched, not duplicated \u2014 ` +
+    `safe to run again any time.\n\nOpen /study to review them.`,
+  );
+  console.log(`syncanki: offered ${vocabWritten} vocabulary and ${grammarWritten} grammar rows`);
+}
+
 async function handleExport(msg: any, user: any) {
   await sendMessage(msg.chat.id, "\u23f3 Building your export\u2026");
   scheduleBackgroundWork("exportRun", exportRun(msg.chat.id, user));
@@ -2401,56 +2686,29 @@ async function exportRun(chatId: number, user: any) {
         }
       }
     }
-    // An example that opens with a command token was never something anyone said: it is
-    // a mistyped command ("/lear <word>") from before the dispatch guard caught those,
-    // which fell through to translation and was annotated as conversation. Blank it
-    // rather than print the typo on the front of a card. Anki matches an imported note
-    // on its first field (the lemma), so re-importing updates the existing card and the
-    // bad front goes away -- nothing has to be deleted by hand.
-    if (exampleSentence && leadingCommandToken(exampleSentence)) {
-      console.warn(`export: blanking example for lemma="${v.lemma}" lang=${v.language} \u2014 example is a mistyped command line`);
-      exampleSentence = "";
-      exampleTranslation = "";
-      commandExamples++;
-    }
-    if (exampleSentence && !exampleScriptMatchesLanguage(exampleSentence, v.language)) {
-      const { cyrillicRatio, letters } = detectScriptRatios(exampleSentence);
-      console.warn(`export: blanking example for lemma="${v.lemma}" lang=${v.language} \u2014 script mismatch (cyrillic=${Math.round(cyrillicRatio * 100)}%, letters=${letters})`);
-      exampleSentence = "";
-      exampleTranslation = "";
-      blankedExamples++;
+    // Anki matches an imported note on its first field (the lemma), so re-importing
+    // updates the existing card and a bad front goes away -- nothing has to be deleted
+    // by hand. The hygiene itself lives in sanitizeExample, shared with the live write
+    // to the study app, so both sinks blank the same things.
+    const fields = vocabCardFields({ ...v, example: exampleSentence, example_translation: exampleTranslation });
+    if (exampleSentence && !fields.example) {
+      if (leadingCommandToken(exampleSentence)) commandExamples++;
+      else blankedExamples++;
     }
     const deckName = `Capybara::${langMeta(v.language).englishName}`;
     deckCounts[v.language] = (deckCounts[v.language] ?? 0) + 1;
     rows.push([
-      csvEscape(v.lemma),
-      csvEscape(v.gloss),
-      csvEscape(v.lemma_translation),
-      csvEscape(v.part_of_speech),
-      csvEscape(v.language),
-      csvEscape(exampleSentence),
-      csvEscape(exampleTranslation),
+      csvEscape(fields.lemma),
+      csvEscape(fields.gloss),
+      csvEscape(fields.lemmaTranslation),
+      csvEscape(fields.partOfSpeech),
+      csvEscape(fields.language),
+      csvEscape(fields.example),
+      csvEscape(fields.exampleTranslation),
       csvEscape(deckName),
       csvEscape("capybara::vocab"),
     ].join(","));
   }
-
-  // Replaces `word` in `sentence` with a blank, matching it as a WHOLE word. JavaScript's
-  // \b is ASCII-only, so it cannot be used here: a Cyrillic "довго" would otherwise match
-  // inside "довгого" and blank only the stem, leaking "го" onto the card front. The
-  // lookarounds below use \p{L} (any letter) instead. Returns null when the word is not
-  // present as a standalone token, so the caller can fall back rather than emit a
-  // half-blanked sentence.
-  const blankWord = (sentence: string, word: string): string | null => {
-    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    let re: RegExp;
-    try {
-      re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "u");
-    } catch {
-      return null; // Malformed pattern from unexpected model output -- fall back.
-    }
-    return re.test(sentence) ? sentence.replace(re, "_____") : null;
-  };
 
   // Grammar cards reuse the Capybara notetype so the whole export stays one file with
   // one import: the sentence the learner actually wrote goes in the first field (the
@@ -2460,53 +2718,26 @@ async function exportRun(chatId: number, user: any) {
   // distinguishable inside the deck.
   let clozeCards = 0;
   for (const g of grammarRows as any[]) {
-    if (!g.original_text || !g.corrected_text) continue;
+    const card = grammarCardFields(g);
+    if (!card) continue;
+    if (card.isCloze) clozeCards++;
     const tags = ["capybara::grammar", ...(g.category ? [`capybara::grammar::${g.category}`] : [])].join(" ");
-    // Preferred shape: blank the corrected word out of the corrected sentence, so the
-    // learner never re-reads their own mistake before recalling. The wrong form is shown
-    // afterwards, on the back, as contrast.
-    const cloze = g.correction_focus ? blankWord(g.corrected_text, g.correction_focus) : null;
-    if (cloze) {
-      clozeCards++;
-      const wrote = g.error_focus ? ` (you wrote: ${g.error_focus})` : "";
-      // The blanked sentence alone is not answerable -- "Я дуже ____ тобою." could take
-      // any of several verbs -- so the front also names the word, via its dictionary form
-      // and meaning, leaving only the inflection to produce. This is appended to field 1
-      // because that field IS the card front; the notetype's template is not ours to
-      // change. Each part is optional and the clue is omitted entirely when none is
-      // present, so an older row still yields a usable card.
-      const word = [g.correction_lemma, g.correction_gloss].filter(Boolean).join(" — ");
-      // The category is only shown alongside the word. On its own it names the KIND of
-      // mistake, not the missing word -- "(agreement)" reads as a hint but leads nowhere,
-      // which is worse than no parenthetical at all.
-      const front = word ? `${cloze}  (${[word, g.category].filter(Boolean).join(" · ")})` : cloze;
-      rows.push([
-        csvEscape(front),
-        csvEscape(g.category ?? ""),
-        csvEscape(g.correction_focus),
-        csvEscape("grammar"),
-        csvEscape(g.language),
-        csvEscape(`${g.explanation ?? ""}${wrote}`),
-        csvEscape(g.corrected_text),
-        csvEscape("Capybara::Grammar"),
-        csvEscape(tags),
-      ].join(","));
-      continue;
-    }
-    // Fallback: no single-word substitution to blank (word order, a missing word, or the
-    // model declined to name the forms). Show the whole sentence and its correction.
+    // The card front goes in field 1 because that field IS the front; the notetype's
+    // template is not ours to change. What the front says is decided by
+    // grammarCardFields, shared with the live write to the study app.
     rows.push([
-      csvEscape(g.original_text),
-      csvEscape(g.error_focus ? `was: ${g.error_focus}` : ""),
-      csvEscape(g.corrected_text),
-      csvEscape("grammar"),
-      csvEscape(g.language),
-      csvEscape(g.explanation ?? ""),
-      csvEscape(""),
+      csvEscape(card.fields.lemma),
+      csvEscape(card.fields.gloss),
+      csvEscape(card.fields.lemmaTranslation),
+      csvEscape(card.fields.partOfSpeech),
+      csvEscape(card.fields.language),
+      csvEscape(card.fields.example),
+      csvEscape(card.fields.exampleTranslation),
       csvEscape("Capybara::Grammar"),
       csvEscape(tags),
     ].join(","));
   }
+
   const grammarCount = rows.length - Object.values(deckCounts).reduce((a, b) => a + b, 0);
 
   if (rows.length === 0) {
@@ -2758,7 +2989,7 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /learn <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0414\u043e\u0434\u0430\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0434\u043e \u043a\u043e\u043b\u043e\u0434\u0438",
       "\u2022 /learn top N \u2014 \u041e\u043f\u0442\u043e\u043c \u0434\u043e\u0434\u0430\u0442\u0438 N \u0441\u043b\u0456\u0432",
       "\u2022 /forget <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0412\u0438\u0434\u0430\u043b\u0438\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0437 \u043a\u043e\u043b\u043e\u0434\u0438",
-      "\u2022 /export \u2014 \u0417\u0430\u0432\u0430\u043d\u0442\u0430\u0436\u0438\u0442\u0438 CSV \u0434\u043b\u044f Anki",
+      "\u2022 /export \u2014 \u0417\u0430\u0432\u0430\u043d\u0442\u0430\u0436\u0438\u0442\u0438 CSV \u0434\u043b\u044f Anki (\u0440\u0435\u0437\u0435\u0440\u0432\u043d\u0430 \u043a\u043e\u043f\u0456\u044f \u2014 \u043a\u0430\u0440\u0442\u043a\u0438 \u0432\u0436\u0435 \u0432 /study)",
       "\u2022 /pronounce \u2014 \u0424\u0440\u0430\u0437\u0438 \u0434\u043b\u044f \u0442\u0440\u0435\u043d\u0443\u0432\u0430\u043d\u043d\u044f \u0432\u0438\u043c\u043e\u0432\u0438",
       "\u2022 /capybara \u2014 \u041f\u0435\u0440\u0435\u0432\u0456\u0440\u043a\u0430 \u0433\u0440\u0430\u043c\u0430\u0442\u0438\u043a\u0438 \u043c\u043e\u0432\u0438, \u044f\u043a\u0443 \u0432\u0438\u0432\u0447\u0430\u0454\u0448 (\u0443\u0432\u0456\u043c\u043a/\u0432\u0438\u043c\u043a)",
       "",
@@ -2793,7 +3024,7 @@ async function handleHelp(msg: any, user: any) {
       "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
       "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",
       "\u2022 /forget <word> \u2014 Remove a word from the matching deck",
-      "\u2022 /export \u2014 Download both decks as a single CSV for Anki",
+      "\u2022 /export \u2014 Download both decks as a single CSV for Anki (a backup \u2014 cards already go straight to /study)",
       "\u2022 /pronounce \u2014 Phrases for pronunciation practice (Anki + AnkiPA)",
       "\u2022 /capybara \u2014 Toggle grammar checks on the language you're learning",
       "",
@@ -2932,7 +3163,9 @@ async function lemmatize(word: string, language: LangCode): Promise<string | nul
 
 async function lookupVocabByLemma(lemma: string, language: LangCode): Promise<any[]> {
   const { data, error } = await supabase.from("vocabulary")
-    .select("id, lemma, part_of_speech, gloss, first_seen_message_id, language")
+    // lemma_translation/example/example_translation are here for the card builder
+    // (vocabCardFields): /learn writes a real study card now, not just a flashcards row.
+    .select("id, lemma, part_of_speech, gloss, lemma_translation, example, example_translation, first_seen_message_id, language")
     .eq("language", language)
     .ilike("lemma", lemma);
   if (error) { console.error("vocab lookup failed:", error); return []; }
@@ -3007,6 +3240,10 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
     await sendMessage(msg.chat.id, "Couldn't add to the deck. Check function logs.");
     return;
   }
+  scheduleBackgroundWork(
+    `writeAnkiNotes(learn top ${targetLang})`,
+    writeAnkiNotes(unlearned.map(vocabCardFields), langLabel(targetLang)),
+  );
   const lines = unlearned.map((v: any, i: number) => {
     const pos = v.part_of_speech ? ` _(${mdEscapeItalicSlot(v.part_of_speech)})_` : "";
     const gloss = v.gloss ?? "?";
@@ -3089,6 +3326,15 @@ async function handleLearn(msg: any, user: any) {
   }
   const insertedIds = new Set((inserted ?? []).map((r: any) => r.vocabulary_id));
   const toAdd = vocabRows.filter((v: any) => insertedIds.has(v.id));
+  // The same choice, sent to the study app. Backgrounded and non-throwing: a card
+  // failing to reach capybara-anki must not turn a successful /learn into an error
+  // message, and /syncanki repairs anything missed.
+  if (toAdd.length > 0) {
+    scheduleBackgroundWork(
+      `writeAnkiNotes(learn ${targetLang})`,
+      writeAnkiNotes(toAdd.map(vocabCardFields), langLabel(targetLang)),
+    );
+  }
   const deckOwnerLabel = isPartnerDeck ? `${targetUser.display_name}'s` : "your";
   const deckLabel = `${langFlag(targetLang)} ${targetLangLabel} deck`;
   if (toAdd.length === 0) {
@@ -3151,6 +3397,27 @@ async function handleForget(msg: any, user: any) {
     console.error("forget delete failed:", error);
     await sendMessage(msg.chat.id, "Couldn't update the deck. Check function logs.");
     return;
+  }
+  // Forgetting a word removes its study card too, or /forget would only half
+  // work now that /learn creates one. Scoped by (lemma, part_of_speech, language)
+  // — anki_notes' own uniqueness key — and restricted to source 'bot', so a card
+  // that came from the original Anki import or the page scanner is never deleted
+  // by a bot command that did not create it.
+  const forgotten = new Set((deleted ?? []).map((r: any) => r.vocabulary_id));
+  const removedRows = vocabRows.filter((v: any) => forgotten.has(v.id));
+  if (removedRows.length > 0) {
+    scheduleBackgroundWork(`deleteAnkiNotes(forget ${targetLang})`, (async () => {
+      for (const v of removedRows) {
+        const { error: delErr } = await supabase
+          .from("anki_notes")
+          .delete()
+          .eq("lemma", v.lemma)
+          .eq("part_of_speech", v.part_of_speech)
+          .eq("language", v.language)
+          .eq("source", "bot");
+        if (delErr) console.error("forget: anki_notes delete failed:", delErr);
+      }
+    })());
   }
   const deckOwnerLabel = isPartnerDeck ? `${targetUser.display_name}'s` : "your";
   const deckLabel = `${langFlag(targetLang)} ${targetLangLabel} deck`;
