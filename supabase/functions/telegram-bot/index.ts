@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v101";
+const BUILD_VERSION = "v102";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -109,6 +109,11 @@ const GITHUB_ISSUE_TOKEN = Deno.env.get("GITHUB_ISSUE_TOKEN") ?? GITHUB_DEPLOY_T
 // Telegram messages run long and GitHub caps an issue body at 65536 chars; keep well
 // under both so a pasted log can never fail the create call.
 const BUG_REPORT_MAX_CHARS = 8000;
+// capybara-anki's reviewer, opened as a Telegram Mini App (that repo's issue #17).
+// Its own URL, because it is a separate deployment -- a static site on GitHub Pages,
+// not something this function serves. Optional: /study explains itself and does
+// nothing if unset, the same way /update and /bug stay inert without their secrets.
+const ANKI_APP_URL = Deno.env.get("ANKI_APP_URL") ?? "";
 // This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
 // (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
 // deploys to THIS couple's project — not whatever single project the repo's default
@@ -423,7 +428,7 @@ function leadingCommandToken(text: string): string | null {
 // consults this list (a command is unknown precisely because the table declined it), so
 // a name missing here costs a suggestion and nothing else.
 const SUGGESTIBLE_COMMANDS = [
-  "start", "help", "menu", "vocab", "learn", "forget", "export", "pronounce", "capybara",
+  "start", "help", "menu", "study", "vocab", "learn", "forget", "export", "pronounce", "capybara",
   "pin", "unpin", "pinned", "remember", "note", "recap", "ask", "reconcile", "restore",
 ];
 
@@ -495,6 +500,7 @@ async function handleUpdate(update: any) {
           `Type /help to see what I can do.`); } },
     { match: t => t === "/help",                                                        handle: handleHelp },
     { match: t => isCmd(t, "menu"),                                                     handle: handleMenu },
+    { match: t => isCmd(t, "study"),                                                     handle: handleStudy },
     { match: t => t === "/vocab",                                                       handle: handleVocab },
     { match: t => t === "/learn" || t.startsWith("/learn ") || t.startsWith("/learn@"),   handle: handleLearn },
     { match: t => t === "/forget" || t.startsWith("/forget ") || t.startsWith("/forget@"), handle: handleForget },
@@ -2702,6 +2708,31 @@ async function refreshVocabularyCounts() {
   if (error) throw error;
 }
 
+/** Opens capybara-anki's reviewer as a Mini App.
+ *
+ * A web_app button has to carry an https URL and Telegram only honours one in a
+ * private chat, so a group chat gets the plain link instead of a button that
+ * would silently do nothing. The app authenticates itself from there: Telegram
+ * hands it signed initData on launch, which capybara-anki verifies against this
+ * bot's token, so there is no link to hand out and no token to keep safe. */
+async function handleStudy(msg: any, _user: any): Promise<void> {
+  if (!ANKI_APP_URL) {
+    await sendMessage(msg.chat.id,
+      "Flashcards aren't set up on this instance. Set the ANKI_APP_URL secret to capybara-anki's URL to enable /study.");
+    return;
+  }
+  if (msg.chat?.type !== "private") {
+    await sendMessage(msg.chat.id, `Flashcards: ${ANKI_APP_URL}`);
+    return;
+  }
+  await sendMessage(
+    msg.chat.id,
+    "Your flashcards \u2014 what's due, the page scanner, and your stats.",
+    undefined,
+    { inline_keyboard: [[{ text: "Open flashcards", web_app: { url: ANKI_APP_URL } }]] },
+  );
+}
+
 async function handleHelp(msg: any, user: any) {
   const isAdmin = msg.from?.id === BACKFILL_ADMIN_TELEGRAM_ID;
   const viewerLang = user.native_language === "uk" ? "uk" : "en";
@@ -2722,6 +2753,7 @@ async function handleHelp(msg: any, user: any) {
         ? "\u2022 \u0414\u043e\u0434\u0430\u0439 \u043f\u0456\u0434\u043f\u0438\u0441 \u0434\u043e \u0444\u043e\u0442\u043e/\u0444\u0430\u0439\u043b\u0443 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u0439\u043e\u0433\u043e \u0443 \u0442\u0432\u0456\u0439 \u043a\u043e\u0440\u043f\u0443\u0441"
         : "\u2022 \u041d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0444\u043e\u0442\u043e \u0430\u0431\u043e \u0432\u0456\u0434\u0435\u043e \u2014 \u044f \u043f\u0435\u0440\u0435\u0441\u0438\u043b\u0430\u044e \u0439\u043e\u0433\u043e \u043f\u0430\u0440\u0442\u043d\u0435\u0440\u043e\u0432\u0456",
       "\u2022 /menu — Відкрити кнопки меню",
+      "\u2022 /study — Відкрити картки (до повторення, сканування, статистика)",
       "\u2022 /vocab \u2014 \u041d\u0430\u0439\u0447\u0430\u0441\u0442\u0456\u0448\u0456 \u0441\u043b\u043e\u0432\u0430, \u0449\u0435 \u043d\u0435 \u0432\u0438\u0432\u0447\u0435\u043d\u0456",
       "\u2022 /learn <\u0441\u043b\u043e\u0432\u043e> \u2014 \u0414\u043e\u0434\u0430\u0442\u0438 \u0441\u043b\u043e\u0432\u043e \u0434\u043e \u043a\u043e\u043b\u043e\u0434\u0438",
       "\u2022 /learn top N \u2014 \u041e\u043f\u0442\u043e\u043c \u0434\u043e\u0434\u0430\u0442\u0438 N \u0441\u043b\u0456\u0432",
@@ -2756,6 +2788,7 @@ async function handleHelp(msg: any, user: any) {
         : "\u2022 Send a photo, video, file, sticker, GIF, audio, location, or contact \u2014 I forward it to the other person",
       "\u2022 Add a caption to a photo/file/GIF/audio \u2014 I translate it and add it to your study corpus",
       "\u2022 /menu \u2014 Open the button menu",
+      "\u2022 /study \u2014 Open your flashcards (due cards, scanning, stats)",
       "\u2022 /vocab \u2014 Top words still unlearned in each deck",
       "\u2022 /learn <word> \u2014 Add a word (script picks the deck)",
       "\u2022 /learn top N \u2014 Bulk-add the top N unlearned words",

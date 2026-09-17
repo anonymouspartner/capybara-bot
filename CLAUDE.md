@@ -95,6 +95,13 @@ Optional (enable the admin `/update` self-deploy command; the feature is inert i
 `/update` only reports version status, no deploy button), `GITHUB_REPO` (`owner/name`),
 `GITHUB_DEPLOY_BRANCH` (defaults to `main`).
 
+Optional (enable `/study`, which opens capybara-anki's reviewer as a Telegram Mini App;
+inert if unset): `ANKI_APP_URL` — that app's own https URL (a static site on GitHub Pages,
+a separate deployment this function does not serve). Note this bot's `TELEGRAM_BOT_TOKEN`
+is also what capybara-anki verifies the Mini App's signed `initData` against. That is an
+HMAC key only — it makes no call to Telegram's API, so it does not make that app a second
+*consumer* of the token in the sense warned about above.
+
 Optional (enable the admin `/bug` report command; inert if unset): `GITHUB_ISSUE_TOKEN` (GitHub PAT
 with `Issues: write` — files issues on `GITHUB_REPO`). Falls back to `GITHUB_DEPLOY_TOKEN`, which
 then needs both `Issues: write` and `Actions: write`; keeping them separate means the issue-filing
