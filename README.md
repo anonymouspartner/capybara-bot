@@ -605,10 +605,20 @@ deploy-safety and reproducibility handoffs that shaped them.
   give the other service its **own** bot from @BotFather, then re-run `setWebhook` here
   to reclaim the token — see PROVISION_NEW_COUPLE.md step 6.
 
-  The `webhook-watch` workflow runs this check every 30 minutes and emails you when it
-  fails, so this can't go unnoticed for hours again. It needs the same
-  `SUPABASE_PROJECT_REF` repo secret the deploy workflow uses. Note that GitHub disables
-  scheduled workflows after 60 days of repo inactivity.
+  The `webhook-watch` workflow checks this on a schedule and **repairs it automatically**:
+  on finding the webhook taken it calls the function's `?repair_webhook` route, which
+  re-registers this URL and lets the queued updates through. The run still fails on
+  purpose, so the email goes out — a bot that quietly heals itself every few hours is a
+  bot whose token is still being shared, and that is the problem to fix.
+
+  It needs two repo secrets: `SUPABASE_PROJECT_REF` (same as the deploy workflow) and
+  `WEBHOOK_SECRET` (same value as the function secret). The second one only authenticates
+  the repair call — that route takes no parameters and can only ever register this
+  function's own URL, so the secret cannot be used to redirect the bot anywhere.
+
+  Two caveats. The cron asks for every 30 minutes and **GitHub does not honour it** —
+  observed spacing is 3–5 hours, because scheduled workflows are delayed under load. And
+  GitHub disables scheduled workflows after 60 days of repo inactivity.
 - **Deploy aborted by the gate** — `predeploy-check.ps1` failed (`deno check`, line
   count, or missing anchors). Fix the reported issue; nothing was deployed.
 

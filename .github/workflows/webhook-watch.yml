@@ -1,34 +1,33 @@
 name: webhook-watch
 
-# Watches, from OUTSIDE, whether this bot still owns its own Telegram webhook.
+# Watches, from OUTSIDE, whether this bot still owns its own Telegram webhook -- and puts it
+# back when it does not.
 #
-# Why this exists: a Telegram bot token can be served by exactly one consumer. When
-# another service is configured with this bot's token it takes the updates -- a second
-# webhook consumer overwrites the URL, and a POLLING client is worse, because polling and
-# webhooks are mutually exclusive so those libraries call deleteWebhook on every startup.
-# Either way Telegram stops delivering here, this function is never invoked, and NOTHING
-# appears in its logs. There is no in-band signal at all: the chat simply goes quiet, and
-# the couple assumes the bot is ignoring them. That is exactly how it went unnoticed for
-# hours. The check therefore cannot live inside the bot.
+# Why this exists: a Telegram bot token can be served by exactly one consumer. When another
+# service is configured with this bot's token it takes the updates -- a second webhook
+# consumer overwrites the URL, and a POLLING client is worse, because polling and webhooks
+# are mutually exclusive so those libraries call deleteWebhook on every startup. Either way
+# Telegram stops delivering here, this function is never invoked, and NOTHING appears in its
+# logs. There is no in-band signal at all: the chat simply goes quiet, and the couple assumes
+# the bot is ignoring them. The check cannot live inside the bot, because when it matters the
+# bot is not running.
 #
-# ?health&webhook asks Telegram where it is actually delivering (fetchWebhookStatus in
-# index.ts). It is plain HTTP, so it answers precisely when the bot is NOT answering in
-# Telegram -- which is when you need it.
+# This has happened twice. The first outage ran for hours; the second was still broken four
+# hours later. Alerting alone was not enough, so a failed ownership check now REPAIRS it:
+# ?repair_webhook re-registers this function, and the run still fails afterwards so the email
+# goes out. Self-healing must never be silent -- a bot that quietly fixes itself every few
+# hours is a bot whose token is still being shared, which is the actual problem.
 #
-# A failing scheduled run emails the repo owner. That is the entire point of this
-# workflow: do not quiet a red run by loosening the assertions below.
-#
-# NOTE: GitHub disables scheduled workflows after 60 days with no repo activity. If this
-# stops firing, re-enable it in the Actions tab.
+# NOTE ON CADENCE: the cron below asks for every 30 minutes and GitHub does not honour it.
+# Observed spacing on this repo is 3-5 hours, because scheduled workflows on shared runners
+# are delayed and dropped under load. Treat the interval as best-effort; it bounds how long a
+# silent outage can last, not how quickly one is caught.
 
 on:
   schedule:
-    # Every 30 minutes -- worst-case 30 minutes of silence instead of hours. Tune freely;
-    # scheduled runs are free on a public repo, and GitHub may delay a tick under load.
     - cron: "*/30 * * * *"
   workflow_dispatch:
 
-# A manual dispatch landing on top of a scheduled tick would just probe twice.
 concurrency:
   group: webhook-watch
   cancel-in-progress: false
@@ -40,12 +39,16 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe the webhook owner
+      - name: Probe the webhook owner, and repair it if it has been taken
         env:
-          # Same secret the deploy workflow uses. Being a secret, it is masked in these
-          # logs, so the URLs printed below appear partly redacted -- the field that
-          # matters on a hijack (a FOREIGN host) is not masked and will show.
+          # Both are secrets, so they are masked in these logs -- the URLs below appear
+          # partly redacted. The field that matters on a hijack (a FOREIGN host) is not
+          # masked and will show.
           REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          # Same value as the function's WEBHOOK_SECRET. It authenticates the repair call
+          # and nothing else; the repair endpoint takes no parameters and can only ever
+          # register this function's own URL, so this secret cannot redirect the bot.
+          REPAIR_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
 
@@ -54,7 +57,13 @@ jobs:
             exit 1
           fi
 
-          if ! body=$(curl -fsS --max-time 30 "https://${REF}.supabase.co/functions/v1/telegram-bot?health&webhook"); then
+          BASE="https://${REF}.supabase.co/functions/v1/telegram-bot"
+
+          probe() {
+            curl -fsS --max-time 30 "${BASE}?health&webhook"
+          }
+
+          if ! body=$(probe); then
             echo "FAIL: health route unreachable -- the edge function itself may be down."
             exit 1
           fi
@@ -77,26 +86,80 @@ jobs:
             exit 1
           fi
 
+          # ---- Ownership: the one failure worth self-healing --------------------------
           if [ "$(field '.webhook.pointsHere // false')" != "true" ]; then
-            echo "FAIL: THIS BOT NO LONGER OWNS ITS WEBHOOK."
+            echo "THIS BOT NO LONGER OWNS ITS WEBHOOK."
             echo "  Telegram delivers to: $(field '.webhook.registeredUrl // "(nothing -- the webhook was deleted)"')"
             echo "  Expected:             $(field '.webhook.expectedUrl')"
+            echo "  Queued updates:       $(field '.webhook.pendingUpdates // "unknown"')"
             echo
-            echo "Another service is using this bot's token, so the couple's messages are"
-            echo "going to it, or nowhere at all. An empty URL means a polling client"
-            echo "deleted the webhook on startup and is draining updates via getUpdates."
-            echo "See README -> 'The bot stops answering entirely'."
+            echo "An empty URL means a polling client deleted the webhook on startup and is"
+            echo "draining updates via getUpdates. A foreign URL means a second webhook"
+            echo "consumer overwrote it. Either way another service holds this bot's token."
+            echo
+
+            if [ -z "${REPAIR_SECRET:-}" ]; then
+              echo "FAIL: cannot repair -- the WEBHOOK_SECRET repo secret is not set."
+              echo "Add it (same value as the function's WEBHOOK_SECRET) to enable self-repair."
+              exit 1
+            fi
+
+            echo "Repairing..."
+            if ! repair=$(curl -fsS --max-time 30 -X POST \
+                  -H "x-capybara-internal-secret: ${REPAIR_SECRET}" \
+                  "${BASE}?repair_webhook"); then
+              echo "FAIL: the repair call itself failed. A 401 means the WEBHOOK_SECRET repo"
+              echo "secret does not match the function's WEBHOOK_SECRET."
+              exit 1
+            fi
+            echo "$repair" | jq .
+
+            # Trust the re-probe, not the repair's own say-so.
+            if ! body=$(probe) || [ "$(field '.webhook.pointsHere // false')" != "true" ]; then
+              echo
+              echo "FAIL: repair did not take -- the webhook still does not point here."
+              exit 1
+            fi
+
+            echo
+            echo "REPAIRED: the webhook points here again and queued updates will now deliver."
+            echo "This run still FAILS on purpose. Something else is using this bot's token,"
+            echo "and it will keep taking it until that service stops. See CLAUDE.md,"
+            echo "'One token, one consumer'."
             exit 1
           fi
 
+          # ---- Delivery errors --------------------------------------------------------
+          # last_error_message is STICKY: Telegram keeps reporting it long after the cause is
+          # gone. Failing on its mere presence made this workflow alarm for six hours over a
+          # 502 blip during a deploy that had already recovered -- three false alarms, which
+          # is exactly how a monitor gets ignored. Fail only when the error is still live:
+          # an auth rejection (which never heals on its own), or a recent error with updates
+          # actually backing up behind it.
           last_error=$(field '.webhook.lastError // "null"')
           if [ "$last_error" != "null" ]; then
-            echo "FAIL: Telegram reports a webhook delivery error."
+            age=$(field '.webhook.lastErrorAgeSeconds // 999999')
+            pending=$(field '.webhook.pendingUpdates // 0')
+            case "$last_error" in
+              *401*|*403*)
+                echo "FAIL: Telegram is being REJECTED by the webhook."
+                echo "  $last_error"
+                echo
+                echo "The secret_token does not match WEBHOOK_SECRET: the webhook looks"
+                echo "perfectly registered while every single update is rejected. This never"
+                echo "resolves on its own."
+                exit 1
+                ;;
+            esac
+            if [ "$age" -lt 900 ] 2>/dev/null && [ "$pending" -gt 0 ] 2>/dev/null; then
+              echo "FAIL: deliveries are failing right now."
+              echo "  $last_error"
+              echo "  ${age}s ago, with ${pending} updates queued behind it."
+              exit 1
+            fi
+            echo "NOTE: Telegram still reports an earlier delivery error, already recovered:"
             echo "  $last_error"
-            echo
-            echo "A 401 here means secret_token does not match WEBHOOK_SECRET: the webhook"
-            echo "looks perfectly registered while every single update is rejected."
-            exit 1
+            echo "  (${age}s ago, ${pending} queued -- not treated as a failure.)"
           fi
 
           if [ "$(field '.adminConfigured // false')" != "true" ]; then
@@ -105,13 +168,5 @@ jobs:
             exit 1
           fi
 
-          pending=$(field '.webhook.pendingUpdates // 0')
-          echo "OK: webhook points here, no delivery errors, admin configured."
-          echo "    version=$(field '.version')  pendingUpdates=${pending}"
-
-          # Not a failure -- Telegram queues during a brief outage and drains on its own.
-          # A number that stays high across runs means deliveries are not succeeding.
-          if [ "$pending" != "null" ] && [ "$pending" -gt 50 ] 2>/dev/null; then
-            echo "    NOTE: ${pending} updates are queued. If this does not fall on the next"
-            echo "    run, deliveries are failing even though the webhook is registered."
-          fi
+          echo "OK: webhook points here, deliveries healthy, admin configured."
+          echo "    version=$(field '.version')  pendingUpdates=$(field '.webhook.pendingUpdates // 0')"
