@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v103";
+const BUILD_VERSION = "v104";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -2485,9 +2485,24 @@ const ANKI_GRAMMAR_DECK = "Grammar";
  *
  * `anki_notes.language` is constrained to 'uk'/'en', unlike this bot's free-text
  * column, so rows in any other language are dropped here rather than rejected by
- * Postgres. The table's own (lemma, part_of_speech, language) uniqueness makes a
- * repeat an upsert rather than a duplicate card -- which is also what makes the
- * backfill safe to run as often as you like.
+ * Postgres.
+ *
+ * An explicit "is this already captured?" select, then a plain insert of what's
+ * left -- not an upsert. `anki_notes`' own uniqueness on (lemma, part_of_speech,
+ * language) is a *partial* index (`WHERE source <> 'anki-import'`, capybara-anki's
+ * docs/MIGRATION.md §1.1/§3.1): a real AnkiDroid export can genuinely hold two
+ * notes sharing a (lemma, part_of_speech, language) -- a plain note and its
+ * "Capybara+" revision, both independently reviewed for months -- so the imported
+ * rows had to be exempted from uniqueness rather than collapsed. Postgres will
+ * only use a partial index as an ON CONFLICT target when the request repeats its
+ * exact WHERE predicate, and supabase-js's `.upsert({ onConflict })` has no way to
+ * supply one -- so `ignoreDuplicates` against this index doesn't just skip a
+ * repeat, it fails the whole call with "no unique or exclusion constraint
+ * matching the ON CONFLICT specification", silently swallowed by the catch below
+ * the same way any other write failure is. The select-then-insert here checks the
+ * same condition the index enforces (excluding `anki-import` rows, which a bot
+ * capture is always allowed to coexist beside) without needing a matching
+ * conflict target at all.
  */
 async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number> {
   const rows = cards
@@ -2506,14 +2521,36 @@ async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number
       source: "bot",
     }));
   if (rows.length === 0) return 0;
-  const { error } = await supabase
-    .from("anki_notes")
-    .upsert(rows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
+
+  // Chunked the same way the example-message lookup above is (avoids an
+  // oversized IN filter) -- /syncanki's backfill is the caller that can hand
+  // this up to 200 lemmas in one call.
+  const lemmas = [...new Set(rows.map((r) => r.lemma))];
+  const captured = new Set<string>();
+  for (let i = 0; i < lemmas.length; i += 100) {
+    const { data: existing, error: selectError } = await supabase
+      .from("anki_notes")
+      .select("lemma, part_of_speech, language")
+      .neq("source", "anki-import")
+      .in("lemma", lemmas.slice(i, i + 100));
+    if (selectError) {
+      console.error("writeAnkiNotes pre-check failed:", selectError);
+      return 0;
+    }
+    for (const r of existing ?? []) {
+      captured.add(JSON.stringify([r.lemma, r.part_of_speech, r.language]));
+    }
+  }
+
+  const newRows = rows.filter((r) => !captured.has(JSON.stringify([r.lemma, r.part_of_speech, r.language])));
+  if (newRows.length === 0) return 0;
+
+  const { error } = await supabase.from("anki_notes").insert(newRows);
   if (error) {
     console.error("writeAnkiNotes failed:", error);
     return 0;
   }
-  return rows.length;
+  return newRows.length;
 }
 
 /** A vocabulary row as a card. The example is sanitized on the way through, so

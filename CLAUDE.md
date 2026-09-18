@@ -124,10 +124,19 @@ One builder shapes every card (`vocabCardFields` / `grammarCardFields`), used by
 the live writes, and the backfill alike. Two would drift, and the copy the app reads is
 the one nobody is looking at while they review.
 
-`/syncanki` is idempotent — `writeAnkiNotes` upserts on `anki_notes`' own
-`(lemma, part_of_speech, language)` key, the same key the original Anki import wrote
-under, so re-running it matches rather than duplicates. `/export` stays forever as the
-backup and escape hatch (capybara-anki's D-§2.3), just not as the daily path.
+`/syncanki` is idempotent — `writeAnkiNotes` checks `anki_notes`' own
+`(lemma, part_of_speech, language)` key with an explicit select before inserting,
+excluding rows the original Anki import wrote (that key is only a *partial* unique
+index on capybara-anki's side, `WHERE source <> 'anki-import'` — a real export can
+hold two notes sharing that key, one plain and one a `Capybara+` revision, both
+independently reviewed for months, so imported rows are exempted from uniqueness
+rather than collapsed). A plain upsert against that index doesn't work: Postgres
+only accepts a partial index as an `ON CONFLICT` target when the request repeats
+its exact `WHERE` clause, which `supabase-js`'s `.upsert({ onConflict })` has no
+way to supply — so re-running `/syncanki` matches rather than duplicates by
+checking first, not by relying on the database to reject a conflict. `/export`
+stays forever as the backup and escape hatch (capybara-anki's D-§2.3), just not
+as the daily path.
 
 Optional (enable the admin `/bug` report command; inert if unset): `GITHUB_ISSUE_TOKEN` (GitHub PAT
 with `Issues: write` — files issues on `GITHUB_REPO`). Falls back to `GITHUB_DEPLOY_TOKEN`, which
