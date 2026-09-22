@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v104";
+const BUILD_VERSION = "v105";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -114,6 +114,18 @@ const BUG_REPORT_MAX_CHARS = 8000;
 // not something this function serves. Optional: /study explains itself and does
 // nothing if unset, the same way /update and /bug stay inert without their secrets.
 const ANKI_APP_URL = Deno.env.get("ANKI_APP_URL") ?? "";
+// Automates `/learn top N` on a schedule (.github/workflows/auto-learn.yml), rather
+// than requiring either person to type it. A word only auto-adds once it has
+// genuinely kept coming up -- AUTO_LEARN_THRESHOLD, not merely appeared once -- and
+// AUTO_LEARN_MAX_PER_RUN caps how many land in a single run, so turning this on
+// against months of existing annotation history (11k+ vocabulary rows already on
+// record) doesn't dump a huge backlog into the deck the first time it runs; it
+// trickles in over several days instead, the same as someone occasionally running
+// `/learn top 15` themselves. Both fixed rather than configurable -- see
+// runAutoLearnCron's own docstring for why this isn't the "mint a card for every
+// word annotation sees" mistake this file already warns against elsewhere.
+const AUTO_LEARN_THRESHOLD = 10;
+const AUTO_LEARN_MAX_PER_RUN = 15;
 // This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
 // (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
 // deploys to THIS couple's project — not whatever single project the repo's default
@@ -363,6 +375,20 @@ Deno.serve(async (req) => {
     }
     scheduleBackgroundWork(`exampleBackfillChain (depth ${depth})`, runExampleBackfillChain(chatId, depth));
     return new Response("ok");
+  }
+
+  // Daily automation for "add frequently used words" (.github/workflows/auto-learn.yml).
+  // Same INTERNAL_CHAIN_HEADER/WEBHOOK_SECRET trust as internal_backfill_examples above,
+  // extended to an external scheduled caller instead of a self-chained request -- reusing
+  // the secret rather than minting a new one, same reasoning as that block. Runs
+  // synchronously and returns a real summary rather than backgrounding + an empty ack,
+  // since the caller is a scheduled job that wants to see what happened.
+  if (req.method === "POST" && url.searchParams.has("internal_autolearn")) {
+    if (req.headers.get(INTERNAL_CHAIN_HEADER) !== WEBHOOK_SECRET) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    const result = await runAutoLearnCron();
+    return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
   }
 
   const secret = req.headers.get("x-telegram-bot-api-secret-token");
@@ -3114,6 +3140,99 @@ async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit
   });
   if (error) { console.error(`vocab_top_unlearned (${lang}) failed:`, error); return []; }
   return data ?? [];
+}
+
+/**
+ * The daily automation behind `.github/workflows/auto-learn.yml` -- `/learn top N`'s
+ * own selection (this function reuses `fetchTopUnlearned` unchanged), run once a day
+ * for both people's OWN learning_language deck rather than requiring either of them
+ * to type the command. Unlike `/learn top N [lang]`, this never reaches into a
+ * partner's deck on its own initiative -- each person's run only ever touches their
+ * own `learning_language`.
+ *
+ * `fetchTopUnlearned` already orders by `occurrence_count desc`, so asking it for
+ * exactly `AUTO_LEARN_MAX_PER_RUN` rows and then filtering to `>= AUTO_LEARN_THRESHOLD`
+ * is already correct -- the top N by count are the only candidates that could ever
+ * qualify for a cap of N, so there is no need to over-fetch and re-sort.
+ *
+ * Two guards keep this from being the exact mistake this file already warns against
+ * elsewhere (annotation minting a card for every word it sees, which emptied `/learn`
+ * of meaning the first time this codebase tried it): AUTO_LEARN_THRESHOLD requires a
+ * word to have genuinely kept coming up, not merely appeared once, and
+ * AUTO_LEARN_MAX_PER_RUN caps a single run's additions so months of pre-existing
+ * annotation history doesn't dump a huge backlog into the deck the first time this
+ * runs -- it trickles in over several days instead.
+ *
+ * Runs synchronously (no scheduleBackgroundWork): the caller is a scheduled job that
+ * wants a real summary back, not a Telegram webhook racing a delivery timeout.
+ */
+async function runAutoLearnCron(): Promise<{ perUser: Record<string, { added: number; lemmas: string[] }>; error?: string }> {
+  const { data: users, error } = await supabase
+    .from("users")
+    .select("id, telegram_id, display_name, learning_language");
+  if (error) {
+    console.error("autoLearnCron: fetch users failed:", error);
+    return { perUser: {}, error: error.message };
+  }
+
+  try { await refreshVocabularyCounts(); }
+  catch (e) { console.error("autoLearnCron: refreshVocabularyCounts failed:", e); }
+
+  const perUser: Record<string, { added: number; lemmas: string[] }> = {};
+
+  for (const user of (users ?? []) as any[]) {
+    const candidates = await fetchTopUnlearned(user.learning_language, user.id, AUTO_LEARN_MAX_PER_RUN);
+    const qualifying = candidates.filter((v: any) => v.occurrence_count >= AUTO_LEARN_THRESHOLD);
+    if (qualifying.length === 0) {
+      perUser[user.id] = { added: 0, lemmas: [] };
+      continue;
+    }
+
+    const newCards = qualifying.map((v: any) => ({
+      user_id: user.id,
+      vocabulary_id: v.id,
+      example_message_id: v.first_seen_message_id,
+    }));
+    const { data: inserted, error: insertErr } = await supabase.from("flashcards")
+      .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true })
+      .select("vocabulary_id");
+    if (insertErr) {
+      console.error(`autoLearnCron: flashcard insert failed for ${user.id}:`, insertErr);
+      perUser[user.id] = { added: 0, lemmas: [] };
+      continue;
+    }
+
+    // Same "what actually landed, not what we tried" check /learn itself makes --
+    // ignoreDuplicates means a race with a manual /learn between the select above and
+    // this insert silently skips rather than errors, so re-deriving from what the
+    // insert's own .select() reports is the only way to know what's real.
+    const insertedIds = new Set((inserted ?? []).map((r: any) => r.vocabulary_id));
+    const added = qualifying.filter((v: any) => insertedIds.has(v.id));
+    perUser[user.id] = { added: added.length, lemmas: added.map((v: any) => v.lemma) };
+    if (added.length === 0) continue;
+
+    scheduleBackgroundWork(
+      `writeAnkiNotes(autolearn ${user.learning_language})`,
+      writeAnkiNotes(added.map(vocabCardFields), langLabel(user.learning_language)),
+    );
+
+    if (user.telegram_id) {
+      const deckLabel = `${langFlag(user.learning_language)} ${langLabel(user.learning_language)} deck`;
+      const lines = added.map((v: any, i: number) => {
+        const pos = v.part_of_speech ? ` _(${mdEscapeItalicSlot(v.part_of_speech)})_` : "";
+        const gloss = v.gloss ?? "?";
+        return `${i + 1}. *${v.lemma}*${pos} — ${gloss} _(${v.occurrence_count}×)_`;
+      });
+      const header = `📚 Auto-added ${added.length} frequently used word${added.length === 1 ? "" : "s"} to your ${deckLabel} (seen ${AUTO_LEARN_THRESHOLD}+ times):`;
+      await sendMessage(
+        Number(user.telegram_id),
+        `${header}\n${lines.join("\n")}\n\nOpen /study to review ${added.length === 1 ? "it" : "them"}.`,
+        "Markdown",
+      );
+    }
+  }
+
+  return { perUser };
 }
 
 function formatVocabSection(
