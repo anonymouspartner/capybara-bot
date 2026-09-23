@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v104";
+const BUILD_VERSION = "v106";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -114,6 +114,18 @@ const BUG_REPORT_MAX_CHARS = 8000;
 // not something this function serves. Optional: /study explains itself and does
 // nothing if unset, the same way /update and /bug stay inert without their secrets.
 const ANKI_APP_URL = Deno.env.get("ANKI_APP_URL") ?? "";
+// Automates `/learn top N` on a schedule (.github/workflows/auto-learn.yml), rather
+// than requiring either person to type it. A word only auto-adds once it has
+// genuinely kept coming up -- AUTO_LEARN_THRESHOLD, not merely appeared once -- and
+// AUTO_LEARN_MAX_PER_RUN caps how many land in a single run, so turning this on
+// against months of existing annotation history (11k+ vocabulary rows already on
+// record) doesn't dump a huge backlog into the deck the first time it runs; it
+// trickles in over several days instead, the same as someone occasionally running
+// `/learn top 15` themselves. Both fixed rather than configurable -- see
+// runAutoLearnCron's own docstring for why this isn't the "mint a card for every
+// word annotation sees" mistake this file already warns against elsewhere.
+const AUTO_LEARN_THRESHOLD = 10;
+const AUTO_LEARN_MAX_PER_RUN = 15;
 // This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
 // (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
 // deploys to THIS couple's project — not whatever single project the repo's default
@@ -404,6 +416,20 @@ Deno.serve(async (req) => {
     }
     scheduleBackgroundWork(`exampleBackfillChain (depth ${depth})`, runExampleBackfillChain(chatId, depth));
     return new Response("ok");
+  }
+
+  // Daily automation for "add frequently used words" (.github/workflows/auto-learn.yml).
+  // Same INTERNAL_CHAIN_HEADER/WEBHOOK_SECRET trust as internal_backfill_examples above,
+  // extended to an external scheduled caller instead of a self-chained request -- reusing
+  // the secret rather than minting a new one, same reasoning as that block. Runs
+  // synchronously and returns a real summary rather than backgrounding + an empty ack,
+  // since the caller is a scheduled job that wants to see what happened.
+  if (req.method === "POST" && url.searchParams.has("internal_autolearn")) {
+    if (req.headers.get(INTERNAL_CHAIN_HEADER) !== WEBHOOK_SECRET) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    const result = await runAutoLearnCron();
+    return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
   }
 
   const secret = req.headers.get("x-telegram-bot-api-secret-token");
@@ -2570,9 +2596,24 @@ const ANKI_GRAMMAR_DECK = "Grammar";
  *
  * `anki_notes.language` is constrained to 'uk'/'en', unlike this bot's free-text
  * column, so rows in any other language are dropped here rather than rejected by
- * Postgres. The table's own (lemma, part_of_speech, language) uniqueness makes a
- * repeat an upsert rather than a duplicate card -- which is also what makes the
- * backfill safe to run as often as you like.
+ * Postgres.
+ *
+ * An explicit "is this already captured?" select, then a plain insert of what's
+ * left -- not an upsert. `anki_notes`' own uniqueness on (lemma, part_of_speech,
+ * language) is a *partial* index (`WHERE source <> 'anki-import'`, capybara-anki's
+ * docs/MIGRATION.md §1.1/§3.1): a real AnkiDroid export can genuinely hold two
+ * notes sharing a (lemma, part_of_speech, language) -- a plain note and its
+ * "Capybara+" revision, both independently reviewed for months -- so the imported
+ * rows had to be exempted from uniqueness rather than collapsed. Postgres will
+ * only use a partial index as an ON CONFLICT target when the request repeats its
+ * exact WHERE predicate, and supabase-js's `.upsert({ onConflict })` has no way to
+ * supply one -- so `ignoreDuplicates` against this index doesn't just skip a
+ * repeat, it fails the whole call with "no unique or exclusion constraint
+ * matching the ON CONFLICT specification", silently swallowed by the catch below
+ * the same way any other write failure is. The select-then-insert here checks the
+ * same condition the index enforces (excluding `anki-import` rows, which a bot
+ * capture is always allowed to coexist beside) without needing a matching
+ * conflict target at all.
  */
 async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number> {
   const rows = cards
@@ -2591,14 +2632,36 @@ async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number
       source: "bot",
     }));
   if (rows.length === 0) return 0;
-  const { error } = await supabase
-    .from("anki_notes")
-    .upsert(rows, { onConflict: "lemma,part_of_speech,language", ignoreDuplicates: true });
+
+  // Chunked the same way the example-message lookup above is (avoids an
+  // oversized IN filter) -- /syncanki's backfill is the caller that can hand
+  // this up to 200 lemmas in one call.
+  const lemmas = [...new Set(rows.map((r) => r.lemma))];
+  const captured = new Set<string>();
+  for (let i = 0; i < lemmas.length; i += 100) {
+    const { data: existing, error: selectError } = await supabase
+      .from("anki_notes")
+      .select("lemma, part_of_speech, language")
+      .neq("source", "anki-import")
+      .in("lemma", lemmas.slice(i, i + 100));
+    if (selectError) {
+      console.error("writeAnkiNotes pre-check failed:", selectError);
+      return 0;
+    }
+    for (const r of existing ?? []) {
+      captured.add(JSON.stringify([r.lemma, r.part_of_speech, r.language]));
+    }
+  }
+
+  const newRows = rows.filter((r) => !captured.has(JSON.stringify([r.lemma, r.part_of_speech, r.language])));
+  if (newRows.length === 0) return 0;
+
+  const { error } = await supabase.from("anki_notes").insert(newRows);
   if (error) {
     console.error("writeAnkiNotes failed:", error);
     return 0;
   }
-  return rows.length;
+  return newRows.length;
 }
 
 /** A vocabulary row as a card. The example is sanitized on the way through, so
@@ -3162,6 +3225,99 @@ async function fetchTopUnlearned(lang: LangCode, learnerId: string | null, limit
   });
   if (error) { console.error(`vocab_top_unlearned (${lang}) failed:`, error); return []; }
   return data ?? [];
+}
+
+/**
+ * The daily automation behind `.github/workflows/auto-learn.yml` -- `/learn top N`'s
+ * own selection (this function reuses `fetchTopUnlearned` unchanged), run once a day
+ * for both people's OWN learning_language deck rather than requiring either of them
+ * to type the command. Unlike `/learn top N [lang]`, this never reaches into a
+ * partner's deck on its own initiative -- each person's run only ever touches their
+ * own `learning_language`.
+ *
+ * `fetchTopUnlearned` already orders by `occurrence_count desc`, so asking it for
+ * exactly `AUTO_LEARN_MAX_PER_RUN` rows and then filtering to `>= AUTO_LEARN_THRESHOLD`
+ * is already correct -- the top N by count are the only candidates that could ever
+ * qualify for a cap of N, so there is no need to over-fetch and re-sort.
+ *
+ * Two guards keep this from being the exact mistake this file already warns against
+ * elsewhere (annotation minting a card for every word it sees, which emptied `/learn`
+ * of meaning the first time this codebase tried it): AUTO_LEARN_THRESHOLD requires a
+ * word to have genuinely kept coming up, not merely appeared once, and
+ * AUTO_LEARN_MAX_PER_RUN caps a single run's additions so months of pre-existing
+ * annotation history doesn't dump a huge backlog into the deck the first time this
+ * runs -- it trickles in over several days instead.
+ *
+ * Runs synchronously (no scheduleBackgroundWork): the caller is a scheduled job that
+ * wants a real summary back, not a Telegram webhook racing a delivery timeout.
+ */
+async function runAutoLearnCron(): Promise<{ perUser: Record<string, { added: number; lemmas: string[] }>; error?: string }> {
+  const { data: users, error } = await supabase
+    .from("users")
+    .select("id, telegram_id, display_name, learning_language");
+  if (error) {
+    console.error("autoLearnCron: fetch users failed:", error);
+    return { perUser: {}, error: error.message };
+  }
+
+  try { await refreshVocabularyCounts(); }
+  catch (e) { console.error("autoLearnCron: refreshVocabularyCounts failed:", e); }
+
+  const perUser: Record<string, { added: number; lemmas: string[] }> = {};
+
+  for (const user of (users ?? []) as any[]) {
+    const candidates = await fetchTopUnlearned(user.learning_language, user.id, AUTO_LEARN_MAX_PER_RUN);
+    const qualifying = candidates.filter((v: any) => v.occurrence_count >= AUTO_LEARN_THRESHOLD);
+    if (qualifying.length === 0) {
+      perUser[user.id] = { added: 0, lemmas: [] };
+      continue;
+    }
+
+    const newCards = qualifying.map((v: any) => ({
+      user_id: user.id,
+      vocabulary_id: v.id,
+      example_message_id: v.first_seen_message_id,
+    }));
+    const { data: inserted, error: insertErr } = await supabase.from("flashcards")
+      .upsert(newCards, { onConflict: "user_id,vocabulary_id", ignoreDuplicates: true })
+      .select("vocabulary_id");
+    if (insertErr) {
+      console.error(`autoLearnCron: flashcard insert failed for ${user.id}:`, insertErr);
+      perUser[user.id] = { added: 0, lemmas: [] };
+      continue;
+    }
+
+    // Same "what actually landed, not what we tried" check /learn itself makes --
+    // ignoreDuplicates means a race with a manual /learn between the select above and
+    // this insert silently skips rather than errors, so re-deriving from what the
+    // insert's own .select() reports is the only way to know what's real.
+    const insertedIds = new Set((inserted ?? []).map((r: any) => r.vocabulary_id));
+    const added = qualifying.filter((v: any) => insertedIds.has(v.id));
+    perUser[user.id] = { added: added.length, lemmas: added.map((v: any) => v.lemma) };
+    if (added.length === 0) continue;
+
+    scheduleBackgroundWork(
+      `writeAnkiNotes(autolearn ${user.learning_language})`,
+      writeAnkiNotes(added.map(vocabCardFields), langLabel(user.learning_language)),
+    );
+
+    if (user.telegram_id) {
+      const deckLabel = `${langFlag(user.learning_language)} ${langLabel(user.learning_language)} deck`;
+      const lines = added.map((v: any, i: number) => {
+        const pos = v.part_of_speech ? ` _(${mdEscapeItalicSlot(v.part_of_speech)})_` : "";
+        const gloss = v.gloss ?? "?";
+        return `${i + 1}. *${v.lemma}*${pos} — ${gloss} _(${v.occurrence_count}×)_`;
+      });
+      const header = `📚 Auto-added ${added.length} frequently used word${added.length === 1 ? "" : "s"} to your ${deckLabel} (seen ${AUTO_LEARN_THRESHOLD}+ times):`;
+      await sendMessage(
+        Number(user.telegram_id),
+        `${header}\n${lines.join("\n")}\n\nOpen /study to review ${added.length === 1 ? "it" : "them"}.`,
+        "Markdown",
+      );
+    }
+  }
+
+  return { perUser };
 }
 
 function formatVocabSection(

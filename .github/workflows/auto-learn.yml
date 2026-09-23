@@ -1,0 +1,62 @@
+name: auto-learn
+
+# Automates "add frequently used words" -- what /learn top N already does by hand,
+# run once a day for both people's own learning_language deck instead of requiring
+# either of them to type the command. See CLAUDE.md's "How cards reach the study
+# app" and runAutoLearnCron's own docstring in index.ts for the two guards (a word
+# has to genuinely keep coming up, and a single run's additions are capped) that
+# keep this from being the "mint a card for every word annotation sees" mistake
+# this file already warns against elsewhere.
+#
+# Needs WEBHOOK_SECRET as a repo secret, same value as the Supabase function secret
+# of the same name -- the internal_autolearn route trusts it the same way an
+# internal self-chained request already does (see INTERNAL_CHAIN_HEADER in
+# index.ts). Also needs SUPABASE_PROJECT_REF, the same secret webhook-watch.yml
+# already uses. Missing either fails the run loudly rather than silently doing
+# nothing -- same philosophy as webhook-watch.yml's own comment on why a red run
+# is never quieted.
+#
+# NOTE: GitHub disables scheduled workflows after 60 days with no repo activity.
+# If this stops firing, re-enable it in the Actions tab.
+
+on:
+  schedule:
+    - cron: "0 12 * * *" # once a day; hour is arbitrary
+  workflow_dispatch: {}
+
+concurrency:
+  group: auto-learn
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run the daily auto-learn pass
+        env:
+          REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${REF:-}" ] || [ -z "${SECRET:-}" ]; then
+            echo "FAIL: SUPABASE_PROJECT_REF and/or WEBHOOK_SECRET is not set on this repo."
+            exit 1
+          fi
+
+          if ! body=$(curl -fsS --max-time 60 -X POST \
+              -H "x-capybara-internal-secret: ${SECRET}" \
+              "https://${REF}.supabase.co/functions/v1/telegram-bot?internal_autolearn"); then
+            echo "FAIL: the auto-learn route did not return success."
+            exit 1
+          fi
+
+          echo "$body" | jq .
+
+          if echo "$body" | jq -e 'has("error")' > /dev/null; then
+            echo "FAIL: the route reported an error: $(echo "$body" | jq -r '.error')"
+            exit 1
+          fi

@@ -30,7 +30,7 @@ couple (not multi-tenant).
 | `storage_setup.sql` | Creates the private `voice-messages` Storage bucket. |
 | `PROVISION_NEW_COUPLE.md` | The setup runbook — start here for a new instance. |
 | `.env.example` | Template for the five function secrets (copy to `.env`). |
-| `.github/workflows/` | CI gate (`check.yml`) + **primary deploy path** (`deploy.yml`, manual `workflow_dispatch`) + `webhook-watch.yml` (scheduled outside-in check that this bot still owns its Telegram webhook); `.devcontainer/` for Codespaces. |
+| `.github/workflows/` | CI gate (`check.yml`) + **primary deploy path** (`deploy.yml`, manual `workflow_dispatch`) + `webhook-watch.yml` (scheduled outside-in check that this bot still owns its Telegram webhook) + `auto-learn.yml` (scheduled daily "add frequently used words," see "How cards reach the study app" below); `.devcontainer/` for Codespaces. |
 | `deploy.ps1` / `predeploy-check.ps1` | Fallback deploy spine for offline/local deploys (Windows PowerShell). |
 | `deploy.sh` / `predeploy-check.sh` / `provision.sh` | Same fallback spine, ported to bash, + provisioning glue. |
 | `docs/` | Background & design history (deploy-safety + reproducibility handoffs). |
@@ -121,6 +121,7 @@ directly:
 |---|---|---|
 | `/learn <word>`, `/learn top N` | the words just added to `flashcards` | `Ukrainian` / `English` |
 | the grammar assistant (`/capybara`) | each correction, as a fill-in-the-blank card | `Grammar` |
+| `.github/workflows/auto-learn.yml` (daily, automatic) | `/learn top N`'s own selection, run unattended for each person's own deck | `Ukrainian` / `English` |
 | `/syncanki` (admin) | the whole existing corpus, once | all of the above |
 
 **Annotation deliberately does not create cards.** `vocabulary` is every word the
@@ -129,14 +130,39 @@ annotator has ever seen (11,329 rows); the deck is the subset someone deliberate
 asked for and empty `/learn` of meaning. An earlier version did exactly that — if you are
 tempted to move the write back into `annotateMessage`, this is why not.
 
+**`auto-learn.yml` is not that mistake, on purpose.** It's `/learn top N`'s own logic
+(`runAutoLearnCron`, reusing `fetchTopUnlearned` unchanged) run once a day instead of by
+hand, guarded two ways: `AUTO_LEARN_THRESHOLD` (10) requires a word to have genuinely kept
+recurring, not merely appeared once, and `AUTO_LEARN_MAX_PER_RUN` (15) caps how many land
+in a single day, so switching this on against months of existing `vocabulary` history
+doesn't dump a huge backlog into the deck at once — it trickles in over several days, the
+same shape a person occasionally running `/learn top 15` themselves would produce. Each
+person's run only ever touches their own `learning_language` deck, never a partner's.
+Sends a Telegram message listing what it added, same as `/learn` does, so it's never a
+silent surprise. The route (`POST ?internal_autolearn`) reuses `WEBHOOK_SECRET` as its
+bearer credential (`x-capybara-internal-secret` header, the same trust
+`internal_backfill_examples` already uses) — the workflow needs `WEBHOOK_SECRET` and
+`SUPABASE_PROJECT_REF` added as **repo** secrets (Settings → Secrets and variables →
+Actions) to actually run; missing either fails the scheduled run loudly rather than
+silently doing nothing.
+
 One builder shapes every card (`vocabCardFields` / `grammarCardFields`), used by the CSV,
 the live writes, and the backfill alike. Two would drift, and the copy the app reads is
 the one nobody is looking at while they review.
 
-`/syncanki` is idempotent — `writeAnkiNotes` upserts on `anki_notes`' own
-`(lemma, part_of_speech, language)` key, the same key the original Anki import wrote
-under, so re-running it matches rather than duplicates. `/export` stays forever as the
-backup and escape hatch (capybara-anki's D-§2.3), just not as the daily path.
+`/syncanki` is idempotent — `writeAnkiNotes` checks `anki_notes`' own
+`(lemma, part_of_speech, language)` key with an explicit select before inserting,
+excluding rows the original Anki import wrote (that key is only a *partial* unique
+index on capybara-anki's side, `WHERE source <> 'anki-import'` — a real export can
+hold two notes sharing that key, one plain and one a `Capybara+` revision, both
+independently reviewed for months, so imported rows are exempted from uniqueness
+rather than collapsed). A plain upsert against that index doesn't work: Postgres
+only accepts a partial index as an `ON CONFLICT` target when the request repeats
+its exact `WHERE` clause, which `supabase-js`'s `.upsert({ onConflict })` has no
+way to supply — so re-running `/syncanki` matches rather than duplicates by
+checking first, not by relying on the database to reject a conflict. `/export`
+stays forever as the backup and escape hatch (capybara-anki's D-§2.3), just not
+as the daily path.
 
 Optional (enable the admin `/bug` report command; inert if unset): `GITHUB_ISSUE_TOKEN` (GitHub PAT
 with `Issues: write` — files issues on `GITHUB_REPO`). Falls back to `GITHUB_DEPLOY_TOKEN`, which
