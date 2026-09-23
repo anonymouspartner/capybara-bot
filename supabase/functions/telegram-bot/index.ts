@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v105";
+const BUILD_VERSION = "v106";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -344,12 +344,53 @@ Deno.serve(async (req) => {
         expectedUrl: EXPECTED_WEBHOOK_URL,
         pendingUpdates: w.pending,
         lastError: w.lastError,
+        lastErrorAgeSeconds: w.lastErrorAgeSeconds,
         detail: w.detail,
       };
     }
     return new Response(
       JSON.stringify(body),
       { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }
+
+  // Webhook self-repair, called from OUTSIDE by the webhook-watch workflow.
+  //
+  // When another service runs on this bot's token it takes the updates -- a polling client
+  // calls deleteWebhook on startup, a second webhook consumer overwrites the URL. From that
+  // moment Telegram delivers nothing here and this function is never invoked, so it cannot
+  // possibly notice on its own: there is no request to notice it during. Something outside
+  // has to look, and then ask for the repair. This is that ask.
+  //
+  // Must stay BEFORE the Telegram secret check: this request is not a Telegram update and
+  // carries no Telegram header. It authenticates with the same internal header the backfill
+  // chain uses, and takes no parameters at all -- see repairWebhook for why that matters.
+  if (req.method === "POST" && url.searchParams.has("repair_webhook")) {
+    if (req.headers.get(INTERNAL_CHAIN_HEADER) !== WEBHOOK_SECRET) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    const before = await fetchWebhookStatus();
+    // Already correct: report it and change nothing, so a watchdog that races a manual fix
+    // (or retries) does not re-register the webhook for no reason.
+    if (before.reachable && before.pointsHere) {
+      return new Response(
+        JSON.stringify({ repaired: false, alreadyCorrect: true, url: EXPECTED_WEBHOOK_URL,
+                         pendingUpdates: before.pending, detail: "Webhook already points here." }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    const result = await repairWebhook();
+    console.log(`repair_webhook: was ${before.url ?? "(unset)"} -> ${result.ok ? "repaired" : "FAILED"}: ${result.detail}`);
+    return new Response(
+      JSON.stringify({
+        repaired: result.ok,
+        alreadyCorrect: false,
+        previousUrl: before.url,
+        url: EXPECTED_WEBHOOK_URL,
+        pendingUpdates: before.pending,
+        detail: result.detail,
+      }),
+      { status: result.ok ? 200 : 502, headers: { "content-type": "application/json" } },
     );
   }
 
@@ -1696,6 +1737,11 @@ type WebhookStatus = {
   pointsHere: boolean;      // ...and whether that is this function
   pending: number | null;   // updates accepted but not yet delivered
   lastError: string | null;
+  // How long ago that error was. Telegram keeps reporting last_error_message long after
+  // the cause is gone, so the text alone cannot tell "delivery is broken right now" from
+  // "blipped during a deploy six hours ago and recovered" -- the age is what separates
+  // them, and without it a monitor alarms for hours on an error that already resolved.
+  lastErrorAgeSeconds: number | null;
   detail: string | null;
 };
 
@@ -1713,7 +1759,8 @@ function sameEndpoint(a: string, b: string): boolean {
 
 async function fetchWebhookStatus(): Promise<WebhookStatus> {
   const dead = (detail: string): WebhookStatus =>
-    ({ reachable: false, url: null, pointsHere: false, pending: null, lastError: null, detail });
+    ({ reachable: false, url: null, pointsHere: false, pending: null, lastError: null,
+       lastErrorAgeSeconds: null, detail });
   try {
     const resp = await fetch(`${TELEGRAM_API}/getWebhookInfo`);
     const body = await resp.json().catch(() => null);
@@ -1730,10 +1777,48 @@ async function fetchWebhookStatus(): Promise<WebhookStatus> {
       lastError: info.last_error_message
         ? `${info.last_error_message}${info.last_error_date ? ` (${new Date(info.last_error_date * 1000).toISOString()})` : ""}`
         : null,
+      lastErrorAgeSeconds: (info.last_error_message && info.last_error_date)
+        ? Math.max(0, Math.round(Date.now() / 1000 - info.last_error_date))
+        : null,
       detail: null,
     };
   } catch (e) {
     return dead(`transport fail: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+// Re-register this function as the bot's webhook.
+//
+// The URL is NOT a parameter and never will be: the only address this can ever register is
+// this function's own EXPECTED_WEBHOOK_URL. That is what makes the repair route below safe
+// to expose -- the worst anyone who learns the secret can do is put the bot back where it
+// already belongs.
+//
+// allowed_updates is sent EXPLICITLY. Telegram keeps the previous value when the field is
+// omitted, and the value left behind by a polling client is every update type that exists
+// (that exhaustive list is the polling fingerprint). Inheriting it would wake this function
+// for reactions, poll answers and chat-member changes that handleUpdate reads and discards
+// -- a cold start and a bill for each. These two are what it actually handles.
+async function repairWebhook(): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const resp = await fetch(`${TELEGRAM_API}/setWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: EXPECTED_WEBHOOK_URL,
+        secret_token: WEBHOOK_SECRET,
+        allowed_updates: ["message", "callback_query"],
+        // Deliberately NOT drop_pending_updates: whatever queued up while the bot was
+        // unreachable is the couple's own messages, and they get delivered on repair.
+      }),
+    });
+    const body = await resp.json().catch(() => null);
+    if (!resp.ok || !body?.ok) {
+      return { ok: false, detail: `setWebhook HTTP ${resp.status}${body?.description ? `: ${body.description}` : ""}` };
+    }
+    return { ok: true, detail: body.description ?? "Webhook was set" };
+  } catch (e) {
+    return { ok: false, detail: `transport fail: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
 

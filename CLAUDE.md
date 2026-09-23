@@ -90,6 +90,15 @@ between projects; give the other service its own @BotFather bot. `getWebhookInfo
 only place the truth lives — `/diag`, `?health&webhook`, and the `webhook-watch` workflow
 all read it.
 
+This has now happened **twice**, so the bot repairs itself: `POST ?repair_webhook`
+(authenticated by `WEBHOOK_SECRET` in the `x-capybara-internal-secret` header) re-registers
+this function as the webhook. It is called by `webhook-watch`, which must live outside —
+once the webhook is gone this function is never invoked, so it cannot notice on its own.
+The route takes **no parameters** and only ever registers `EXPECTED_WEBHOOK_URL`, so the
+worst anyone holding the secret can do is put the bot back where it belongs. The repairing
+run still **fails**, on purpose: self-healing must never be silent, because a bot that
+quietly recovers every few hours is a bot whose token is still shared.
+
 Optional (enable the admin `/update` self-deploy command; the feature is inert if unset):
 `GITHUB_DEPLOY_TOKEN` (GitHub PAT with `Actions: write` — dispatches `deploy.yml`; without it
 `/update` only reports version status, no deploy button), `GITHUB_REPO` (`owner/name`),
