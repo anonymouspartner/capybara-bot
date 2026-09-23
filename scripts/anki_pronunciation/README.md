@@ -73,6 +73,30 @@ python -m scripts.anki_pronunciation --phrases phrases-uk-2026-09-02.json --send
 Then in Anki: **File → Import** the `.apkg`, and **Tools → AnkiPA Settings →
 Card fields: `TargetText`** (leave *Text extraction method* on **Fields only**).
 
+### Straight into the study app (`--direct`)
+
+capybara-anki is retiring AnkiDroid (its `docs/MIGRATION.md` Phase 6), so a new deck
+no longer needs the build → import → re-export loop. `--direct` skips the `.apkg`
+entirely and writes what `/study` reads:
+
+```bash
+export SUPABASE_URL=https://<ref>.supabase.co
+export SUPABASE_SERVICE_ROLE_KEY=<service role key>
+export OPENAI_API_KEY=<key>
+python -m scripts.anki_pronunciation --lang en --limit 40 --provider openai --direct --dry-run  # preview
+python -m scripts.anki_pronunciation --lang en --limit 40 --provider openai --direct
+```
+
+Audio goes to the public `pronunciation-audio` Storage bucket, and each phrase becomes
+an `anki_notes` row (`kind = 'pronunciation'`) in a per-language deck: `Pronunciation`
+for Ukrainian (where the imported notes already are), `English Pronunciation` for
+English. The two are kept apart on purpose — the app shows both people every deck and
+keeps one schedule per card, so each person's schedule stays their own only while
+they study their own deck. Re-running skips phrases already captured. With
+`--direct`, `--dry-run` lists the phrases and writes nothing, since silent audio
+would otherwise land in the live app. The app's in-app scoring (`/pronounce/score`)
+needs no Azure account for either language — it transcribes with Whisper.
+
 ### Options
 
 | Flag | Meaning |
@@ -85,6 +109,7 @@ Card fields: `TargetText`** (leave *Text extraction method* on **Fields only**).
 | `--voice` | override `CAPYBARA_TTS_VOICE` for one run |
 | `--dry-run` | silent placeholder audio; makes **no API calls** |
 | `--send-to ID` | upload the finished deck to a Telegram chat |
+| `--direct` | write into capybara-anki's `anki_notes` + Storage instead of an `.apkg` |
 
 ---
 

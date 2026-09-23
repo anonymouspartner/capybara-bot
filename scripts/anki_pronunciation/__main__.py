@@ -11,6 +11,9 @@
 
     # build and post the deck straight back to Telegram
     python -m scripts.anki_pronunciation --phrases phrases.json --send-to 12345678
+
+    # skip Anki entirely: write cards straight into capybara-anki's live tables
+    python -m scripts.anki_pronunciation --lang en --limit 40 --provider openai --direct
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from .deck import build_deck
 from .deliver import DeliveryError, send_document
 from .phrases import ENGLISH_NAME, load_json, load_supabase
 from .tts import AudioCache, TTSError, build_provider
+from .write_direct import write_direct
 
 DEFAULT_CACHE = Path(__file__).resolve().parent / ".cache"
 DEFAULT_OUTDIR = Path(__file__).resolve().parent / "dist"
@@ -53,12 +57,58 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="use silent placeholder audio; makes no API calls and costs nothing")
     p.add_argument("--send-to", metavar="CHAT_ID",
                    help="post the finished .apkg to this Telegram chat")
-    return p.parse_args(argv)
+    p.add_argument("--direct", action="store_true",
+                   help="write notes + audio straight into capybara-anki's anki_notes and "
+                        "Storage instead of building an .apkg (needs SUPABASE_URL and "
+                        "SUPABASE_SERVICE_ROLE_KEY)")
+    args = p.parse_args(argv)
+    if args.direct and (args.out or args.send_to):
+        p.error("--direct writes to the database, not a file: drop --out/--send-to")
+    return args
 
 
 def _default_out(lang: str) -> Path:
     today = _dt.date.today().isoformat()
     return DEFAULT_OUTDIR / f"capybara-pronunciation-{lang}-{today}.apkg"
+
+
+def _run_direct(phrase_set, provider, cache, progress, *, dry_run: bool) -> int:
+    print(f"target    capybara-anki anki_notes ({phrase_set.lang})")
+    print(f"provider  {provider.identity}")
+    print(f"phrases   {len(phrase_set)}")
+    print()
+
+    # --dry-run's silent audio is for exercising a local .apkg build. Here it would
+    # land in the live app as real cards with no sound, so a dry run writes nothing.
+    if dry_run:
+        for i, phrase in enumerate(phrase_set.phrases, start=1):
+            progress(i, len(phrase_set), phrase.text, "ok")
+        print("\n  --dry-run: nothing synthesized, uploaded or inserted.")
+        return 0
+
+    base_url = os.environ.get("SUPABASE_URL", "")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not base_url or not service_key:
+        print("error: --direct needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY", file=sys.stderr)
+        return 1
+
+    try:
+        summary = write_direct(phrase_set, provider, cache, base_url=base_url,
+                               service_key=service_key, on_progress=progress)
+    except Exception as e:
+        print(f"\nerror: {e}", file=sys.stderr)
+        return 1
+
+    print()
+    print(f"inserted {summary['written']} pronunciation notes "
+          f"({summary['skipped_existing']} already there, "
+          f"{summary['cache_hits']} audio cached, {summary['cache_misses']} synthesized)")
+    if summary["failures"]:
+        print(f"\n  {len(summary['failures'])} phrase(s) failed and were skipped:", file=sys.stderr)
+        for text, err in summary["failures"][:5]:
+            print(f"    - {text[:60]!r}: {err}", file=sys.stderr)
+    print(f"\nOpen /study -> {summary['deck_name']} to see them.")
+    return 0 if not summary["failures"] else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -88,8 +138,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    out_path = Path(args.out) if args.out else _default_out(phrase_set.lang)
     cache = AudioCache(args.cache_dir)
+
+    def progress(i: int, total: int, text: str, status: str) -> None:
+        preview = text if len(text) <= 52 else text[:49] + "..."
+        marker = {"ok": "  ", "exists": "= "}.get(status, "!!")
+        print(f"{marker} [{i:>3}/{total}] {preview}")
+
+    if args.direct:
+        return _run_direct(phrase_set, provider, cache, progress, dry_run=args.dry_run)
+
+    out_path = Path(args.out) if args.out else _default_out(phrase_set.lang)
 
     print(f"deck      {phrase_set.deck_name}")
     print(f"locale    {phrase_set.locale}"
@@ -97,11 +156,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"provider  {provider.identity}")
     print(f"phrases   {len(phrase_set)}")
     print()
-
-    def progress(i: int, total: int, text: str, status: str) -> None:
-        preview = text if len(text) <= 52 else text[:49] + "..."
-        marker = "  " if status == "ok" else "!!"
-        print(f"{marker} [{i:>3}/{total}] {preview}")
 
     # --- build --------------------------------------------------------------
     try:
