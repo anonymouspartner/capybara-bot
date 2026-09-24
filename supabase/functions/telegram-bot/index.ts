@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v108";
+const BUILD_VERSION = "v109";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1937,14 +1937,21 @@ async function deleteMyCommands(scope?: unknown, languageCode?: string): Promise
   return true;
 }
 
-// Pin the compose-box menu button to the "commands" mode so it renders as the "/"
-// command shortcut (which autofills a slash command on tap) rather than the default
-// "Menu" label. Set globally (no chat scope) — applies to every chat.
+// The compose-box menu button. With the study app configured it opens the app directly
+// -- one tap from any chat to the flashcards, which is what that button is best placed
+// for now that the "/" list is empty anyway. A menu-button launch carries signed
+// initData, which capybara-anki's Telegram auth needs (a reply-KEYBOARD web_app button
+// would not: Telegram sends no initData for those, so the Study button in MENUS below
+// dispatches /study, whose inline button does). Without ANKI_APP_URL it falls back to
+// the "commands" mode, the "/" shortcut. Set globally (no chat scope).
 async function setChatMenuButtonToCommands(): Promise<boolean> {
+  const menuButton = ANKI_APP_URL
+    ? { type: "web_app", text: "📚 Study", web_app: { url: ANKI_APP_URL } }
+    : { type: "commands" };
   const resp = await fetch(`${TELEGRAM_API}/setChatMenuButton`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ menu_button: { type: "commands" } }),
+    body: JSON.stringify({ menu_button: menuButton }),
   });
   if (!resp.ok) { console.error("setChatMenuButton failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
   return true;
@@ -2039,20 +2046,15 @@ const PROMPT_TO_COMMAND: Map<string, string> = new Map(
 // levels deep, but the label stays explicit so adding a third level cannot reintroduce that.
 const BACK_TO_MAIN = "⬅️ Головне меню · Main menu";
 
+// Study is one button, not a submenu: studying happens in the app, and the old Education
+// submenu's commands (/vocab, /learn, /forget, /export, /capybara, /pronounce) are either
+// occasional or covered by the daily auto-learn run, so they no longer earn buttons. They
+// all still work typed, and /help still lists them.
 const MENUS: Record<string, MenuItem[][]> = {
   main: [
-    [{ label: "🎓 Освіта · Education", menu: "education" },
+    [{ label: "📚 Навчання · Study", command: "/study" },
      { label: "🧠 Пам'ять · Memory", menu: "memory" }],
     [{ label: "⚙️ Адмін · Admin", menu: "admin", adminOnly: true }],
-  ],
-  education: [
-    [{ label: "🔤 Топ слів · Top words", command: "/vocab" },
-     { label: "➕ Вивчити · Learn", command: "/learn", prompt: ARG_PROMPTS["/learn"] }],
-    [{ label: "➖ Забути · Forget", command: "/forget", prompt: ARG_PROMPTS["/forget"] },
-     { label: "📤 Експорт · Export", command: "/export" }],
-    [{ label: "🐹 Граматика · Grammar", command: "/capybara" },
-     { label: "🗣️ Вимова · Pronounce", command: "/pronounce" }],
-    [{ label: BACK_TO_MAIN, menu: "main" }],
   ],
   memory: [
     [{ label: "❓ Запитати · Ask", command: "/ask", prompt: ARG_PROMPTS["/ask"] },
@@ -2079,12 +2081,27 @@ const MENUS: Record<string, MenuItem[][]> = {
   ],
 };
 
+// Buttons no keyboard offers any more but a client may still be showing: Telegram keeps
+// the last keyboard a chat received until a new one replaces it, so a stale Education
+// submenu can outlive the build that sent it. A tap on one arrives as bare text, and an
+// unrecognised label would be translated and forwarded to the partner -- so they stay
+// resolvable, doing what they always did. The old Education button opens Study.
+const RETIRED_MENU_ITEMS: MenuItem[] = [
+  { label: "🎓 Освіта · Education", command: "/study" },
+  { label: "🔤 Топ слів · Top words", command: "/vocab" },
+  { label: "➕ Вивчити · Learn", command: "/learn", prompt: ARG_PROMPTS["/learn"] },
+  { label: "➖ Забути · Forget", command: "/forget", prompt: ARG_PROMPTS["/forget"] },
+  { label: "📤 Експорт · Export", command: "/export" },
+  { label: "🐹 Граматика · Grammar", command: "/capybara" },
+  { label: "🗣️ Вимова · Pronounce", command: "/pronounce" },
+];
+
 // Flat label -> item index, built once. Labels are unique across the whole tree (the
 // two Back buttons name distinct destinations), so a tap resolves without knowing which
 // submenu the user is looking at -- which the keyboard itself never tells us.
 const MENU_ITEM_BY_LABEL: Map<string, MenuItem> = (() => {
   const m = new Map<string, MenuItem>();
-  for (const rows of Object.values(MENUS)) {
+  for (const rows of [...Object.values(MENUS), [RETIRED_MENU_ITEMS]]) {
     for (const row of rows) {
       for (const item of row) {
         // One label may legitimately appear in several menus as long as it always does
@@ -2126,7 +2143,6 @@ function buildMenuKeyboard(menuName: string, isAdmin: boolean): any {
 
 const MENU_TITLES: Record<string, string> = {
   main: "🏠 Головне меню · Main menu",
-  education: "🎓 Освіта · Education",
   memory: "🧠 Пам'ять · Memory",
   admin: "⚙️ Адмін-меню · Admin menu",
 };
@@ -3177,7 +3193,7 @@ async function handleHelp(msg: any, user: any) {
       "",
       "\u0414\u0432\u0456 \u043a\u043e\u043b\u043e\u0434\u0438: \ud83c\uddfa\ud83c\udde6 \u0443\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430 \u0456 \ud83c\uddec\ud83c\udde7 \u0430\u043d\u0433\u043b\u0456\u0439\u0441\u044c\u043a\u0430.",
       "",
-      "Кнопки меню — за значком сітки поряд зі скріпкою. Натисни його, щоб відкрити Освіту й Пам'ять. /menu — якщо значка не видно. Усі команди також працюють, якщо їх набрати.",
+      "Кнопки меню — за значком сітки поряд зі скріпкою. Натисни його, щоб відкрити Навчання й Пам'ять. /menu — якщо значка не видно. Усі команди також працюють, якщо їх набрати.",
       "",
       solo
         ? "\u2022 \u041f\u0438\u0448\u0438 \u0430\u0431\u043e \u043d\u0430\u0434\u0441\u0438\u043b\u0430\u0439 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0435 \u2014 \u044f \u043f\u0435\u0440\u0435\u043a\u043b\u0430\u0434\u0430\u044e \u043c\u0456\u0436 \u0442\u0432\u043e\u0457\u043c\u0438 \u0434\u0432\u043e\u043c\u0430 \u043c\u043e\u0432\u0430\u043c\u0438"
@@ -3211,7 +3227,7 @@ async function handleHelp(msg: any, user: any) {
       "",
       "Two decks: a \ud83c\uddfa\ud83c\udde6 Ukrainian deck and a \ud83c\uddec\ud83c\udde7 English deck.",
       "",
-      "Menu buttons live behind the grid button next to the paperclip — tap it for Education and Memory. /menu if you don't see it. Every command below also works typed.",
+      "Menu buttons live behind the grid button next to the paperclip — tap it for Study and Memory. /menu if you don't see it. Every command below also works typed.",
       "",
       solo
         ? "\u2022 Just type or send a voice message \u2014 I translate it between your two languages"
