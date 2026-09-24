@@ -6,6 +6,11 @@
     # straight from the vocabulary table
     python -m scripts.anki_pronunciation --lang uk --limit 40
 
+    # review a list before paying for it: preview + save it, then run from the
+    # saved file, dropping lines by the numbers the preview printed
+    python -m scripts.anki_pronunciation --lang en --direct --dry-run --save-plan phrases-en.json
+    python -m scripts.anki_pronunciation --phrases phrases-en.json --skip 3,17 --provider openai --direct
+
     # exercise the whole pipeline with silent audio, no API calls, no cost
     python -m scripts.anki_pronunciation --lang uk --dry-run
 
@@ -26,7 +31,8 @@ from pathlib import Path
 
 from .deck import build_deck
 from .deliver import DeliveryError, send_document
-from .phrases import ENGLISH_NAME, load_json, load_supabase
+from .phrases import (DEFAULT_MAX_WORDS, ENGLISH_NAME, PhraseSet, load_json,
+                      load_supabase, save_json)
 from .tts import AudioCache, TTSError, build_provider
 from .write_direct import write_direct
 
@@ -47,6 +53,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     p.add_argument("--limit", type=int, default=40,
                    help="max cards when reading from the database (default: 40)")
+    p.add_argument("--max-words", type=int, default=DEFAULT_MAX_WORDS,
+                   help="skip database example sentences longer than this many words "
+                        f"(default: {DEFAULT_MAX_WORDS}; 0 = no limit)")
+    p.add_argument("--skip", metavar="N[,N...]", type=_parse_skip, default=frozenset(),
+                   help="drop these phrases, by the 1-based numbers a preview printed "
+                        "(use with --phrases so the numbering can't shift)")
+    p.add_argument("--save-plan", metavar="FILE",
+                   help="write the final phrase list to FILE (reload it with --phrases)")
     p.add_argument("--out", metavar="FILE", help="output .apkg path")
     p.add_argument("--provider", choices=["elevenlabs", "openai", "azure", "local", "silent"],
                    help="override CAPYBARA_TTS_PROVIDER")
@@ -65,6 +79,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.direct and (args.out or args.send_to):
         p.error("--direct writes to the database, not a file: drop --out/--send-to")
     return args
+
+
+def _parse_skip(value: str) -> frozenset[int]:
+    try:
+        numbers = frozenset(int(part) for part in value.split(",") if part.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected numbers like 3,17 -- got {value!r}")
+    if any(n < 1 for n in numbers):
+        raise argparse.ArgumentTypeError("phrase numbers start at 1")
+    return numbers
 
 
 def _default_out(lang: str) -> Path:
@@ -122,10 +146,24 @@ def main(argv: list[str] | None = None) -> int:
         if args.phrases:
             phrase_set = load_json(args.phrases)
         else:
-            phrase_set = load_supabase(args.lang, args.limit)
+            phrase_set = load_supabase(args.lang, args.limit, max_words=args.max_words)
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+
+    if args.skip:
+        out_of_range = sorted(n for n in args.skip if n > len(phrase_set))
+        if out_of_range:
+            print(f"error: --skip {out_of_range} is past the end of a {len(phrase_set)}-phrase list",
+                  file=sys.stderr)
+            return 1
+        phrase_set = PhraseSet(lang=phrase_set.lang, phrases=[
+            p for i, p in enumerate(phrase_set.phrases, start=1) if i not in args.skip
+        ])
+
+    if args.save_plan:
+        save_json(phrase_set, args.save_plan)
+        print(f"saved     {args.save_plan} ({len(phrase_set)} phrases)")
 
     if len(phrase_set) == 0:
         print("error: no phrases found — nothing to build.", file=sys.stderr)

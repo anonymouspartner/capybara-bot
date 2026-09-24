@@ -83,9 +83,20 @@ entirely and writes what `/study` reads:
 export SUPABASE_URL=https://<ref>.supabase.co
 export SUPABASE_SERVICE_ROLE_KEY=<service role key>
 export OPENAI_API_KEY=<key>
-python -m scripts.anki_pronunciation --lang en --limit 40 --provider openai --direct --dry-run  # preview
-python -m scripts.anki_pronunciation --lang en --limit 40 --provider openai --direct
+# 1. preview, and freeze the list you're looking at
+python -m scripts.anki_pronunciation --lang en --limit 40 --direct --dry-run --save-plan phrases-en.json
+# 2. write it, dropping any lines you don't want by the numbers step 1 printed
+python -m scripts.anki_pronunciation --phrases phrases-en.json --skip 3,17 --provider openai --direct
 ```
+
+**Review before the real run.** The phrases are example sentences from your own
+conversations, so the list can include things you'd rather not drill — and the audio
+lands in a *public* bucket, readable by anyone who has a file's URL.
+The loader already drops sentences over `--max-words` (default 12) and lines in the
+wrong alphabet for the language (a mis-tagged Serbo-Croatian line in `en`, say);
+anything else is `--skip`. Skip from the saved plan, not a fresh `--lang` query: the
+database's occurrence ordering moves as you keep chatting, so the same numbers could
+point at different lines a minute later.
 
 Audio goes to the public `pronunciation-audio` Storage bucket, and each phrase becomes
 an `anki_notes` row (`kind = 'pronunciation'`) in a per-language deck: `Pronunciation`
@@ -104,6 +115,9 @@ needs no Azure account for either language — it transcribes with Whisper.
 | `--phrases FILE` | phrase list from `/pronounce` (mutually exclusive with `--lang`) |
 | `--lang CODE` | read phrases from the `vocabulary` table instead |
 | `--limit N` | max cards when reading the database (default 40) |
+| `--max-words N` | drop database example sentences longer than N words (default 12; 0 = no limit) |
+| `--skip N,N` | drop phrases by the 1-based numbers a preview printed (use with `--phrases`) |
+| `--save-plan FILE` | write the final phrase list to FILE, reloadable with `--phrases` |
 | `--out FILE` | output path (default `dist/capybara-pronunciation-<lang>-<date>.apkg`) |
 | `--provider` | override `CAPYBARA_TTS_PROVIDER` for one run |
 | `--voice` | override `CAPYBARA_TTS_VOICE` for one run |

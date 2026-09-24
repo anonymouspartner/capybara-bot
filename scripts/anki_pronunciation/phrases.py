@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -134,6 +135,59 @@ def _dedupe(phrases: Iterable[Phrase]) -> list[Phrase]:
     return out
 
 
+# Longest example sentence load_supabase keeps by default. A pronunciation card is
+# something you say in one breath; the corpus's examples are whole chat messages,
+# and the long ones read as dictation, not drill.
+DEFAULT_MAX_WORDS = 12
+
+
+def word_count(text: str) -> int:
+    return len(text.split())
+
+
+def in_expected_script(text: str, lang: str) -> bool:
+    """False if `text` has letters from the wrong alphabet for `lang`.
+
+    The vocabulary table is only as accurate as the language detection that filled
+    it, and a chat that mixes languages leaks: a Serbo-Croatian line tagged `en`
+    would otherwise become an "English" card read by an English voice. Only checks
+    the two alphabets this corpus actually has (Latin for en, Cyrillic for uk);
+    other languages pass unchecked.
+    """
+    for ch in text:
+        # Modifier letters (Ukrainian's apostrophe U+02BC among them) count as
+        # alphabetic but belong to no one alphabet.
+        if not ch.isalpha() or unicodedata.category(ch) == "Lm":
+            continue
+        if lang == "en" and not ("a" <= ch.lower() <= "z"):
+            return False
+        if lang == "uk" and not unicodedata.name(ch, "").startswith("CYRILLIC"):
+            return False
+    return True
+
+
+def save_json(phrase_set: PhraseSet, path: str | Path) -> None:
+    """Write `phrase_set` in the same schema `load_json` reads.
+
+    This is how a reviewed list gets frozen: preview with `--save-plan`, then run
+    the real thing from that file (`--phrases`, optionally `--skip`), so the
+    numbers you picked from are the numbers that get skipped -- the live
+    occurrence ordering can shift between two runs. The file holds conversation
+    text: name it `phrases-*.json` (gitignored) -- this repo is public.
+    """
+    doc = {
+        "schema": SCHEMA,
+        "language": phrase_set.lang,
+        "phrases": [
+            {"id": p.source_id, "text": p.text, "translation": p.translation,
+             "hint": p.hint, "source": p.source}
+            for p in phrase_set.phrases
+        ],
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def load_json(path: str | Path) -> PhraseSet:
     """Load the phrases.json produced by the bot's /pronounce command."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -163,13 +217,17 @@ def load_json(path: str | Path) -> PhraseSet:
     return PhraseSet(lang=lang, phrases=_dedupe(phrases))
 
 
-def load_supabase(lang: str, limit: int = 40, *, url: str | None = None,
-                  service_key: str | None = None) -> PhraseSet:
+def load_supabase(lang: str, limit: int = 40, *, max_words: int = DEFAULT_MAX_WORDS,
+                  url: str | None = None, service_key: str | None = None) -> PhraseSet:
     """Pull phrases straight from the `vocabulary` table.
 
     Prefers `example` (the short model-extracted sentence) and falls back to the
     bare lemma for rows annotated before that column existed. Ordered by
     occurrence_count so you drill what you actually say.
+
+    Drops examples longer than `max_words` (0 = no limit) and anything in the wrong
+    alphabet for `lang` (`in_expected_script`). Those filters can reject most of
+    the top rows, hence the deeper over-fetch.
     """
     url = url or os.environ.get("SUPABASE_URL")
     service_key = service_key or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -183,7 +241,7 @@ def load_supabase(lang: str, limit: int = 40, *, url: str | None = None,
         "select": "id,lemma,lemma_translation,example,example_translation,occurrence_count",
         "language": f"eq.{lang}",
         "order": "occurrence_count.desc",
-        "limit": str(max(limit * 3, limit)),  # over-fetch; dedupe trims below
+        "limit": str(max(limit * 10, limit)),  # over-fetch; filters + dedupe trim below
     })
     req = urllib.request.Request(
         f"{url.rstrip('/')}/rest/v1/vocabulary?{query}",
@@ -201,9 +259,16 @@ def load_supabase(lang: str, limit: int = 40, *, url: str | None = None,
             f"vocabulary query failed: HTTP {e.code} {e.read().decode('utf-8', 'replace')[:200]}"
         ) from e
 
+    def keep(text: str) -> bool:
+        if not in_expected_script(text, lang):
+            return False
+        return not max_words or word_count(text) <= max_words
+
     phrases: list[Phrase] = []
     for row in rows:
         example = (row.get("example") or "").strip()
+        if example and not keep(example):
+            continue
         if example:
             phrases.append(Phrase(
                 text=example,
@@ -212,7 +277,7 @@ def load_supabase(lang: str, limit: int = 40, *, url: str | None = None,
                 source_id=f"vocab:{row['id']}",
                 source="example",
             ))
-        elif (row.get("lemma") or "").strip():
+        elif (row.get("lemma") or "").strip() and keep(row["lemma"].strip()):
             phrases.append(Phrase(
                 text=row["lemma"].strip(),
                 translation=(row.get("lemma_translation") or "").strip(),
