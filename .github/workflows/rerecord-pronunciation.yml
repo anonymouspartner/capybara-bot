@@ -42,9 +42,11 @@ jobs:
           # Each batch is a handful of TTS calls; 40 batches is far more than any
           # voice change needs, and bounds the job if something keeps failing.
           for i in $(seq 1 40); do
+            # skip = failures so far: those cards stay stale and sort first, so without it
+            # a card that keeps failing would take the same slot in every batch.
             if ! body=$(curl -fsS --max-time 150 -X POST \
                 -H "x-capybara-internal-secret: ${SECRET}" \
-                "https://${REF}.supabase.co/functions/v1/telegram-bot?internal_rerecord_pronunciation"); then
+                "https://${REF}.supabase.co/functions/v1/telegram-bot?internal_rerecord_pronunciation&skip=${failed}"); then
               echo "FAIL: the re-record route did not return success."
               exit 1
             fi
@@ -61,9 +63,10 @@ jobs:
             failed=$((failed + failed_now))
             echo "batch $i: re-recorded $done_now, failed $failed_now, remaining $remaining"
 
-            if [ "$remaining" -eq 0 ]; then break; fi
-            if [ "$done_now" -eq 0 ]; then
-              echo "FAIL: $remaining card(s) left and none could be re-recorded -- see the function's logs in Supabase."
+            # Only cards that already failed this run are left: stop, and report below.
+            if [ "$remaining" -le "$failed" ]; then break; fi
+            if [ "$done_now" -eq 0 ] && [ "$failed_now" -eq 0 ]; then
+              echo "FAIL: $remaining card(s) left but the batch did nothing -- see the function's logs in Supabase."
               exit 1
             fi
           done
@@ -73,7 +76,7 @@ jobs:
             echo "FAIL: $failed attempt(s) failed along the way -- see the function's logs in Supabase."
             exit 1
           fi
-          if [ "$remaining" -gt 0 ]; then
+          if [ "$remaining" -gt "$failed" ]; then
             echo "FAIL: stopped with $remaining card(s) still stale."
             exit 1
           fi
