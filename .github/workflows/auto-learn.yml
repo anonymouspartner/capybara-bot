@@ -16,6 +16,13 @@ name: auto-learn
 # nothing -- same philosophy as webhook-watch.yml's own comment on why a red run
 # is never quieted.
 #
+# The same call also adds each person's daily pronunciation cards (runAutoPronounceCron):
+# single words from their own flashcards, synthesized with the function's own
+# OPENAI_API_KEY -- nothing new to set here.
+#
+# This repo is public, so its run logs are world-readable: the step below prints
+# counts only, never the words. The words go to each person in Telegram.
+#
 # NOTE: GitHub disables scheduled workflows after 60 days with no repo activity.
 # If this stops firing, re-enable it in the Actions tab.
 
@@ -47,16 +54,29 @@ jobs:
             exit 1
           fi
 
-          if ! body=$(curl -fsS --max-time 60 -X POST \
+          # Longer than a plain /learn: the pronunciation pass makes one TTS call per word.
+          if ! body=$(curl -fsS --max-time 150 -X POST \
               -H "x-capybara-internal-secret: ${SECRET}" \
               "https://${REF}.supabase.co/functions/v1/telegram-bot?internal_autolearn"); then
             echo "FAIL: the auto-learn route did not return success."
             exit 1
           fi
 
-          echo "$body" | jq .
+          echo "$body" | jq '{
+            vocabulary: (.perUser | map_values(.added)),
+            pronunciation: ((.pronunciation.perUser // {}) | map_values({added, failed})),
+            error, pronunciation_error: .pronunciation.error
+          }'
 
           if echo "$body" | jq -e 'has("error")' > /dev/null; then
             echo "FAIL: the route reported an error: $(echo "$body" | jq -r '.error')"
+            exit 1
+          fi
+          if echo "$body" | jq -e '.pronunciation.error // empty' > /dev/null; then
+            echo "FAIL: the pronunciation pass reported an error: $(echo "$body" | jq -r '.pronunciation.error')"
+            exit 1
+          fi
+          if echo "$body" | jq -e '[.pronunciation.perUser[]?.failed] | add // 0 | . > 0' > /dev/null; then
+            echo "FAIL: some pronunciation words failed -- see the function's logs in Supabase."
             exit 1
           fi

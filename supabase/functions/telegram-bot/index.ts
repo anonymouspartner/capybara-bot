@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v106";
+const BUILD_VERSION = "v107";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -126,6 +126,29 @@ const ANKI_APP_URL = Deno.env.get("ANKI_APP_URL") ?? "";
 // word annotation sees" mistake this file already warns against elsewhere.
 const AUTO_LEARN_THRESHOLD = 10;
 const AUTO_LEARN_MAX_PER_RUN = 15;
+// The same daily run also gives each person a few pronunciation cards (capybara-anki's
+// shadow-and-score exercise) -- see runAutoPronounceCron. Words only, from the
+// person's own flashcards: never an example sentence, because those are lines from
+// the couple's conversations and the audio goes to a public bucket with nobody
+// reviewing it first. Sentence cards stay a reviewed, manual run of
+// scripts/anki_pronunciation. Capped per run like auto-learn, so a deck of hundreds
+// of existing flashcards trickles in rather than landing at once.
+const AUTO_PRONOUNCE_MAX_PER_RUN = 5;
+// A "word" can be a short fixed phrase ("look after"); anything longer is a sentence.
+const AUTO_PRONOUNCE_MAX_WORDS = 3;
+const PRONUNCIATION_BUCKET = "pronunciation-audio";
+// capybara-anki keeps one schedule per card and shows both people every deck, so each
+// language needs its own deck for each person's schedule to stay their own. Must match
+// DECK_BY_LANG in scripts/anki_pronunciation/write_direct.py.
+const PRONUNCIATION_DECK_BY_LANG: Partial<Record<LangCode, string>> = {
+  uk: "Pronunciation",
+  en: "English Pronunciation",
+};
+// Same model, preset voice and file naming as scripts/anki_pronunciation's OpenAI
+// provider (tts.py), so a word synthesized by either path is the same object in the
+// bucket rather than two copies of it.
+const PRONUNCIATION_TTS_MODEL = "gpt-4o-mini-tts";
+const PRONUNCIATION_TTS_VOICE = "nova";
 // This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
 // (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
 // deploys to THIS couple's project — not whatever single project the repo's default
@@ -429,7 +452,15 @@ Deno.serve(async (req) => {
       return new Response("Unauthorized", { status: 401 });
     }
     const result = await runAutoLearnCron();
-    return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
+    // Its own try: a TTS or Storage failure must not take the vocabulary pass down
+    // with it, and must still reach the workflow as a failure rather than vanish.
+    let pronunciation: Awaited<ReturnType<typeof runAutoPronounceCron>>;
+    try { pronunciation = await runAutoPronounceCron(); }
+    catch (e) {
+      console.error("autoPronounceCron failed:", e);
+      pronunciation = { perUser: {}, error: e instanceof Error ? e.message : String(e) };
+    }
+    return new Response(JSON.stringify({ ...result, pronunciation }), { status: 200, headers: { "content-type": "application/json" } });
   }
 
   const secret = req.headers.get("x-telegram-bot-api-secret-token");
@@ -3318,6 +3349,200 @@ async function runAutoLearnCron(): Promise<{ perUser: Record<string, { added: nu
   }
 
   return { perUser };
+}
+
+/**
+ * The pronunciation half of the daily run: up to AUTO_PRONOUNCE_MAX_PER_RUN new
+ * pronunciation cards per person, in their own learning_language's deck.
+ *
+ * Words come from the person's own `flashcards` -- words someone already chose to
+ * learn, most-used first -- never from `vocabulary` at large (its top rows are "I",
+ * "you", "the") and never an example sentence (conversation text, into a public
+ * bucket, unreviewed; see AUTO_PRONOUNCE_MAX_PER_RUN). A word already captured as a
+ * pronunciation note in that language, by any source, is skipped, so re-running is
+ * safe and the imported deck is never duplicated.
+ *
+ * Writes what scripts/anki_pronunciation's `--direct` writes: an MP3 in the public
+ * PRONUNCIATION_BUCKET (the reviewer's `<audio>` fetches with no auth header) and an
+ * `anki_notes` row with kind 'pronunciation'. Returns counts only -- the caller is a
+ * workflow on a public repo, whose logs anyone can read; the words themselves go to
+ * the person in Telegram.
+ */
+async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added: number; failed: number }>; error?: string }> {
+  const { data: users, error } = await supabase
+    .from("users")
+    .select("id, telegram_id, learning_language");
+  if (error) {
+    console.error("autoPronounceCron: fetch users failed:", error);
+    return { perUser: {}, error: error.message };
+  }
+
+  await ensurePronunciationBucket();
+  const perUser: Record<string, { added: number; failed: number }> = {};
+
+  for (const user of (users ?? []) as any[]) {
+    const lang = user.learning_language as LangCode;
+    const deck = PRONUNCIATION_DECK_BY_LANG[lang];
+    if (!deck) continue; // anki_notes.language is CHECK-constrained to uk/en
+
+    // Both reads are paged: either can pass PostgREST's 1000-row response cap (one
+    // person already has 600+ flashcards), and a silently truncated read would quietly
+    // re-add words or skip them.
+    let cards: any[];
+    let existingRows: any[];
+    try {
+      cards = await selectAllPages((from, to) => supabase
+        .from("flashcards")
+        .select("vocabulary:vocabulary_id (lemma, gloss, lemma_translation, language, occurrence_count)")
+        .eq("user_id", user.id)
+        .order("created_at", { ascending: true })
+        .range(from, to));
+      existingRows = await selectAllPages((from, to) => supabase
+        .from("anki_notes")
+        .select("lemma")
+        .eq("kind", "pronunciation")
+        .eq("language", lang)
+        .order("id", { ascending: true })
+        .range(from, to));
+    } catch (e) {
+      console.error(`autoPronounceCron: reads failed for ${user.id}:`, e);
+      perUser[user.id] = { added: 0, failed: 0 };
+      continue;
+    }
+    const existing = new Set(existingRows.map((r: any) => normalizeSpaces(r.lemma)));
+
+    const seen = new Set<string>();
+    const picks = cards
+      .map((c) => c.vocabulary)
+      .filter((v) => {
+        if (!v?.lemma || v.language !== lang) return false;
+        const word = normalizeSpaces(v.lemma);
+        if (existing.has(word) || seen.has(word)) return false;
+        if (word.split(" ").length > AUTO_PRONOUNCE_MAX_WORDS || !inLanguageScript(word, lang)) return false;
+        seen.add(word);
+        return true;
+      })
+      .sort((a, b) => (b.occurrence_count ?? 0) - (a.occurrence_count ?? 0))
+      .slice(0, AUTO_PRONOUNCE_MAX_PER_RUN);
+
+    const added: string[] = [];
+    let failed = 0;
+    for (const v of picks) {
+      const word = normalizeSpaces(v.lemma);
+      try {
+        const audioUrl = await synthesizePronunciation(word, lang);
+        const { error: insertErr } = await supabase.from("anki_notes").insert({
+          lemma: word,
+          gloss: v.gloss || null,
+          lemma_translation: v.lemma_translation || null,
+          language: lang,
+          audio_url: audioUrl,
+          deck,
+          kind: "pronunciation",
+          has_spelling: false,
+          source: "bot",
+        });
+        if (insertErr) throw new Error(insertErr.message);
+        added.push(word);
+      } catch (e) {
+        // One bad word must not cost the rest of the run.
+        console.error(`autoPronounceCron: "${word}" (${lang}) failed:`, e);
+        failed++;
+      }
+    }
+    perUser[user.id] = { added: added.length, failed };
+
+    if (added.length > 0 && user.telegram_id) {
+      await sendMessage(
+        Number(user.telegram_id),
+        `🔊 Added ${added.length} word${added.length === 1 ? "" : "s"} to your ${langFlag(lang)} ${deckLabelForPronunciation(lang)} deck: ${added.join(", ")}\n\nOpen /study to practise ${added.length === 1 ? "it" : "them"}.`,
+      );
+    }
+  }
+
+  return { perUser };
+}
+
+// The name capybara-anki actually shows: it prefixes the shared "Pronunciation" deck
+// with its language (deckOfCard in its src/review/types.ts); "English Pronunciation"
+// already carries one.
+function deckLabelForPronunciation(lang: LangCode): string {
+  const deck = PRONUNCIATION_DECK_BY_LANG[lang] ?? "Pronunciation";
+  return deck.includes(" ") ? deck : `${langLabel(lang)} ${deck}`;
+}
+
+async function selectAllPages(
+  page: (from: number, to: number) => PromiseLike<{ data: any[] | null; error: any }>,
+): Promise<any[]> {
+  const PAGE = 1000;
+  const rows: any[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await page(from, from + PAGE - 1);
+    if (error) throw new Error(error.message ?? String(error));
+    rows.push(...(data ?? []));
+    if (!data || data.length < PAGE) return rows;
+  }
+}
+
+function normalizeSpaces(text: string): string {
+  return text.split(/\s+/).filter(Boolean).join(" ");
+}
+
+// False if the word has letters from the wrong alphabet for its language -- the
+// vocabulary table is only as right as the language detection that filled it, and a
+// mis-tagged word would be read out by the wrong voice. Mirrors in_expected_script in
+// scripts/anki_pronunciation/phrases.py. Modifier letters (Ukrainian's apostrophe,
+// U+02BC) belong to no alphabet and pass.
+function inLanguageScript(word: string, lang: LangCode): boolean {
+  for (const ch of word) {
+    if (!/\p{L}/u.test(ch) || /\p{Lm}/u.test(ch)) continue;
+    if (lang === "en" && !/[a-z]/i.test(ch)) return false;
+    if (lang === "uk" && !/\p{Script=Cyrillic}/u.test(ch)) return false;
+  }
+  return true;
+}
+
+let pronunciationBucketReady = false;
+async function ensurePronunciationBucket(): Promise<void> {
+  if (pronunciationBucketReady) return;
+  const { error } = await supabase.storage.getBucket(PRONUNCIATION_BUCKET);
+  if (error) {
+    const { error: createErr } = await supabase.storage.createBucket(PRONUNCIATION_BUCKET, { public: true });
+    if (createErr && !/already exists/i.test(createErr.message)) throw createErr;
+  }
+  pronunciationBucketReady = true;
+}
+
+// TTS one word into the public bucket; returns its public URL. The object name is
+// scripts/anki_pronunciation's AudioCache.media_name for the same provider identity,
+// so either path writing the same word lands on the same file.
+async function synthesizePronunciation(word: string, lang: LangCode): Promise<string> {
+  const locale = PRONUNCIATION_LOCALES[lang] ?? lang;
+  const identity = `openai:${PRONUNCIATION_TTS_MODEL}:${PRONUNCIATION_TTS_VOICE}:${(await sha256Hex("")).slice(0, 8)}`;
+  const name = `capy_pron_${(await sha256Hex(`${identity}\u0000${locale}\u0000${word}`)).slice(0, 12)}.mp3`;
+
+  const resp = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: PRONUNCIATION_TTS_MODEL,
+      voice: PRONUNCIATION_TTS_VOICE,
+      input: word,
+      response_format: "mp3",
+    }),
+  });
+  if (!resp.ok) throw new Error(`TTS ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  const audio = new Uint8Array(await resp.arrayBuffer());
+
+  const { error } = await supabase.storage.from(PRONUNCIATION_BUCKET)
+    .upload(name, audio, { contentType: "audio/mpeg", upsert: true });
+  if (error) throw new Error(`upload: ${error.message}`);
+  return supabase.storage.from(PRONUNCIATION_BUCKET).getPublicUrl(name).data.publicUrl;
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function formatVocabSection(

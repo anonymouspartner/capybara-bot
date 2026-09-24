@@ -122,6 +122,7 @@ directly:
 | `/learn <word>`, `/learn top N` | the words just added to `flashcards` | `Ukrainian` / `English` |
 | the grammar assistant (`/capybara`) | each correction, as a fill-in-the-blank card | `Grammar` |
 | `.github/workflows/auto-learn.yml` (daily, automatic) | `/learn top N`'s own selection, run unattended for each person's own deck | `Ukrainian` / `English` |
+| the same daily run (`runAutoPronounceCron`) | up to 5 of each person's own flashcard **words** a day as pronunciation cards (TTS audio in the public `pronunciation-audio` bucket) | `Pronunciation` (uk) / `English Pronunciation` |
 | `/syncanki` (admin) | the whole existing corpus, once | all of the above |
 
 **Annotation deliberately does not create cards.** `vocabulary` is every word the
@@ -139,7 +140,11 @@ doesn't dump a huge backlog into the deck at once — it trickles in over severa
 same shape a person occasionally running `/learn top 15` themselves would produce. Each
 person's run only ever touches their own `learning_language` deck, never a partner's.
 Sends a Telegram message listing what it added, same as `/learn` does, so it's never a
-silent surprise. The route (`POST ?internal_autolearn`) reuses `WEBHOOK_SECRET` as its
+silent surprise. The pronunciation half is **words only, never example sentences**: those are lines
+from the couple's conversations, and this run puts their audio in a public bucket with
+nobody reviewing it first. Sentence cards stay a reviewed, manual
+`scripts/anki_pronunciation --direct` run (preview, `--save-plan`, `--skip`). The
+workflow logs counts only -- this repo's Actions logs are world-readable. The route (`POST ?internal_autolearn`) reuses `WEBHOOK_SECRET` as its
 bearer credential (`x-capybara-internal-secret` header, the same trust
 `internal_backfill_examples` already uses) — the workflow needs `WEBHOOK_SECRET` and
 `SUPABASE_PROJECT_REF` added as **repo** secrets (Settings → Secrets and variables →
