@@ -144,7 +144,9 @@ silent surprise. The pronunciation half is **words only, never example sentences
 from the couple's conversations, and this run puts their audio in a public bucket with
 nobody reviewing it first. Changing a voice leaves existing bot-made cards in the old
 one until `rerecord-pronunciation.yml` is run (after the deploy): it re-records them in
-place, keeping their review history, and never touches the imported deck's audio. Sentence cards stay a reviewed, manual
+place, keeping their review history. It only ever replaces audio an OpenAI preset voice
+made (recognised by file name) -- never the imported deck's audio, and never a
+`--direct` run's audio from another provider or custom settings, which it can't reproduce. Sentence cards stay a reviewed, manual
 `scripts/anki_pronunciation --direct` run (preview, `--save-plan`, `--skip`). The
 workflow logs counts only -- this repo's Actions logs are world-readable. The route (`POST ?internal_autolearn`) reuses `WEBHOOK_SECRET` as its
 bearer credential (`x-capybara-internal-secret` header, the same trust

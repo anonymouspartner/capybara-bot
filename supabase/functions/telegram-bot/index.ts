@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v109";
+const BUILD_VERSION = "v110";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -153,6 +153,13 @@ const PRONUNCIATION_DECK_BY_LANG: Partial<Record<LangCode, string>> = {
 const PRONUNCIATION_TTS_MODEL = "gpt-4o-mini-tts";
 const PRONUNCIATION_TTS_VOICE_DEFAULT = "nova";
 const PRONUNCIATION_TTS_VOICE_BY_LANG: Partial<Record<LangCode, string>> = { en: "onyx" };
+// OpenAI's preset voices (tts.py's OpenAITTS.PRESETS). Re-recording only ever replaces
+// audio one of these made with the default settings -- recognisable by file name --
+// never audio from another provider (ElevenLabs, Azure, real recordings) or with custom
+// instructions, which this code can't reproduce and would be destroying.
+const OPENAI_TTS_PRESETS = [
+  "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse",
+];
 // Re-records per call: each is one TTS request, and the caller loops, so this only
 // keeps a single call well inside the function's wall-clock limit.
 const RERECORD_BATCH = 10;
@@ -462,7 +469,8 @@ Deno.serve(async (req) => {
       return new Response("Unauthorized", { status: 401 });
     }
     let result: Awaited<ReturnType<typeof rerecordPronunciationBatch>> | { error: string };
-    try { result = await rerecordPronunciationBatch(RERECORD_BATCH); }
+    const skip = Math.max(0, Number(url.searchParams.get("skip")) || 0);
+    try { result = await rerecordPronunciationBatch(RERECORD_BATCH, skip); }
     catch (e) {
       console.error("rerecordPronunciationBatch failed:", e);
       result = { error: e instanceof Error ? e.message : String(e) };
@@ -1945,7 +1953,9 @@ async function deleteMyCommands(scope?: unknown, languageCode?: string): Promise
 // dispatches /study, whose inline button does). Without ANKI_APP_URL it falls back to
 // the "commands" mode, the "/" shortcut. Set globally (no chat scope).
 async function setChatMenuButtonToCommands(): Promise<boolean> {
-  const menuButton = ANKI_APP_URL
+  // Telegram only accepts an https web_app URL; anything else would be refused on every
+  // attempt, so fall back to the "/" button rather than asking.
+  const menuButton = /^https:\/\//i.test(ANKI_APP_URL)
     ? { type: "web_app", text: "📚 Study", web_app: { url: ANKI_APP_URL } }
     : { type: "commands" };
   const resp = await fetch(`${TELEGRAM_API}/setChatMenuButton`, {
@@ -1958,6 +1968,7 @@ async function setChatMenuButtonToCommands(): Promise<boolean> {
 }
 
 let commandsRegistered = false;
+let menuButtonAttempted = false;
 // Register the "/" menu once per warm instance (self-heals on each cold start /
 // deploy, picking up any command changes). The flag flips only after success, so a
 // transient failure retries on the next request rather than waiting for a cold start.
@@ -1996,8 +2007,14 @@ async function ensureCommandsRegistered(): Promise<void> {
       ok = cleared && ok;
     }
   }
-  const okMenuButton = await setChatMenuButtonToCommands();
-  if (ok && okMenuButton) commandsRegistered = true;
+  // The menu button is cosmetic and set once per warm instance whether or not it takes:
+  // tying it to the flag below would re-run this whole matrix -- a Telegram call per
+  // scope per language per chat -- on every update for as long as Telegram refused it.
+  if (!menuButtonAttempted) {
+    menuButtonAttempted = true;
+    await setChatMenuButtonToCommands();
+  }
+  if (ok) commandsRegistered = true;
 }
 
 // --- Branched reply-keyboard menu --------------------------------------------------
@@ -3418,6 +3435,9 @@ async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added
 
   await ensurePronunciationBucket();
   const perUser: Record<string, { added: number; failed: number }> = {};
+  // A read that fails is a failed run, not "nothing to add": reported as `error`, which
+  // auto-learn.yml fails on, so a pass that silently stops adding cards can't stay green.
+  const readErrors: string[] = [];
 
   for (const user of (users ?? []) as any[]) {
     const lang = user.learning_language as LangCode;
@@ -3446,6 +3466,7 @@ async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added
     } catch (e) {
       console.error(`autoPronounceCron: reads failed for ${user.id}:`, e);
       perUser[user.id] = { added: 0, failed: 0 };
+      readErrors.push(`reads failed for one user (${lang}): ${e instanceof Error ? e.message : String(e)}`);
       continue;
     }
     const existing = new Set(existingRows.map((r: any) => normalizeSpaces(r.lemma)));
@@ -3499,7 +3520,7 @@ async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added
     }
   }
 
-  return { perUser };
+  return readErrors.length > 0 ? { perUser, error: readErrors.join("; ") } : { perUser };
 }
 
 // The name capybara-anki actually shows: it prefixes the shared "Pronunciation" deck
@@ -3559,9 +3580,9 @@ function pronunciationVoice(lang: LangCode): string {
 // scripts/anki_pronunciation's AudioCache.media_name for the same provider identity
 // (model + voice + empty-instructions hash), so either path writing the same text in
 // the same voice lands on the same file -- and a voice change yields a new name.
-async function pronunciationAudioName(text: string, lang: LangCode): Promise<string> {
+async function pronunciationAudioName(text: string, lang: LangCode, voice = pronunciationVoice(lang)): Promise<string> {
   const locale = PRONUNCIATION_LOCALES[lang] ?? lang;
-  const identity = `openai:${PRONUNCIATION_TTS_MODEL}:${pronunciationVoice(lang)}:${(await sha256Hex("")).slice(0, 8)}`;
+  const identity = `openai:${PRONUNCIATION_TTS_MODEL}:${voice}:${(await sha256Hex("")).slice(0, 8)}`;
   return `capy_pron_${(await sha256Hex(`${identity}\u0000${locale}\u0000${normalizeSpaces(text)}`)).slice(0, 12)}.mp3`;
 }
 
@@ -3596,15 +3617,22 @@ async function synthesizePronunciation(word: string, lang: LangCode): Promise<st
  * Re-record bot-made pronunciation notes whose audio isn't in their language's
  * current voice, in place: same note (so its review history and schedule stay),
  * new audio_url. Only `source = 'bot'` -- the imported deck's audio came from the
- * original Anki collection and is never regenerated. "Current voice" is decided by
- * the object name alone (pronunciationAudioName), so notes already re-recorded, or
- * made after the change, are left alone and re-running is a no-op.
+ * original Anki collection and is never regenerated -- and of those, only audio an
+ * OpenAI preset voice made (OPENAI_TTS_PRESETS): a note whose file name matches none
+ * of them came from another provider or custom settings, and is left alone. "Current
+ * voice" is decided by the object name alone (pronunciationAudioName), so notes
+ * already re-recorded, or made after the change, are skipped and re-running is a
+ * no-op.
+ *
+ * `skip` passes over that many stale notes first: the caller counts its failures and
+ * sends them back, so a note that keeps failing is stepped past instead of taking
+ * the same slot at the front of every batch.
  *
  * The superseded file is removed once nothing references it: sentence cards' audio
  * is conversation text in a public bucket, and an orphan is exposure with no use.
  * Returns counts only (the caller's logs are public).
  */
-async function rerecordPronunciationBatch(limit: number): Promise<{ rerecorded: number; failed: number; remaining: number }> {
+async function rerecordPronunciationBatch(limit: number, skip = 0): Promise<{ rerecorded: number; failed: number; remaining: number }> {
   await ensurePronunciationBucket();
   const langs = Object.keys(PRONUNCIATION_DECK_BY_LANG) as LangCode[];
   const notes = await selectAllPages((from, to) => supabase
@@ -3621,13 +3649,19 @@ async function rerecordPronunciationBatch(limit: number): Promise<{ rerecorded: 
     if (!n.lemma) continue;
     // By file name, not whole URL: a note written by the script carries whatever base
     // URL it was run with, and only the name says which voice made the audio.
+    const current = pronunciationObjectName(n.audio_url);
+    if (!current) continue;
     const expected = await pronunciationAudioName(n.lemma, n.language);
-    if (!(n.audio_url ?? "").endsWith(`/${expected}`)) stale.push(n);
+    if (current === expected) continue;
+    const presetNames = await Promise.all(
+      OPENAI_TTS_PRESETS.map((voice) => pronunciationAudioName(n.lemma, n.language, voice)),
+    );
+    if (presetNames.includes(current)) stale.push(n);
   }
 
   let rerecorded = 0;
   let failed = 0;
-  for (const n of stale.slice(0, limit)) {
+  for (const n of stale.slice(skip, skip + limit)) {
     try {
       const url = await synthesizePronunciation(n.lemma, n.language);
       const { error } = await supabase.from("anki_notes").update({ audio_url: url }).eq("id", n.id);
@@ -3642,14 +3676,24 @@ async function rerecordPronunciationBatch(limit: number): Promise<{ rerecorded: 
   return { rerecorded, failed, remaining: stale.length - rerecorded };
 }
 
+// The capy_pron_<digest>.mp3 object a pronunciation audio_url points at, or null for
+// anything this code didn't make (the imported deck's files, other buckets).
+function pronunciationObjectName(url: string | null): string | null {
+  const match = url?.match(new RegExp(`/storage/v1/object/public/${PRONUNCIATION_BUCKET}/(capy_pron_[0-9a-f]{12}\\.mp3)$`));
+  return match ? match[1] : null;
+}
+
 async function removeOrphanedPronunciationAudio(oldUrl: string | null): Promise<void> {
-  const match = oldUrl?.match(new RegExp(`/storage/v1/object/public/${PRONUNCIATION_BUCKET}/(capy_pron_[0-9a-f]{12}\\.mp3)$`));
-  if (!match) return; // not a file this code made
-  const name = match[1];
+  const name = pronunciationObjectName(oldUrl);
+  if (!name) return; // not a file this code made
+  // Still referenced by any note, under any base URL -- the script writes whatever base
+  // it was run with, so matching the whole URL could miss a live reference and delete a
+  // file a card still plays. (LIKE's `_` also matches the name's own underscores, which
+  // can only over-count: the safe direction for a delete.)
   const { count, error } = await supabase
     .from("anki_notes")
     .select("id", { count: "exact", head: true })
-    .eq("audio_url", oldUrl);
+    .like("audio_url", `%/${name}`);
   if (error || (count ?? 0) > 0) return;
   const { error: removeErr } = await supabase.storage.from(PRONUNCIATION_BUCKET).remove([name]);
   if (removeErr) console.error(`remove old audio ${name} failed:`, removeErr);

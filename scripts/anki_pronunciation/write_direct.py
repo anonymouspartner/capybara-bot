@@ -64,16 +64,49 @@ def _ensure_bucket(base_url: str, key: str) -> None:
     raise RuntimeError(f"could not create bucket {BUCKET!r}: {status} {body.decode(errors='replace')}")
 
 
+PAGE_SIZE = 1000
+
+
+def _normalize(text: str) -> str:
+    """Whitespace-insensitive lemma key -- the same normalisation the bot's daily run
+    applies (normalizeSpaces), so a phrase written by either path is recognised by both."""
+    return " ".join(text.split())
+
+
 def _existing_lemmas(base_url: str, key: str, lang: str) -> set[str]:
-    query = urllib.parse.urlencode({
-        "select": "lemma",
-        "language": f"eq.{lang}",
-        "kind": "eq.pronunciation",
-    })
+    """Every captured pronunciation lemma in `lang`, normalised. Paged: PostgREST caps a
+    response at 1000 rows, and a silently truncated read here would re-insert notes
+    that already exist, as duplicates with their own schedules."""
+    lemmas: set[str] = set()
+    offset = 0
+    while True:
+        query = urllib.parse.urlencode({
+            "select": "lemma",
+            "language": f"eq.{lang}",
+            "kind": "eq.pronunciation",
+            "order": "id.asc",
+            "limit": str(PAGE_SIZE),
+            "offset": str(offset),
+        })
+        status, body = _request("GET", f"{base_url}/rest/v1/anki_notes?{query}", key=key)
+        if status != 200:
+            raise RuntimeError(f"reading existing pronunciation notes failed: {status} {body.decode(errors='replace')}")
+        page = json.loads(body)
+        lemmas.update(_normalize(row["lemma"]) for row in page if row.get("lemma"))
+        if len(page) < PAGE_SIZE:
+            return lemmas
+        offset += PAGE_SIZE
+
+
+def _remove_if_unreferenced(base_url: str, key: str, name: str) -> None:
+    """Delete an uploaded object no note points at. Audio here is conversation text in
+    a public bucket, so a file whose note never landed is exposure with no use -- but a
+    content-addressed name can be shared, so check before deleting."""
+    query = urllib.parse.urlencode({"select": "id", "audio_url": f"like.*/{name}", "limit": "1"})
     status, body = _request("GET", f"{base_url}/rest/v1/anki_notes?{query}", key=key)
-    if status != 200:
-        raise RuntimeError(f"reading existing pronunciation notes failed: {status} {body.decode(errors='replace')}")
-    return {row["lemma"] for row in json.loads(body)}
+    if status != 200 or json.loads(body):
+        return
+    _request("DELETE", f"{base_url}/storage/v1/object/{BUCKET}/{name}", key=key)
 
 
 def write_direct(
@@ -97,13 +130,13 @@ def write_direct(
     _ensure_bucket(base_url, service_key)
     existing = _existing_lemmas(base_url, service_key, phrase_set.lang)
 
-    rows: list[dict] = []
+    written = 0
     skipped = 0
     failures: list[tuple[str, str]] = []
     total = len(phrase_set)
 
     for index, phrase in enumerate(phrase_set.phrases, start=1):
-        if phrase.text in existing:
+        if _normalize(phrase.text) in existing:
             skipped += 1
             if on_progress:
                 on_progress(index, total, phrase.text, "exists")
@@ -123,7 +156,10 @@ def write_direct(
                 on_progress(index, total, phrase.text, "FAILED")
             continue
 
-        rows.append({
+        # One insert per phrase, straight after its upload: a failure then costs only
+        # that phrase, and its just-uploaded audio is taken back down instead of being
+        # left public with no note pointing at it.
+        row = {
             "lemma": phrase.text,
             "gloss": phrase.hint or None,
             "lemma_translation": phrase.translation or None,
@@ -133,22 +169,26 @@ def write_direct(
             "kind": "pronunciation",
             "has_spelling": False,
             "source": "bot",
-        })
-        if on_progress:
-            on_progress(index, total, phrase.text, "ok")
-
-    if rows:
+        }
         status, body = _request(
             "POST", f"{base_url}/rest/v1/anki_notes", key=service_key,
-            body=json.dumps(rows).encode(), headers={"prefer": "return=minimal"},
+            body=json.dumps(row).encode(), headers={"prefer": "return=minimal"},
         )
         if status not in (200, 201):
-            raise RuntimeError(f"inserting notes failed: {status} {body.decode(errors='replace')}")
+            _remove_if_unreferenced(base_url, service_key, audio_path.name)
+            failures.append((phrase.text, f"insert failed: {status} {body.decode(errors='replace')[:200]}"))
+            if on_progress:
+                on_progress(index, total, phrase.text, "FAILED")
+            continue
+        written += 1
+        existing.add(_normalize(phrase.text))
+        if on_progress:
+            on_progress(index, total, phrase.text, "ok")
 
     return {
         "deck_name": deck,
         "locale": phrase_set.locale,
-        "written": len(rows),
+        "written": written,
         "skipped_existing": skipped,
         "cache_hits": cache.hits,
         "cache_misses": cache.misses,
