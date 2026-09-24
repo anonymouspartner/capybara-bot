@@ -120,7 +120,7 @@ needs no Azure account for either language — it transcribes with Whisper.
 | `--save-plan FILE` | write the final phrase list to FILE, reloadable with `--phrases` |
 | `--out FILE` | output path (default `dist/capybara-pronunciation-<lang>-<date>.apkg`) |
 | `--provider` | override `CAPYBARA_TTS_PROVIDER` for one run |
-| `--voice` | override `CAPYBARA_TTS_VOICE` for one run |
+| `--voice` | override `CAPYBARA_TTS_VOICE` for one run (OpenAI default: `onyx` for English, `nova` otherwise -- the same voices the bot's daily cards use) |
 | `--dry-run` | silent placeholder audio; makes **no API calls** |
 | `--send-to ID` | upload the finished deck to a Telegram chat |
 | `--direct` | write into capybara-anki's `anki_notes` + Storage instead of an `.apkg` |

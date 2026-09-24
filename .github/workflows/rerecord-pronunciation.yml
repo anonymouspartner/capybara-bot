@@ -1,0 +1,79 @@
+name: rerecord-pronunciation
+
+# Re-records bot-made pronunciation cards whose audio isn't in their language's
+# current voice (PRONUNCIATION_TTS_VOICE_BY_LANG in index.ts) -- run it once after
+# changing a voice and deploying. Cards are updated in place, so study progress on
+# them is kept; the imported deck's original audio is never touched. Re-running when
+# nothing is stale is a no-op.
+#
+# Calls POST ?internal_rerecord_pronunciation, which does a small batch per call,
+# until nothing is left. Same secrets and trust as auto-learn.yml (WEBHOOK_SECRET,
+# SUPABASE_PROJECT_REF). This repo is public and so are its run logs: the route
+# returns counts only, and that is all this prints.
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: rerecord-pronunciation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-record stale pronunciation audio
+        env:
+          REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${REF:-}" ] || [ -z "${SECRET:-}" ]; then
+            echo "FAIL: SUPABASE_PROJECT_REF and/or WEBHOOK_SECRET is not set on this repo."
+            exit 1
+          fi
+
+          total=0
+          failed=0
+          # Each batch is a handful of TTS calls; 40 batches is far more than any
+          # voice change needs, and bounds the job if something keeps failing.
+          for i in $(seq 1 40); do
+            if ! body=$(curl -fsS --max-time 150 -X POST \
+                -H "x-capybara-internal-secret: ${SECRET}" \
+                "https://${REF}.supabase.co/functions/v1/telegram-bot?internal_rerecord_pronunciation"); then
+              echo "FAIL: the re-record route did not return success."
+              exit 1
+            fi
+
+            if echo "$body" | jq -e 'has("error")' > /dev/null; then
+              echo "FAIL: the route reported an error: $(echo "$body" | jq -r '.error')"
+              exit 1
+            fi
+
+            done_now=$(echo "$body" | jq '.rerecorded')
+            failed_now=$(echo "$body" | jq '.failed')
+            remaining=$(echo "$body" | jq '.remaining')
+            total=$((total + done_now))
+            failed=$((failed + failed_now))
+            echo "batch $i: re-recorded $done_now, failed $failed_now, remaining $remaining"
+
+            if [ "$remaining" -eq 0 ]; then break; fi
+            if [ "$done_now" -eq 0 ]; then
+              echo "FAIL: $remaining card(s) left and none could be re-recorded -- see the function's logs in Supabase."
+              exit 1
+            fi
+          done
+
+          echo "re-recorded $total card(s) in total"
+          if [ "$failed" -gt 0 ]; then
+            echo "FAIL: $failed attempt(s) failed along the way -- see the function's logs in Supabase."
+            exit 1
+          fi
+          if [ "$remaining" -gt 0 ]; then
+            echo "FAIL: stopped with $remaining card(s) still stale."
+            exit 1
+          fi
