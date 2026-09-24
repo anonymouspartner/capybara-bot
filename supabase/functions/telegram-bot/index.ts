@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v107";
+const BUILD_VERSION = "v108";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -144,11 +144,18 @@ const PRONUNCIATION_DECK_BY_LANG: Partial<Record<LangCode, string>> = {
   uk: "Pronunciation",
   en: "English Pronunciation",
 };
-// Same model, preset voice and file naming as scripts/anki_pronunciation's OpenAI
-// provider (tts.py), so a word synthesized by either path is the same object in the
-// bucket rather than two copies of it.
+// Same model, preset voices and file naming as scripts/anki_pronunciation's OpenAI
+// provider (tts.py, and DEFAULT_OPENAI_VOICE_BY_LANG in its __main__.py), so a word
+// synthesized by either path is the same object in the bucket rather than two copies.
+// Voice is per language. Changing one makes existing cards stale rather than wrong:
+// ?internal_rerecord_pronunciation (.github/workflows/rerecord-pronunciation.yml)
+// re-records them in place.
 const PRONUNCIATION_TTS_MODEL = "gpt-4o-mini-tts";
-const PRONUNCIATION_TTS_VOICE = "nova";
+const PRONUNCIATION_TTS_VOICE_DEFAULT = "nova";
+const PRONUNCIATION_TTS_VOICE_BY_LANG: Partial<Record<LangCode, string>> = { en: "onyx" };
+// Re-records per call: each is one TTS request, and the caller loops, so this only
+// keeps a single call well inside the function's wall-clock limit.
+const RERECORD_BATCH = 10;
 // This instance's own Supabase project ref, parsed from the injected SUPABASE_URL
 // (https://<ref>.supabase.co). Passed to the deploy workflow so a one-tap /update
 // deploys to THIS couple's project — not whatever single project the repo's default
@@ -447,6 +454,22 @@ Deno.serve(async (req) => {
   // the secret rather than minting a new one, same reasoning as that block. Runs
   // synchronously and returns a real summary rather than backgrounding + an empty ack,
   // since the caller is a scheduled job that wants to see what happened.
+  // Re-record bot-made pronunciation audio after a voice change
+  // (.github/workflows/rerecord-pronunciation.yml, which calls this until nothing is
+  // left). Same trust as internal_autolearn below.
+  if (req.method === "POST" && url.searchParams.has("internal_rerecord_pronunciation")) {
+    if (req.headers.get(INTERNAL_CHAIN_HEADER) !== WEBHOOK_SECRET) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    let result: Awaited<ReturnType<typeof rerecordPronunciationBatch>> | { error: string };
+    try { result = await rerecordPronunciationBatch(RERECORD_BATCH); }
+    catch (e) {
+      console.error("rerecordPronunciationBatch failed:", e);
+      result = { error: e instanceof Error ? e.message : String(e) };
+    }
+    return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
+  }
+
   if (req.method === "POST" && url.searchParams.has("internal_autolearn")) {
     if (req.headers.get(INTERNAL_CHAIN_HEADER) !== WEBHOOK_SECRET) {
       return new Response("Unauthorized", { status: 401 });
@@ -3513,21 +3536,34 @@ async function ensurePronunciationBucket(): Promise<void> {
   pronunciationBucketReady = true;
 }
 
-// TTS one word into the public bucket; returns its public URL. The object name is
-// scripts/anki_pronunciation's AudioCache.media_name for the same provider identity,
-// so either path writing the same word lands on the same file.
-async function synthesizePronunciation(word: string, lang: LangCode): Promise<string> {
+function pronunciationVoice(lang: LangCode): string {
+  return PRONUNCIATION_TTS_VOICE_BY_LANG[lang] ?? PRONUNCIATION_TTS_VOICE_DEFAULT;
+}
+
+// scripts/anki_pronunciation's AudioCache.media_name for the same provider identity
+// (model + voice + empty-instructions hash), so either path writing the same text in
+// the same voice lands on the same file -- and a voice change yields a new name.
+async function pronunciationAudioName(text: string, lang: LangCode): Promise<string> {
   const locale = PRONUNCIATION_LOCALES[lang] ?? lang;
-  const identity = `openai:${PRONUNCIATION_TTS_MODEL}:${PRONUNCIATION_TTS_VOICE}:${(await sha256Hex("")).slice(0, 8)}`;
-  const name = `capy_pron_${(await sha256Hex(`${identity}\u0000${locale}\u0000${word}`)).slice(0, 12)}.mp3`;
+  const identity = `openai:${PRONUNCIATION_TTS_MODEL}:${pronunciationVoice(lang)}:${(await sha256Hex("")).slice(0, 8)}`;
+  return `capy_pron_${(await sha256Hex(`${identity}\u0000${locale}\u0000${normalizeSpaces(text)}`)).slice(0, 12)}.mp3`;
+}
+
+function pronunciationPublicUrl(name: string): string {
+  return supabase.storage.from(PRONUNCIATION_BUCKET).getPublicUrl(name).data.publicUrl;
+}
+
+// TTS one word into the public bucket in its language's voice; returns its public URL.
+async function synthesizePronunciation(word: string, lang: LangCode): Promise<string> {
+  const name = await pronunciationAudioName(word, lang);
 
   const resp = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: { "Authorization": `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: PRONUNCIATION_TTS_MODEL,
-      voice: PRONUNCIATION_TTS_VOICE,
-      input: word,
+      voice: pronunciationVoice(lang),
+      input: normalizeSpaces(word),
       response_format: "mp3",
     }),
   });
@@ -3537,7 +3573,70 @@ async function synthesizePronunciation(word: string, lang: LangCode): Promise<st
   const { error } = await supabase.storage.from(PRONUNCIATION_BUCKET)
     .upload(name, audio, { contentType: "audio/mpeg", upsert: true });
   if (error) throw new Error(`upload: ${error.message}`);
-  return supabase.storage.from(PRONUNCIATION_BUCKET).getPublicUrl(name).data.publicUrl;
+  return pronunciationPublicUrl(name);
+}
+
+/**
+ * Re-record bot-made pronunciation notes whose audio isn't in their language's
+ * current voice, in place: same note (so its review history and schedule stay),
+ * new audio_url. Only `source = 'bot'` -- the imported deck's audio came from the
+ * original Anki collection and is never regenerated. "Current voice" is decided by
+ * the object name alone (pronunciationAudioName), so notes already re-recorded, or
+ * made after the change, are left alone and re-running is a no-op.
+ *
+ * The superseded file is removed once nothing references it: sentence cards' audio
+ * is conversation text in a public bucket, and an orphan is exposure with no use.
+ * Returns counts only (the caller's logs are public).
+ */
+async function rerecordPronunciationBatch(limit: number): Promise<{ rerecorded: number; failed: number; remaining: number }> {
+  await ensurePronunciationBucket();
+  const langs = Object.keys(PRONUNCIATION_DECK_BY_LANG) as LangCode[];
+  const notes = await selectAllPages((from, to) => supabase
+    .from("anki_notes")
+    .select("id, lemma, language, audio_url")
+    .eq("kind", "pronunciation")
+    .eq("source", "bot")
+    .in("language", langs)
+    .order("id", { ascending: true })
+    .range(from, to));
+
+  const stale: any[] = [];
+  for (const n of notes) {
+    if (!n.lemma) continue;
+    // By file name, not whole URL: a note written by the script carries whatever base
+    // URL it was run with, and only the name says which voice made the audio.
+    const expected = await pronunciationAudioName(n.lemma, n.language);
+    if (!(n.audio_url ?? "").endsWith(`/${expected}`)) stale.push(n);
+  }
+
+  let rerecorded = 0;
+  let failed = 0;
+  for (const n of stale.slice(0, limit)) {
+    try {
+      const url = await synthesizePronunciation(n.lemma, n.language);
+      const { error } = await supabase.from("anki_notes").update({ audio_url: url }).eq("id", n.id);
+      if (error) throw new Error(error.message);
+      rerecorded++;
+      await removeOrphanedPronunciationAudio(n.audio_url);
+    } catch (e) {
+      console.error(`rerecord ${n.id} (${n.language}) failed:`, e);
+      failed++;
+    }
+  }
+  return { rerecorded, failed, remaining: stale.length - rerecorded };
+}
+
+async function removeOrphanedPronunciationAudio(oldUrl: string | null): Promise<void> {
+  const match = oldUrl?.match(new RegExp(`/storage/v1/object/public/${PRONUNCIATION_BUCKET}/(capy_pron_[0-9a-f]{12}\\.mp3)$`));
+  if (!match) return; // not a file this code made
+  const name = match[1];
+  const { count, error } = await supabase
+    .from("anki_notes")
+    .select("id", { count: "exact", head: true })
+    .eq("audio_url", oldUrl);
+  if (error || (count ?? 0) > 0) return;
+  const { error: removeErr } = await supabase.storage.from(PRONUNCIATION_BUCKET).remove([name]);
+  if (removeErr) console.error(`remove old audio ${name} failed:`, removeErr);
 }
 
 async function sha256Hex(text: string): Promise<string> {

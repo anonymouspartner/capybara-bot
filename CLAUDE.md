@@ -30,7 +30,7 @@ couple (not multi-tenant).
 | `storage_setup.sql` | Creates the private `voice-messages` Storage bucket. |
 | `PROVISION_NEW_COUPLE.md` | The setup runbook — start here for a new instance. |
 | `.env.example` | Template for the five function secrets (copy to `.env`). |
-| `.github/workflows/` | CI gate (`check.yml`) + **primary deploy path** (`deploy.yml`, manual `workflow_dispatch`) + `webhook-watch.yml` (scheduled outside-in check that this bot still owns its Telegram webhook) + `auto-learn.yml` (scheduled daily "add frequently used words," see "How cards reach the study app" below); `.devcontainer/` for Codespaces. |
+| `.github/workflows/` | CI gate (`check.yml`) + **primary deploy path** (`deploy.yml`, manual `workflow_dispatch`) + `webhook-watch.yml` (scheduled outside-in check that this bot still owns its Telegram webhook) + `auto-learn.yml` (scheduled daily "add frequently used words," see "How cards reach the study app" below) + `rerecord-pronunciation.yml` (manual, after a pronunciation voice change); `.devcontainer/` for Codespaces. |
 | `deploy.ps1` / `predeploy-check.ps1` | Fallback deploy spine for offline/local deploys (Windows PowerShell). |
 | `deploy.sh` / `predeploy-check.sh` / `provision.sh` | Same fallback spine, ported to bash, + provisioning glue. |
 | `docs/` | Background & design history (deploy-safety + reproducibility handoffs). |
@@ -122,7 +122,7 @@ directly:
 | `/learn <word>`, `/learn top N` | the words just added to `flashcards` | `Ukrainian` / `English` |
 | the grammar assistant (`/capybara`) | each correction, as a fill-in-the-blank card | `Grammar` |
 | `.github/workflows/auto-learn.yml` (daily, automatic) | `/learn top N`'s own selection, run unattended for each person's own deck | `Ukrainian` / `English` |
-| the same daily run (`runAutoPronounceCron`) | up to 5 of each person's own flashcard **words** a day as pronunciation cards (TTS audio in the public `pronunciation-audio` bucket) | `Pronunciation` (uk) / `English Pronunciation` |
+| the same daily run (`runAutoPronounceCron`) | up to 5 of each person's own flashcard **words** a day as pronunciation cards (TTS audio in the public `pronunciation-audio` bucket; voice per language, `PRONUNCIATION_TTS_VOICE_BY_LANG` -- English `onyx`, else `nova`) | `Pronunciation` (uk) / `English Pronunciation` |
 | `/syncanki` (admin) | the whole existing corpus, once | all of the above |
 
 **Annotation deliberately does not create cards.** `vocabulary` is every word the
@@ -142,7 +142,9 @@ person's run only ever touches their own `learning_language` deck, never a partn
 Sends a Telegram message listing what it added, same as `/learn` does, so it's never a
 silent surprise. The pronunciation half is **words only, never example sentences**: those are lines
 from the couple's conversations, and this run puts their audio in a public bucket with
-nobody reviewing it first. Sentence cards stay a reviewed, manual
+nobody reviewing it first. Changing a voice leaves existing bot-made cards in the old
+one until `rerecord-pronunciation.yml` is run (after the deploy): it re-records them in
+place, keeping their review history, and never touches the imported deck's audio. Sentence cards stay a reviewed, manual
 `scripts/anki_pronunciation --direct` run (preview, `--save-plan`, `--skip`). The
 workflow logs counts only -- this repo's Actions logs are world-readable. The route (`POST ?internal_autolearn`) reuses `WEBHOOK_SECRET` as its
 bearer credential (`x-capybara-internal-secret` header, the same trust

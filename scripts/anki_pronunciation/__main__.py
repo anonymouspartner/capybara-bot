@@ -36,6 +36,12 @@ from .phrases import (DEFAULT_MAX_WORDS, ENGLISH_NAME, PhraseSet, load_json,
 from .tts import AudioCache, TTSError, build_provider
 from .write_direct import write_direct
 
+# OpenAI voice per language when neither --voice nor CAPYBARA_TTS_VOICE picks one
+# (anything else falls back to tts.py's "nova"). Must match
+# PRONUNCIATION_TTS_VOICE_BY_LANG in the bot's index.ts, which makes the daily cards:
+# the two paths share file names, so the same text in the same voice is one file.
+DEFAULT_OPENAI_VOICE_BY_LANG = {"en": "onyx"}
+
 DEFAULT_CACHE = Path(__file__).resolve().parent / ".cache"
 DEFAULT_OUTDIR = Path(__file__).resolve().parent / "dist"
 
@@ -170,6 +176,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # --- provider -----------------------------------------------------------
+    provider_name = (args.provider or os.environ.get("CAPYBARA_TTS_PROVIDER") or "").lower()
+    if (provider_name == "openai" and not os.environ.get("CAPYBARA_TTS_VOICE")
+            and phrase_set.lang in DEFAULT_OPENAI_VOICE_BY_LANG):
+        os.environ["CAPYBARA_TTS_VOICE"] = DEFAULT_OPENAI_VOICE_BY_LANG[phrase_set.lang]
+
     try:
         provider = build_provider(args.provider, dry_run=args.dry_run)
     except TTSError as e:
