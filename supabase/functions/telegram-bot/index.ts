@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v110";
+const BUILD_VERSION = "v111";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1945,23 +1945,17 @@ async function deleteMyCommands(scope?: unknown, languageCode?: string): Promise
   return true;
 }
 
-// The compose-box menu button. With the study app configured it opens the app directly
-// -- one tap from any chat to the flashcards, which is what that button is best placed
-// for now that the "/" list is empty anyway. A menu-button launch carries signed
-// initData, which capybara-anki's Telegram auth needs (a reply-KEYBOARD web_app button
-// would not: Telegram sends no initData for those, so the Study button in MENUS below
-// dispatches /study, whose inline button does). Without ANKI_APP_URL it falls back to
-// the "commands" mode, the "/" shortcut. Set globally (no chat scope).
+// The compose-box menu button, pinned to "commands" -- the "/" shortcut, which the empty
+// list above leaves with nothing to show. It is deliberately NOT a web_app "Study"
+// button: v107-v110 made it one, and with the reply keyboard's Study button and /study's
+// inline button that put the flashcards behind three entry points at once. /study (whose
+// inline web_app button carries the signed initData capybara-anki's auth needs) is the
+// one way in. Set globally (no chat scope), which also overwrites the old web_app button.
 async function setChatMenuButtonToCommands(): Promise<boolean> {
-  // Telegram only accepts an https web_app URL; anything else would be refused on every
-  // attempt, so fall back to the "/" button rather than asking.
-  const menuButton = /^https:\/\//i.test(ANKI_APP_URL)
-    ? { type: "web_app", text: "📚 Study", web_app: { url: ANKI_APP_URL } }
-    : { type: "commands" };
   const resp = await fetch(`${TELEGRAM_API}/setChatMenuButton`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ menu_button: menuButton }),
+    body: JSON.stringify({ menu_button: { type: "commands" } }),
   });
   if (!resp.ok) { console.error("setChatMenuButton failed:", resp.status, await resp.text().catch(() => "<no body>")); return false; }
   return true;
