@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v111";
+const BUILD_VERSION = "v112";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -2691,10 +2691,14 @@ const ANKI_GRAMMAR_DECK = "Grammar";
  * supply one -- so `ignoreDuplicates` against this index doesn't just skip a
  * repeat, it fails the whole call with "no unique or exclusion constraint
  * matching the ON CONFLICT specification", silently swallowed by the catch below
- * the same way any other write failure is. The select-then-insert here checks the
- * same condition the index enforces (excluding `anki-import` rows, which a bot
- * capture is always allowed to coexist beside) without needing a matching
+ * the same way any other write failure is. The select-then-insert here needs no
  * conflict target at all.
+ *
+ * The check covers imported rows too. The index exempts them so two *imported*
+ * notes can share a key; that was never a reason for the bot to add a third. An
+ * earlier version skipped `anki-import` rows here, and every /learn of a word the
+ * AnkiDroid deck already had put the same card in the deck twice (зв'язатися,
+ * під'їзд, ... -- capybara-anki's docs/MIGRATION.md §6.17).
  */
 async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number> {
   const rows = cards
@@ -2723,7 +2727,6 @@ async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number
     const { data: existing, error: selectError } = await supabase
       .from("anki_notes")
       .select("lemma, part_of_speech, language")
-      .neq("source", "anki-import")
       .in("lemma", lemmas.slice(i, i + 100));
     if (selectError) {
       console.error("writeAnkiNotes pre-check failed:", selectError);
