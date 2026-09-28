@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v112";
+const BUILD_VERSION = "v113";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -2768,6 +2768,25 @@ function vocabCardFields(v: any): CardFields {
   };
 }
 
+/** Cards for vocabulary rows that may be partial. `vocab_top_unlearned` -- the
+ * selection behind `/learn top` and the daily auto-learn -- returns only id, lemma,
+ * part of speech, gloss and count, so building cards straight from its rows wrote
+ * every one of them with no translation and no example (184 cards between
+ * 2026-09-22 and 09-27). This re-reads the columns the card builder needs by id.
+ * A row it can't re-read keeps what it had rather than being dropped. */
+async function writeVocabCards(rows: any[], deck: string): Promise<number> {
+  const ids = rows.map((v) => v.id).filter(Boolean);
+  const full = new Map<string, any>();
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data, error } = await supabase.from("vocabulary")
+      .select("id, lemma, part_of_speech, gloss, lemma_translation, example, example_translation, language")
+      .in("id", ids.slice(i, i + 100));
+    if (error) { console.error("writeVocabCards: vocabulary re-read failed:", error); continue; }
+    for (const v of data ?? []) full.set(v.id, v);
+  }
+  return writeAnkiNotes(rows.map((v) => vocabCardFields({ ...v, ...(full.get(v.id) ?? {}) })), deck);
+}
+
 function csvEscape(value: string | null | undefined): string {
   const s = value ?? "";
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
@@ -3382,7 +3401,7 @@ async function runAutoLearnCron(): Promise<{ perUser: Record<string, { added: nu
 
     scheduleBackgroundWork(
       `writeAnkiNotes(autolearn ${user.learning_language})`,
-      writeAnkiNotes(added.map(vocabCardFields), langLabel(user.learning_language)),
+      writeVocabCards(added, langLabel(user.learning_language)),
     );
 
     if (user.telegram_id) {
@@ -3864,7 +3883,7 @@ async function handleLearnTop(msg: any, user: any, arg: string) {
   }
   scheduleBackgroundWork(
     `writeAnkiNotes(learn top ${targetLang})`,
-    writeAnkiNotes(unlearned.map(vocabCardFields), langLabel(targetLang)),
+    writeVocabCards(unlearned, langLabel(targetLang)),
   );
   const lines = unlearned.map((v: any, i: number) => {
     const pos = v.part_of_speech ? ` _(${mdEscapeItalicSlot(v.part_of_speech)})_` : "";
