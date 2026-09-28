@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v113";
+const BUILD_VERSION = "v114";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -2713,7 +2713,9 @@ async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number
       example_translation: c.exampleTranslation || null,
       deck,
       kind: "vocab",
-      has_spelling: false,
+      // Every word gets a spelling card as well as a recall one. A grammar card is a
+      // fill-in-the-blank already, so a second, spelling card of it means nothing.
+      has_spelling: deck !== ANKI_GRAMMAR_DECK,
       source: "bot",
     }));
   if (rows.length === 0) return 0;
@@ -2737,7 +2739,15 @@ async function writeAnkiNotes(cards: CardFields[], deck: string): Promise<number
     }
   }
 
-  const newRows = rows.filter((r) => !captured.has(JSON.stringify([r.lemma, r.part_of_speech, r.language])));
+  // Also one row per key within this batch: two corrections can build the same card
+  // (the same sentence corrected twice), and the check above only sees what's
+  // already stored.
+  const newRows = rows.filter((r) => {
+    const key = JSON.stringify([r.lemma, r.part_of_speech, r.language]);
+    if (captured.has(key)) return false;
+    captured.add(key);
+    return true;
+  });
   if (newRows.length === 0) return 0;
 
   const { error } = await supabase.from("anki_notes").insert(newRows);
@@ -2853,10 +2863,13 @@ async function syncAnkiRun(chatId: number, user: any) {
     }
   }
 
+  // Both people's corrections, not just the runner's. This used to read only
+  // `user.id`'s, so the one run (by the admin) sent his corrections and none of the
+  // partner's: 23 of her 24 never became cards. Each card carries its correction's
+  // language, which is what puts it in the right person's Grammar deck.
   const { data: corrections, error: corrError } = await supabase
     .from("grammar_corrections")
-    .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language")
-    .eq("user_id", user.id);
+    .select("original_text, corrected_text, explanation, error_focus, correction_focus, correction_lemma, correction_gloss, category, language");
   if (corrError) console.error("syncanki: grammar_corrections read failed:", corrError);
 
   const grammarFields: CardFields[] = [];
