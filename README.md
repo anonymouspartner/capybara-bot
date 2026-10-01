@@ -17,6 +17,10 @@ study material (vocabulary, flashcards) and as a searchable memory. It also rela
 videos, files, stickers, GIFs, audio, locations, and contacts (and whole photo albums) to
 the other person, translating any caption along the way.
 
+The words you choose to learn, your grammar mistakes, and a few pronunciation drills a day
+become **flashcards** in a companion study app
+([capybara-anki](#flashcards--the-study-app)), which opens inside Telegram with `/study`.
+
 > **Status:** in daily use. Self-hosted, one instance per pair, deployed by hand
 > behind a deliberately strict deploy gate.
 
@@ -27,6 +31,7 @@ the other person, translating any caption along the way.
 - [What it does](#what-it-does)
 - [How it works](#how-it-works)
 - [The `/recap` memory pipeline](#the-recap-memory-pipeline)
+- [Flashcards & the study app](#flashcards--the-study-app)
 - [The model: one instance per pair](#the-model-one-instance-per-pair)
 - [Data model](#data-model)
 - [Repository map](#repository-map)
@@ -82,9 +87,18 @@ them in a single turn.
 - **Two decks of equal weight** — one per language of your pair (e.g. 🇺🇦 Ukrainian and
   🇬🇧 English) — built from the words that actually came up in *your* conversations. Each
   word's gloss is given in the learner's own language.
-- `/vocab` surfaces the top still-unlearned words; `/learn` / `/forget` curate a deck;
-  `/export` produces a ready-to-import **Anki CSV** with both sub-decks and example
-  sentences drawn from real messages.
+- `/vocab` surfaces the top still-unlearned words; `/learn` / `/forget` curate a deck.
+  A word you `/learn` goes **straight into the study app** as a card, with its example
+  sentence from a real message, its translation, and a spelling card. `/study` opens the
+  app.
+- **Frequent words are added for you.** Once a day, each person's most-used words that
+  aren't in their deck yet are added automatically. A word has to have come up at least 10
+  times, and at most 15 go in per day. You get a Telegram message listing what was added.
+- **Daily pronunciation cards.** The same daily run turns up to 5 of each person's own
+  flashcard words into listen-and-repeat cards with generated audio. It only ever uses
+  single words, never sentences from your conversations.
+- `/export` still produces a ready-to-import **Anki CSV** with both sub-decks and example
+  sentences. It's now the backup, not the main way cards reach the app.
 - **On-demand grammar coaching (`/capybara`).** An opt-in, per-person switch: when it's
   on and you write in the language you're *learning*, the bot checks the message and, if
   something's off, replies **privately to you** with the corrected sentence and a one- or
@@ -92,8 +106,9 @@ them in a single turn.
   The note is never forwarded to the other person, and your message still translates and
   relays exactly as normal. Each person toggles their own (`/capybara`, `/capybara on|off`);
   it's off by default. Text messages for now.
-- **Your mistakes become flashcards.** Every correction is stored and exported by
-  `/export` as a third **`Capybara::Grammar`** deck. Where the mistake was a single word,
+- **Your mistakes become flashcards.** Every correction is stored and written straight
+  into the study app's **Grammar** deck (and is also in `/export`'s third
+  **`Capybara::Grammar`** deck). Where the mistake was a single word,
   the card is **fill-in-the-blank**: the front is the *corrected* sentence with that word
   removed, so you recall the right form rather than re-reading your own error, and the
   wrong form appears on the back as contrast. The blank is captioned with the word's
@@ -127,10 +142,13 @@ them in a single turn.
 ```
 Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supabase)
                                                             +  Anthropic  (translation, annotation, /recap; Claude Sonnet & Haiku)
-                                                            +  OpenAI     (Whisper voice transcription + embeddings)
+                                                            +  OpenAI     (Whisper voice transcription, embeddings, pronunciation audio)
+
+capybara-anki (study app, Telegram Mini App)  ⇄  the same Postgres (reads the cards the bot writes)
+GitHub Actions (scheduled)  →  the function's internal routes (daily auto-learn, webhook repair)
 ```
 
-- **One canonical file.** The entire bot is a single ~3,500-line
+- **One canonical file.** The entire bot is a single ~6,200-line
   `supabase/functions/telegram-bot/index.ts`. It is **instance-agnostic** — nothing about
   a specific pair is in the code; identity lives in secrets and seed data. **Never
   fork it.**
@@ -144,8 +162,12 @@ Telegram  ⇄  Supabase Edge Function (Deno, one index.ts)  ⇄  Postgres (Supab
 - **Background work.** Annotation and embedding run after the reply is sent, via
   `EdgeRuntime.waitUntil` when available, so the user isn't kept waiting on study-corpus
   bookkeeping.
-- **Admin gating.** Maintenance commands (`/diag`, `/backfill*`, `/recap_backfill`) are
-  restricted to the `ADMIN_TELEGRAM_ID` user, read once at boot.
+- **Admin gating.** Maintenance commands (`/diag`, `/backfill*`, `/recap_backfill`,
+  `/syncanki`, `/bug`) are restricted to the `ADMIN_TELEGRAM_ID` user, read once at boot.
+- **Internal routes.** A few `POST` routes (`?internal_autolearn`, `?repair_webhook`,
+  `?internal_rerecord_pronunciation`) are called by GitHub Actions workflows rather than
+  Telegram. They're authenticated by `WEBHOOK_SECRET` in an `x-capybara-internal-secret`
+  header.
 
 ## The `/recap` memory pipeline
 
@@ -195,6 +217,54 @@ Dates render in **UTC**, as every `/recap` date always has. A message sent late 
 evening from a zone behind UTC is stamped on the following UTC day, so a date answer about
 it can read a day late; the message itself is in the chat with its local time on it.
 
+## Flashcards & the study app
+
+Cards are studied in **capybara-anki**, a separate app (a static site, deployed on its own)
+that opens as a Telegram **Mini App**. `/study` sends an *Open flashcards* button; the
+main menu's 📚 **Study** button does the same. The app signs you in from the data Telegram
+passes it on launch, which it checks against this bot's token. It's an HMAC check only,
+so it doesn't make the app a second consumer of the token. Without the `ANKI_APP_URL`
+secret, `/study` just says it isn't set up.
+
+The bot writes cards into the app's `anki_notes` table **at the moment someone chooses
+them**. There's no CSV step in between:
+
+| Source | Writes | Deck |
+|---|---|---|
+| `/learn <word>`, `/learn top N` | the words just added, with example, translation and a spelling card | `Ukrainian` / `English` |
+| the grammar coach (`/capybara`) | each correction, as a fill-in-the-blank card | `Grammar` |
+| the daily **auto-learn** run | the same selection as `/learn top N`, for each person's own deck | `Ukrainian` / `English` |
+| the same daily run | up to 5 of each person's flashcard **words** as pronunciation cards | `Pronunciation` (uk) / `English Pronunciation` |
+| `/syncanki` (admin) | the whole existing corpus, once, including both people's corrections | all of the above |
+
+- **Annotation doesn't create cards.** `vocabulary` holds every word the annotator has
+  ever seen; your deck is only the words someone actually chose. Making cards from the
+  first would bury the real deck in thousands of words nobody asked for.
+- **No duplicates.** Before inserting, the bot checks for an existing card with the same
+  lemma, part of speech and language, including cards imported from an older AnkiDroid
+  deck. So re-running `/syncanki` matches existing cards instead of adding them again.
+- **Auto-learn is guarded.** `.github/workflows/auto-learn.yml` runs once a day. A word has
+  to have come up at least 10 times (`AUTO_LEARN_THRESHOLD`), and at most 15 land per day
+  (`AUTO_LEARN_MAX_PER_RUN`), so a long history trickles in over days instead of all at
+  once. Each person's run only touches their own learning-language deck, and it always
+  messages them with what it added.
+- **Pronunciation is words only.** The audio is generated with OpenAI text-to-speech
+  (English voice `onyx`, others `nova`) and stored in the **public** `pronunciation-audio`
+  bucket. Sentences from your conversations are never used, because nobody reviews this
+  audio before it goes public.
+- **Changing a voice.** Existing cards keep their old voice until you run the manual
+  `rerecord-pronunciation.yml` workflow after deploying. It re-records them in place, so
+  review history is kept. It only replaces audio an OpenAI preset voice made, never
+  imported audio.
+- **Sentence pronunciation cards** stay a reviewed, manual job:
+  `scripts/anki_pronunciation --direct` previews the list and lets you skip lines before
+  anything is written. `/pronounce` sends you a phrase list for that script.
+
+The daily workflow needs two **repo** secrets (Settings → Secrets and variables →
+Actions): `WEBHOOK_SECRET` (same value as the function secret) and `SUPABASE_PROJECT_REF`.
+If either is missing, the scheduled run fails loudly instead of doing nothing. Workflow
+logs show counts only, since this repo's Actions logs are public.
+
 ## The model: one instance per pair
 
 Each instance runs **one isolated Supabase project + one Telegram bot** — not
@@ -230,6 +300,11 @@ connects as the service role.
 | `message_reconciles` | Messages excluded from `/recap`. |
 | `recap_embeddings` | Vector + text content for messages and notes, powering `/recap`. |
 | `pending_media_group` | Short-lived buffer that regroups the items of a photo album before forwarding (added by a later migration). |
+| `api_usage` | One row per paid API call, priced at call time — the ledger behind `/annotate_ab cost` (added by a later migration). |
+
+`anki_notes`, the table the study app reads cards from, belongs to **capybara-anki**: its
+schema lives in that repo, not in these migrations. The bot only writes to it, and only when
+the study app is set up.
 
 | Function | Purpose |
 |---|---|
@@ -242,7 +317,8 @@ connects as the service role.
 
 Voice-note audio is archived to a **private Supabase Storage bucket named
 `voice-messages`** (created by `storage_setup.sql` — the migration builds only the
-database, not Storage).
+database, not Storage). Pronunciation-card audio goes to a separate **public**
+`pronunciation-audio` bucket, shared with the study app.
 
 ## Repository map
 
@@ -258,6 +334,10 @@ database, not Storage).
 | `.env.example` | Template for the five function secrets (copy to `.env`). |
 | `.github/workflows/deploy.yml` | **Primary deploy path:** CI, manual (`workflow_dispatch`), gated deploy from GitHub. |
 | `.github/workflows/check.yml` | CI: runs the pre-deploy gate on every push/PR (never deploys). |
+| `.github/workflows/auto-learn.yml` | Daily: adds frequently used words and pronunciation cards to each person's deck. |
+| `.github/workflows/webhook-watch.yml` | Scheduled: checks this bot still owns its Telegram webhook, and repairs it if not. |
+| `.github/workflows/rerecord-pronunciation.yml` | Manual: re-records pronunciation cards after a voice change. |
+| `scripts/anki_pronunciation/` | Local tool for reviewed sentence pronunciation cards (`--direct` writes them to the study app). |
 | `deploy.ps1` / `predeploy-check.ps1` | Fallback deploy spine: gate → CLI-from-disk deploy → health smoke. (Windows PowerShell.) |
 | `deploy.sh` / `predeploy-check.sh` | Same fallback spine, ported to bash (macOS/Linux). |
 | `provision.sh` | Scripts the automatable provisioning glue (secrets, webhook, health). |
@@ -325,6 +405,18 @@ for a menu. In brief:
 | `ADMIN_TELEGRAM_ID` | the **admin** user's numeric Telegram ID |
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are **auto-injected** by Supabase — don't set them.
+
+Optional:
+
+| Secret | Enables |
+|---|---|
+| `ANKI_APP_URL` | `/study`: the https URL of your capybara-anki deployment |
+| `GITHUB_DEPLOY_TOKEN`, `GITHUB_REPO`, `GITHUB_DEPLOY_BRANCH` | `/update` self-deploy (see below) |
+| `GITHUB_ISSUE_TOKEN` | `/bug` reports (see below) |
+
+The scheduled workflows also need **repo** secrets: `SUPABASE_PROJECT_REF` and
+`WEBHOOK_SECRET` for `auto-learn`, `webhook-watch` and `rerecord-pronunciation`, plus `SUPABASE_ACCESS_TOKEN` for
+`deploy`.
 
 ## Deploying
 
@@ -406,7 +498,7 @@ The three function secrets:
   no trailing slash, no spaces.
 - `GITHUB_DEPLOY_BRANCH` — the deploy branch whose `BUILD_VERSION` is "latest" (default `main`).
 
-**Bug reports from Telegram (`/bug`).** Either partner can run `/bug <what went wrong>` to open
+**Bug reports from Telegram (`/bug`).** The admin can run `/bug <what went wrong>` to open
 an issue on `GITHUB_REPO`. Filing an issue needs **Issues: write**, a *different* permission from
 the deploy token's **Actions: write**, so it reads a fourth, optional function secret:
 
@@ -472,8 +564,11 @@ Send **`/help`** in the bot for the full, language-aware list — the everyday c
 also appear in Telegram's **`/` menu** (admin commands show only to the admin). Highlights:
 
 Commands are browsable from a **branched menu keyboard** that stays hidden behind the grid
-button in the compose row — `🎓 Education`, `🧠 Memory`, and `⚙️ Admin` (admin only) — each
-opening a submenu with a back button. Nothing the bot sends unfolds it (sending a reply
+button in the compose row — `📚 Study`, `🧠 Memory`, and `⚙️ Admin` (admin only). **Study**
+is one tap: it opens the study app directly. The others each open a submenu with a back
+button. (The old Education submenu is gone. Its commands — `/vocab`, `/learn`, `/forget`,
+`/export`, `/capybara`, `/pronounce` — still work typed and are listed in `/help`, and an
+old button a client still shows keeps working.) Nothing the bot sends unfolds it (sending a reply
 keyboard always displays it, so neither `/start` nor `/help` carries one): this is a chat
 first, and the two ways in are that button and **`/menu`**. The buttons fold away again
 after each tap. `/help` is deliberately not on the menu: it still works typed. Buttons for commands that take input (`/learn`, `/ask`, `/note`, `/bug`)
@@ -493,10 +588,12 @@ the autocomplete popup is gone.
 | `/note <note>` | Add a private note that `/ask` can find. Long form: `/remember` |
 | `/pin` · `/pinned` · `/unpin` | Mark / list / unmark meaningful messages (reply to one) |
 | `/reconcile` · `/restore` | Hide / unhide a message from `/recap` (reply to one) |
+| `/study` | Open your flashcards in the study app (needs `ANKI_APP_URL`) |
 | `/vocab` | Top still-unlearned words in each deck |
-| `/learn <word>` · `/learn top N [uk\|en]` | Add a word (or the top N) to a deck |
+| `/learn <word>` · `/learn top N [uk\|en]` | Add a word (or the top N) to a deck, and to the study app |
 | `/forget <word>` | Remove a word from the matching deck |
-| `/export` | Export vocabulary decks **and your grammar corrections** as a single Anki CSV |
+| `/export` | Export vocabulary decks **and your grammar corrections** as a single Anki CSV (backup) |
+| `/pronounce [lang] [N]` | Get a phrase list (JSON) for the local `scripts/anki_pronunciation` tool |
 | `/capybara` · `/capybara on\|off` | Toggle a private grammar coach for your learning language (per person, off by default) |
 | `/menu` | Open the button menu (it otherwise stays behind the compose-box grid button) |
 | `/help` · `/start` | Help / welcome |
@@ -520,6 +617,9 @@ the autocomplete popup is gone.
 - **`/bug` is the one opt-in outbound path**, and it is **admin-only**. It sends only the
   text the admin types to GitHub, never conversation content. The repo is public, so those
   issues are world-readable. See `PRIVACY.md` §4.
+- **Pronunciation audio is public.** The daily pronunciation cards' audio sits in a public
+  bucket, which is why they're made from single dictionary words only, never from lines of
+  your conversations. Sentence cards are a manual, reviewed step.
 
 ## Admin & maintenance commands
 
@@ -532,7 +632,9 @@ an existing corpus** — new instances can ignore them.
 | `/bug <what went wrong>` | File a GitHub issue (needs `GITHUB_ISSUE_TOKEN`). Admin-only because the repo is **public** — issues are world-readable |
 | `/backfill` | Annotate one batch of un-annotated messages |
 | `/backfill_translations` | Fill in missing cross-language lemma translations, one batch |
+| `/syncanki` | Write the whole existing corpus (both decks + both people's grammar corrections) into the study app. Safe to re-run: it never adds a card twice |
 | `/backfill_senses` | Re-derive flashcard translations so each matches its example sentence |
+| `/backfill_glosses` | Put each gloss back into the learner's own language, one batch |
 | `/backfill_examples` | Fill in the short verbatim example sentence pair for older vocabulary rows. **Self-chaining** — one tap runs it to completion; every other backfill still needs re-tapping |
 | `/backfill_grammar` | Fill in card fields (blank target, dictionary form, meaning) for older corrections |
 | `/recap_backfill` | Embed one batch of existing messages for `/recap` |
@@ -619,6 +721,13 @@ deploy-safety and reproducibility handoffs that shaped them.
   Two caveats. The cron asks for every 30 minutes and **GitHub does not honour it** —
   observed spacing is 3–5 hours, because scheduled workflows are delayed under load. And
   GitHub disables scheduled workflows after 60 days of repo inactivity.
+- **`/study` says flashcards aren't set up** — set the `ANKI_APP_URL` function secret to
+  your capybara-anki URL (it must be https) and **redeploy**. In a group chat, `/study`
+  sends a plain link, because Telegram only opens Mini App buttons in private chats.
+- **The daily auto-learn run fails** — usually a missing `WEBHOOK_SECRET` or
+  `SUPABASE_PROJECT_REF` **repo** secret. It fails on purpose rather than silently adding
+  nothing. Like `webhook-watch`, GitHub may run it late and disables it after 60 days of
+  repo inactivity.
 - **Deploy aborted by the gate** — `predeploy-check.ps1` failed (`deno check`, line
   count, or missing anchors). Fix the reported issue; nothing was deployed.
 
@@ -627,8 +736,10 @@ deploy-safety and reproducibility handoffs that shaped them.
 - **Runtime:** Deno (Supabase Edge Functions).
 - **Database:** Postgres (Supabase) with `pgvector`, `pg_trgm`, `uuid-ossp`.
 - **AI:** Anthropic Claude (Sonnet for translation/annotation/recap synthesis, Haiku for
-  query parsing); OpenAI Whisper (voice) and `text-embedding-3-small` (embeddings).
-- **Messaging:** Telegram Bot API (webhook).
-- **Tooling:** Supabase CLI, PowerShell deploy spine, Git.
+  query parsing); OpenAI Whisper (voice), `text-embedding-3-small` (embeddings), and
+  text-to-speech (pronunciation cards).
+- **Messaging:** Telegram Bot API (webhook) + a Telegram Mini App (the study app).
+- **Tooling:** Supabase CLI, GitHub Actions (deploy + scheduled jobs), PowerShell/bash
+  deploy spine, Git.
 </content>
 </invoke>
