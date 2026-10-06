@@ -155,6 +155,14 @@ bearer credential (`x-capybara-internal-secret` header, the same trust
 Actions) to actually run; missing either fails the scheduled run loudly rather than
 silently doing nothing.
 
+**Re-running a day: use `pronunciation_only`.** The vocabulary half has no per-day
+guard, so a plain re-run adds another day's words. If the pronunciation half was cut
+short, run the workflow by hand with `pronunciation_only` ticked. The run must answer
+inside the function's 150s wall clock: each TTS call and upload has its own timeout,
+and no new word starts after `AUTO_LEARN_BUDGET_MS`. Words it didn't reach come back
+as `deferred`, which fails the run (loudly, not silently) and leaves nothing
+half-written; a later run picks them up.
+
 One builder shapes every card (`vocabCardFields` / `grammarCardFields`), used by the CSV,
 the live writes, and the backfill alike. Two would drift, and the copy the app reads is
 the one nobody is looking at while they review.

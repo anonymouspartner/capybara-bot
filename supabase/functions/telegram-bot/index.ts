@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v114";
+const BUILD_VERSION = "v115";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -136,6 +136,16 @@ const AUTO_LEARN_MAX_PER_RUN = 15;
 const AUTO_PRONOUNCE_MAX_PER_RUN = 5;
 // A "word" can be a short fixed phrase ("look after"); anything longer is a sentence.
 const AUTO_PRONOUNCE_MAX_WORDS = 3;
+// The daily run must answer inside the edge function's 150s wall clock, or Supabase
+// kills it mid-word and the workflow sees only a timeout -- no counts, no Telegram
+// message for what did land. That happened on 2026-10-06: one TTS call took ~80s,
+// the next never returned. So each TTS request and upload gets its own limit, and
+// no new word is started once the run has used AUTO_LEARN_BUDGET_MS; the words it
+// didn't reach are reported as `deferred` and a later run picks them up, since a run
+// only ever picks words that have no pronunciation card yet.
+const PRONUNCIATION_TTS_TIMEOUT_MS = 20_000;
+const PRONUNCIATION_UPLOAD_TIMEOUT_MS = 15_000;
+const AUTO_LEARN_BUDGET_MS = 110_000;
 const PRONUNCIATION_BUCKET = "pronunciation-audio";
 // capybara-anki keeps one schedule per card and shows both people every deck, so each
 // language needs its own deck for each person's schedule to stay their own. Must match
@@ -482,11 +492,17 @@ Deno.serve(async (req) => {
     if (req.headers.get(INTERNAL_CHAIN_HEADER) !== WEBHOOK_SECRET) {
       return new Response("Unauthorized", { status: 401 });
     }
-    const result = await runAutoLearnCron();
+    const deadline = Date.now() + AUTO_LEARN_BUDGET_MS;
+    // `pronunciation_only` re-runs just the pronunciation half -- for a day whose run
+    // got cut short. The vocabulary half has no per-day guard (each run adds up to
+    // AUTO_LEARN_MAX_PER_RUN more), so a plain re-run would double that day's words.
+    const result: Awaited<ReturnType<typeof runAutoLearnCron>> = url.searchParams.has("pronunciation_only")
+      ? { perUser: {} }
+      : await runAutoLearnCron();
     // Its own try: a TTS or Storage failure must not take the vocabulary pass down
     // with it, and must still reach the workflow as a failure rather than vanish.
     let pronunciation: Awaited<ReturnType<typeof runAutoPronounceCron>>;
-    try { pronunciation = await runAutoPronounceCron(); }
+    try { pronunciation = await runAutoPronounceCron(deadline); }
     catch (e) {
       console.error("autoPronounceCron failed:", e);
       pronunciation = { perUser: {}, error: e instanceof Error ? e.message : String(e) };
@@ -3453,7 +3469,9 @@ async function runAutoLearnCron(): Promise<{ perUser: Record<string, { added: nu
  * workflow on a public repo, whose logs anyone can read; the words themselves go to
  * the person in Telegram.
  */
-async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added: number; failed: number }>; error?: string }> {
+async function runAutoPronounceCron(
+  deadline: number,
+): Promise<{ perUser: Record<string, { added: number; failed: number; deferred: number }>; error?: string }> {
   const { data: users, error } = await supabase
     .from("users")
     .select("id, telegram_id, learning_language");
@@ -3463,7 +3481,7 @@ async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added
   }
 
   await ensurePronunciationBucket();
-  const perUser: Record<string, { added: number; failed: number }> = {};
+  const perUser: Record<string, { added: number; failed: number; deferred: number }> = {};
   // A read that fails is a failed run, not "nothing to add": reported as `error`, which
   // auto-learn.yml fails on, so a pass that silently stops adding cards can't stay green.
   const readErrors: string[] = [];
@@ -3494,7 +3512,7 @@ async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added
         .range(from, to));
     } catch (e) {
       console.error(`autoPronounceCron: reads failed for ${user.id}:`, e);
-      perUser[user.id] = { added: 0, failed: 0 };
+      perUser[user.id] = { added: 0, failed: 0, deferred: 0 };
       readErrors.push(`reads failed for one user (${lang}): ${e instanceof Error ? e.message : String(e)}`);
       continue;
     }
@@ -3516,7 +3534,10 @@ async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added
 
     const added: string[] = [];
     let failed = 0;
+    let deferred = 0;
     for (const v of picks) {
+      // Out of time: leave the rest for a later run rather than be killed mid-word.
+      if (Date.now() > deadline) { deferred++; continue; }
       const word = normalizeSpaces(v.lemma);
       try {
         const audioUrl = await synthesizePronunciation(word, lang);
@@ -3539,7 +3560,7 @@ async function runAutoPronounceCron(): Promise<{ perUser: Record<string, { added
         failed++;
       }
     }
-    perUser[user.id] = { added: added.length, failed };
+    perUser[user.id] = { added: added.length, failed, deferred };
 
     if (added.length > 0 && user.telegram_id) {
       await sendMessage(
@@ -3615,6 +3636,16 @@ async function pronunciationAudioName(text: string, lang: LangCode, voice = pron
   return `capy_pron_${(await sha256Hex(`${identity}\u0000${locale}\u0000${normalizeSpaces(text)}`)).slice(0, 12)}.mp3`;
 }
 
+// Rejects if `work` hasn't settled within `ms`. Doesn't cancel it -- it stops the
+// caller waiting, which is what keeps a run inside its wall clock.
+function withTimeout<T>(work: PromiseLike<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([Promise.resolve(work), timeout]).finally(() => clearTimeout(timer));
+}
+
 function pronunciationPublicUrl(name: string): string {
   return supabase.storage.from(PRONUNCIATION_BUCKET).getPublicUrl(name).data.publicUrl;
 }
@@ -3623,6 +3654,7 @@ function pronunciationPublicUrl(name: string): string {
 async function synthesizePronunciation(word: string, lang: LangCode): Promise<string> {
   const name = await pronunciationAudioName(word, lang);
 
+  // The signal covers reading the body too, not just the headers.
   const resp = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: { "Authorization": `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
@@ -3632,12 +3664,16 @@ async function synthesizePronunciation(word: string, lang: LangCode): Promise<st
       input: normalizeSpaces(word),
       response_format: "mp3",
     }),
+    signal: AbortSignal.timeout(PRONUNCIATION_TTS_TIMEOUT_MS),
   });
   if (!resp.ok) throw new Error(`TTS ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
   const audio = new Uint8Array(await resp.arrayBuffer());
 
-  const { error } = await supabase.storage.from(PRONUNCIATION_BUCKET)
-    .upload(name, audio, { contentType: "audio/mpeg", upsert: true });
+  const { error } = await withTimeout(
+    supabase.storage.from(PRONUNCIATION_BUCKET).upload(name, audio, { contentType: "audio/mpeg", upsert: true }),
+    PRONUNCIATION_UPLOAD_TIMEOUT_MS,
+    "upload",
+  );
   if (error) throw new Error(`upload: ${error.message}`);
   return pronunciationPublicUrl(name);
 }
