@@ -29,7 +29,12 @@ name: auto-learn
 on:
   schedule:
     - cron: "0 12 * * *" # once a day; hour is arbitrary
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      pronunciation_only:
+        description: "Only the pronunciation half -- for re-running a day whose run was cut short. A full re-run would add another day's vocabulary words."
+        type: boolean
+        default: false
 
 concurrency:
   group: auto-learn
@@ -46,6 +51,8 @@ jobs:
         env:
           REF: ${{ secrets.SUPABASE_PROJECT_REF }}
           SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          # Empty on a scheduled run, so that always does both halves.
+          PRONUNCIATION_ONLY: ${{ inputs.pronunciation_only }}
         run: |
           set -euo pipefail
 
@@ -54,17 +61,22 @@ jobs:
             exit 1
           fi
 
+          query="internal_autolearn"
+          if [ "${PRONUNCIATION_ONLY:-}" = "true" ]; then query="${query}&pronunciation_only"; fi
+
           # Longer than a plain /learn: the pronunciation pass makes one TTS call per word.
+          # The function stops starting new words well inside this (AUTO_LEARN_BUDGET_MS),
+          # so hitting it means the function itself was killed.
           if ! body=$(curl -fsS --max-time 150 -X POST \
               -H "x-capybara-internal-secret: ${SECRET}" \
-              "https://${REF}.supabase.co/functions/v1/telegram-bot?internal_autolearn"); then
+              "https://${REF}.supabase.co/functions/v1/telegram-bot?${query}"); then
             echo "FAIL: the auto-learn route did not return success."
             exit 1
           fi
 
           echo "$body" | jq '{
             vocabulary: (.perUser | map_values(.added)),
-            pronunciation: ((.pronunciation.perUser // {}) | map_values({added, failed})),
+            pronunciation: ((.pronunciation.perUser // {}) | map_values({added, failed, deferred})),
             error, pronunciation_error: .pronunciation.error
           }'
 
@@ -78,5 +90,9 @@ jobs:
           fi
           if echo "$body" | jq -e '[.pronunciation.perUser[]?.failed] | add // 0 | . > 0' > /dev/null; then
             echo "FAIL: some pronunciation words failed -- see the function's logs in Supabase."
+            exit 1
+          fi
+          if echo "$body" | jq -e '[.pronunciation.perUser[]?.deferred] | add // 0 | . > 0' > /dev/null; then
+            echo "FAIL: the run ran out of time before every pronunciation word (slow TTS?). Nothing is lost: re-run with pronunciation_only, or the next run picks them up."
             exit 1
           fi
