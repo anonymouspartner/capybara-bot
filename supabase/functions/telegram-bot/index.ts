@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v115";
+const BUILD_VERSION = "v116";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -40,8 +40,9 @@ const CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 // CLAUDE_HAIKU_MODEL to cut that spend by roughly two thirds; the risk is weaker
 // lemmatization/glossing on a morphologically rich language, so compare first with
 // /annotate_ab (admin) and re-check existing cards with /backfill_senses afterwards.
-// Defaults to CLAUDE_MODEL, i.e. no behavior change until deliberately switched.
-const ANNOTATION_MODEL: string = CLAUDE_MODEL;
+// Switched to CLAUDE_HAIKU_MODEL in v116 after an /annotate_ab comparison showed no
+// visible quality loss; set back to CLAUDE_MODEL to revert.
+const ANNOTATION_MODEL: string = CLAUDE_HAIKU_MODEL;
 
 // Billing rates for every paid API the bot calls, used by logApiUsage to price each
 // call as it happens and by the /annotate_ab cost report to total them up. Standard
