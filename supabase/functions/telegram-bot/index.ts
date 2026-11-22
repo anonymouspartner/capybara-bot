@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v119";
+const BUILD_VERSION = "v120";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -4750,22 +4750,29 @@ const SYNONYM_MAX_CHARS = 40;
  * the lemma, or null when there is no such word (an idiomatic rendering, or simply
  * a form of the answer already shown). A missing key means the call failed. */
 async function findAsUsedTranslations(
-  items: Array<{ id: string; lemma: string; language: LangCode; example: string; exampleTranslation: string; lemmaTranslation: string }>,
+  items: Array<{ id: string; lemma: string; partOfSpeech: string | null; language: LangCode; example: string; exampleTranslation: string; lemmaTranslation: string }>,
   otherOf: (lang: LangCode) => LangCode,
 ): Promise<Map<string, string | null>> {
   const out = new Map<string, string | null>();
   if (items.length === 0) return out;
   const lines = items.map((it, i) =>
-    `${i + 1}. word: ${JSON.stringify(it.lemma)} (${langMeta(it.language).englishName})\n` +
+    `${i + 1}. word: ${JSON.stringify(it.lemma)} (${langMeta(it.language).englishName}, ${it.partOfSpeech ?? "word"})\n` +
     `   sentence: ${JSON.stringify(it.example)}\n` +
     `   translation (${langMeta(otherOf(it.language)).englishName}): ${JSON.stringify(it.exampleTranslation)}\n` +
     `   current answer: ${JSON.stringify(it.lemmaTranslation)}`).join("\n");
   const system =
     `Each numbered item is a flashcard: a word, a sentence that uses it, that sentence's accepted translation, and the card's current answer (the word's dictionary translation).\n` +
-    `For EACH item, find the word or short phrase in the translation that renders the word, and return it in dictionary form ` +
-    `(infinitive for verbs, nominative singular for nouns, masculine nominative singular for adjectives), in the translation's language.\n` +
-    `Return null when the translation has no specific word for it (it is rendered idiomatically, restructured or dropped), ` +
-    `or when what it uses is just a form of the current answer.\n\n` +
+    `For EACH item, decide whether the translation uses a SYNONYM of the current answer for the word: a different word that a bilingual dictionary ` +
+    `could list as a translation of the word on its own, in this sense, and the same part of speech as the word. ` +
+    `If so return it in dictionary form (infinitive for verbs, nominative singular for nouns, masculine nominative singular for adjectives), in the translation's language.\n` +
+    `Return null in every other case. In particular return null when:\n` +
+    `- the translation has no specific word for it (rendered idiomatically, restructured or dropped);\n` +
+    `- what it uses is a form of the current answer, including the other aspect of the same verb or a different tense or person;\n` +
+    `- the nearest word is a different part of speech (a noun for a verb, an adverb for an adjective);\n` +
+    `- the nearest word only fits this one sentence and is not a translation of the word in general ` +
+    `(e.g. "put" in "put a question" is not "question"; "can" under negation is not "can't"; a name, a compound, or a neighbouring word);\n` +
+    `- the word is a misspelling or a word from another language.\n` +
+    `When unsure, return null: a wrong synonym on a flashcard is worse than none.\n\n` +
     `${lines}\n\n` +
     `Output ONLY a raw JSON array, one object per item, in order: [{"n": 1, "as_used": "..."|null}, ...]\n` +
     `No markdown fences, no preamble.`;
@@ -4803,6 +4810,7 @@ async function findAsUsedTranslations(
     // sentence -- the point is to name the word the learner can see, not to add
     // whatever synonym the model thinks of.
     const usable = asUsed.length > 0 && asUsed.length <= SYNONYM_MAX_CHARS && !asUsed.includes(",") &&
+      asUsed.split(" ").length <= 2 &&
       exampleScriptMatchesLanguage(asUsed, otherOf(it.language)) &&
       !sentenceUsesTerm(asUsed, it.lemmaTranslation) &&
       sentenceUsesTerm(it.exampleTranslation, asUsed);
@@ -4836,6 +4844,9 @@ async function addAsUsedSynonymsToCards(startedAt: number): Promise<number> {
     for (const n of (notes ?? []) as any[]) {
       if (!n.example || !n.example_translation?.trim() || !n.lemma_translation?.trim()) continue;
       if (otherOf(n.language) === n.language) continue;
+      // One synonym is the limit. An answer that already lists two words is left
+      // alone: it either has its synonym, or had one removed by hand.
+      if (n.lemma_translation.includes(",")) continue;
       if (!sentenceUsesTerm(n.example_translation, n.lemma_translation)) candidates.push(n);
     }
     if (!notes || notes.length < 1000) break;
@@ -4846,7 +4857,7 @@ async function addAsUsedSynonymsToCards(startedAt: number): Promise<number> {
     if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
     const batch = candidates.slice(i, i + SYNONYM_BATCH);
     const found = await findAsUsedTranslations(batch.map((n) => ({
-      id: n.id, lemma: n.lemma, language: n.language, example: n.example,
+      id: n.id, lemma: n.lemma, partOfSpeech: n.part_of_speech, language: n.language, example: n.example,
       exampleTranslation: n.example_translation, lemmaTranslation: n.lemma_translation,
     })), otherOf);
     for (const n of batch) {
