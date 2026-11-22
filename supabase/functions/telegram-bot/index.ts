@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v120";
+const BUILD_VERSION = "v121";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -4720,163 +4720,15 @@ async function syncExampleTranslationsToCards(): Promise<number> {
   return updated;
 }
 
-// --- The answer and the sentence under it should agree ------------------------------
-// A card shows lemma_translation as the answer and example_translation as what the
-// example means. Both are right and they can still disagree: "amazing" is answered
-// "чудовий" while the sentence actually said "супер бухгалтер". Hiding the sentence
-// in that case is what left cards without a translation (see above), so instead the
-// word the sentence really used is added to the answer as a synonym: "чудовий, супер".
-
-/** A crude stem: enough of a word's front to survive inflection ("чудовий" matches
- * "чудову"), short enough words whole. Only ever used to ask "is some form of this
- * word in that sentence", where a false "yes" just means no synonym is added. */
-function wordStem(word: string): string {
-  const w = word.toLowerCase();
-  return w.length <= 4 ? w : w.slice(0, Math.max(4, Math.ceil(w.length * 0.6)));
-}
-
-/** True when some form of any word of `terms` (a comma-separated answer) appears in `sentence`. */
-function sentenceUsesTerm(sentence: string, terms: string): boolean {
-  const hay = sentence.toLowerCase();
-  return (terms.match(/\p{L}[\p{L}'’ʼ-]*/gu) ?? [])
-    .filter((w) => w.length >= 3)
-    .some((w) => hay.includes(wordStem(w)));
-}
-
-const SYNONYM_BATCH = 20;
-const SYNONYM_MAX_CHARS = 40;
-
-/** For each card, the dictionary form of the word its example translation used for
- * the lemma, or null when there is no such word (an idiomatic rendering, or simply
- * a form of the answer already shown). A missing key means the call failed. */
-async function findAsUsedTranslations(
-  items: Array<{ id: string; lemma: string; partOfSpeech: string | null; language: LangCode; example: string; exampleTranslation: string; lemmaTranslation: string }>,
-  otherOf: (lang: LangCode) => LangCode,
-): Promise<Map<string, string | null>> {
-  const out = new Map<string, string | null>();
-  if (items.length === 0) return out;
-  const lines = items.map((it, i) =>
-    `${i + 1}. word: ${JSON.stringify(it.lemma)} (${langMeta(it.language).englishName}, ${it.partOfSpeech ?? "word"})\n` +
-    `   sentence: ${JSON.stringify(it.example)}\n` +
-    `   translation (${langMeta(otherOf(it.language)).englishName}): ${JSON.stringify(it.exampleTranslation)}\n` +
-    `   current answer: ${JSON.stringify(it.lemmaTranslation)}`).join("\n");
-  const system =
-    `Each numbered item is a flashcard: a word, a sentence that uses it, that sentence's accepted translation, and the card's current answer (the word's dictionary translation).\n` +
-    `For EACH item, decide whether the translation uses a SYNONYM of the current answer for the word: a different word that a bilingual dictionary ` +
-    `could list as a translation of the word on its own, in this sense, and the same part of speech as the word. ` +
-    `If so return it in dictionary form (infinitive for verbs, nominative singular for nouns, masculine nominative singular for adjectives), in the translation's language.\n` +
-    `Return null in every other case. In particular return null when:\n` +
-    `- the translation has no specific word for it (rendered idiomatically, restructured or dropped);\n` +
-    `- what it uses is a form of the current answer, including the other aspect of the same verb or a different tense or person;\n` +
-    `- the nearest word is a different part of speech (a noun for a verb, an adverb for an adjective);\n` +
-    `- the nearest word only fits this one sentence and is not a translation of the word in general ` +
-    `(e.g. "put" in "put a question" is not "question"; "can" under negation is not "can't"; a name, a compound, or a neighbouring word);\n` +
-    `- the word is a misspelling or a word from another language.\n` +
-    `When unsure, return null: a wrong synonym on a flashcard is worse than none.\n\n` +
-    `${lines}\n\n` +
-    `Output ONLY a raw JSON array, one object per item, in order: [{"n": 1, "as_used": "..."|null}, ...]\n` +
-    `No markdown fences, no preamble.`;
-  let result;
-  try {
-    result = await withRetry(() => anthropic.messages.create({
-      model: CLAUDE_MODEL, max_tokens: 4096, thinking: { type: "disabled" },
-      system, messages: [{ role: "user", content: "Go." }],
-    }, { maxRetries: 0 }));
-  } catch (e) {
-    console.error("findAsUsedTranslations API call failed:", e);
-    return out;
-  }
-  logApiUsage({
-    provider: "anthropic", model: CLAUDE_MODEL, feature: "backfill_examples",
-    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
-  });
-  const block = result.content.find((b) => b.type === "text");
-  if (block?.type !== "text") return out;
-  let parsed: any;
-  try {
-    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-    parsed = JSON.parse(cleaned);
-  } catch {
-    console.error("findAsUsedTranslations JSON parse failed (length " + block.text.length + ")");
-    return out;
-  }
-  if (!Array.isArray(parsed)) return out;
-  for (const entry of parsed) {
-    if (typeof entry?.n !== "number") continue;
-    const it = items[entry.n - 1];
-    if (!it) continue;
-    const asUsed = typeof entry?.as_used === "string" ? collapseWhitespace(entry.as_used) : "";
-    // Kept only if it is short, in the right language, new, and really in the
-    // sentence -- the point is to name the word the learner can see, not to add
-    // whatever synonym the model thinks of.
-    const usable = asUsed.length > 0 && asUsed.length <= SYNONYM_MAX_CHARS && !asUsed.includes(",") &&
-      asUsed.split(" ").length <= 2 &&
-      exampleScriptMatchesLanguage(asUsed, otherOf(it.language)) &&
-      !sentenceUsesTerm(asUsed, it.lemmaTranslation) &&
-      sentenceUsesTerm(it.exampleTranslation, asUsed);
-    out.set(it.id, usable ? asUsed : null);
-  }
-  return out;
-}
-
-/** Adds the word a card's example translation actually used to that card's answer,
- * when no form of the current answer appears in the sentence. Writes the card and
- * the vocabulary row behind it. A card nothing can be added to is asked about again
- * on a later run -- there is nowhere to record "checked" -- which costs a handful of
- * batched calls on a command someone runs by hand. */
-async function addAsUsedSynonymsToCards(startedAt: number): Promise<number> {
-  const { data: uRows } = await supabase.from("users").select("native_language");
-  const instanceLangs = [...new Set((uRows ?? []).map((u: any) => u.native_language as LangCode))];
-  const otherOf = (lang: LangCode): LangCode => instanceLangs.find((l) => l !== lang) ?? lang;
-
-  const candidates: any[] = [];
-  for (let from = 0; ; from += 1000) {
-    const { data: notes, error } = await supabase
-      .from("anki_notes")
-      .select("id, lemma, part_of_speech, language, lemma_translation, example, example_translation")
-      .eq("kind", "vocab")
-      .neq("deck", ANKI_GRAMMAR_DECK)
-      .not("example_translation", "is", null)
-      .not("lemma_translation", "is", null)
-      .order("id", { ascending: true })
-      .range(from, from + 999);
-    if (error) { console.error("addAsUsedSynonymsToCards: read failed:", error); return 0; }
-    for (const n of (notes ?? []) as any[]) {
-      if (!n.example || !n.example_translation?.trim() || !n.lemma_translation?.trim()) continue;
-      if (otherOf(n.language) === n.language) continue;
-      // One synonym is the limit. An answer that already lists two words is left
-      // alone: it either has its synonym, or had one removed by hand.
-      if (n.lemma_translation.includes(",")) continue;
-      if (!sentenceUsesTerm(n.example_translation, n.lemma_translation)) candidates.push(n);
-    }
-    if (!notes || notes.length < 1000) break;
-  }
-
-  let updated = 0;
-  for (let i = 0; i < candidates.length; i += SYNONYM_BATCH) {
-    if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
-    const batch = candidates.slice(i, i + SYNONYM_BATCH);
-    const found = await findAsUsedTranslations(batch.map((n) => ({
-      id: n.id, lemma: n.lemma, partOfSpeech: n.part_of_speech, language: n.language, example: n.example,
-      exampleTranslation: n.example_translation, lemmaTranslation: n.lemma_translation,
-    })), otherOf);
-    for (const n of batch) {
-      const asUsed = found.get(n.id);
-      if (!asUsed) continue;
-      const combined = `${n.lemma_translation.trim()}, ${asUsed}`;
-      const { error: uErr } = await supabase.from("anki_notes").update({ lemma_translation: combined }).eq("id", n.id);
-      if (uErr) { console.error("addAsUsedSynonymsToCards: update failed:", uErr); continue; }
-      updated++;
-      // Keep the row behind the card in step, so /export says the same thing.
-      let q = supabase.from("vocabulary").update({ lemma_translation: combined })
-        .eq("lemma", n.lemma).eq("language", n.language).eq("lemma_translation", n.lemma_translation);
-      q = n.part_of_speech == null ? q.is("part_of_speech", null) : q.eq("part_of_speech", n.part_of_speech);
-      const { error: vErr } = await q;
-      if (vErr) console.error("addAsUsedSynonymsToCards: vocabulary update failed:", vErr);
-    }
-  }
-  return updated;
-}
+// A card's answer (lemma_translation) and the sentence under its example can both be
+// right and still disagree: "amazing" answered "чудовий" over a sentence that says
+// "супер". For new words the annotation prompt gives both ("чудовий, супер"). v119
+// and v120 also had a pass here that added the sentence's word to EXISTING cards, and
+// it is gone on purpose: about a quarter of what it added was wrong (a neighbouring
+// word, another part of speech, a conjugated form), a tighter prompt only halved that,
+// and with nowhere to record "checked", every run of /backfill_examples re-added the
+// ones that had been removed by hand. The backlog was done once, on 2026-11-22, and
+// reviewed; a card that still disagrees is fixed with Edit in the study app.
 
 type ExampleBackfillResult = {
   filled: number; failed: number; skippedNoMessage: number;
@@ -4962,7 +4814,6 @@ async function exampleBackfillGrind(chatId: number): Promise<ExampleBackfillResu
   // any this round just wrote that way), then the cards already made from them.
   const tr = await fillMissingExampleTranslations(startedAt);
   const cardsUpdated = await syncExampleTranslationsToCards();
-  const synonymsAdded = await addAsUsedSynonymsToCards(startedAt);
   const { count: translationsRemainingRaw } = await supabase
     .from("vocabulary")
     .select("id", { count: "exact", head: true })
@@ -4974,7 +4825,7 @@ async function exampleBackfillGrind(chatId: number): Promise<ExampleBackfillResu
     : verifiedRemainingRaw + translationsRemainingRaw;
   failed += tr.failed;
 
-  if (pending.length === 0 && tr.filled === 0 && tr.failed === 0 && cardsUpdated === 0 && synonymsAdded === 0 && verifiedRemaining === 0) {
+  if (pending.length === 0 && tr.filled === 0 && tr.failed === 0 && cardsUpdated === 0 && verifiedRemaining === 0) {
     await sendMessage(chatId, "✅ No more rows to backfill.");
     return { filled: 0, failed: 0, skippedNoMessage: 0, groupsProcessed: 0, totalGroups: 0, verifiedRemaining: 0 };
   }
@@ -4985,7 +4836,6 @@ async function exampleBackfillGrind(chatId: number): Promise<ExampleBackfillResu
     `Examples filled: ${filled}\n` +
     `Example translations filled: ${tr.filled}\n` +
     (cardsUpdated > 0 ? `Study-app cards updated: ${cardsUpdated}\n` : "") +
-    (synonymsAdded > 0 ? `Answers given the word their example uses: ${synonymsAdded}\n` : "") +
     (failed > 0 ? `Failed: ${failed}\n` : "") +
     (skippedNoMessage > 0 ? `Skipped (no usable linked message): ${skippedNoMessage}\n` : "") +
     `Rows still pending: ${verifiedRemaining}\n` +
