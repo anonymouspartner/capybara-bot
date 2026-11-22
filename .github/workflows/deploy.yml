@@ -87,7 +87,7 @@ jobs:
       - name: Deploy the function (committed file only)
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-        run: supabase functions deploy telegram-bot --project-ref "$TARGET_REF" --no-verify-jwt
+        run: supabase functions deploy telegram-bot --project-ref "$TARGET_REF" --no-verify-jwt --yes
 
       - name: Smoke-test the health route
         run: |
