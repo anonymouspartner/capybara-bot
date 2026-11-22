@@ -8,7 +8,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-const BUILD_VERSION = "v117";
+const BUILD_VERSION = "v118";
 const DEFAULT_CONVERSATION_ID = "00000000-0000-0000-0000-000000000001";
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
@@ -1495,7 +1495,7 @@ function buildAnnotationPrompt(language: LangCode, otherLanguage: LangCode, para
     `    - One word only when possible; a short phrase if the language has no single-word equivalent.\n` +
     `    - The gloss and lemma_translation may be identical; that's fine \u2014 return both.\n` +
     `  * example is the ONE sentence from the input text \u2014 copied verbatim, character-for-character, never paraphrased or shortened \u2014 in which the word appears in the form actually used. Use two consecutive sentences only if the word's sense is unrecoverable from one alone. This becomes the front of a flashcard, so it must never be the whole input.\n` +
-    `  * example_translation is the sentence from the accepted translation (given below under SENSE ANCHOR, if present) that corresponds to "example" \u2014 copied verbatim from that translation, never invented or back-translated. If the translation renders that stretch idiomatically and no sentence there actually contains a recognizable form of lemma_translation, return null rather than a sentence that doesn't support the answer. Return null whenever no SENSE ANCHOR translation is given below.\n` +
+    `  * example_translation is the sentence from the accepted translation (given below under SENSE ANCHOR, if present) that corresponds to "example" \u2014 copied verbatim from that translation, never invented or back-translated. Give it for EVERY word whenever a SENSE ANCHOR translation is given, including when the translation renders that stretch idiomatically and no recognizable form of lemma_translation appears in it: the learner reads this to understand the example, so a card without it is incomplete. Return null only when no SENSE ANCHOR translation is given below.\n` +
     `  * SKIP: prepositions, conjunctions, particles, interjections, pronouns, numerals, proper nouns (names of people/places).\n` +
     `  * SKIP any word whose only occurrence in the text is inside source code, markup, a URL, or a similar non-prose span (e.g. a CSS/HTML/JSON snippet) — such an occurrence is not real ${langName} usage and would make a nonsense flashcard.\n` +
     `  * For homographs (same lemma, different part of speech), return separate entries.\n` +
@@ -4444,8 +4444,9 @@ async function handleBackfillSenses(msg: any, user: any) {
 // for vocabulary rows annotated before those columns existed -- see #53: without them,
 // /export fell back to the WHOLE first-seen message as a card's example (often a
 // paragraph), with no guarantee the translated side actually used the answer word.
-// Incremental like /backfill_translations (a row already carrying an example is never
-// revisited), but each row needs its first-seen message for context, so it runs as a
+// Incremental like /backfill_translations (a row already carrying an example keeps
+// it; one carrying an example with no translation gets only the translation -- see
+// fillMissingExampleTranslations), but each row needs its first-seen message for context, so it runs as a
 // time-boxed background grind like /backfill_senses rather than one batch call.
 
 async function backfillExamplesForMessage(
@@ -4466,7 +4467,7 @@ async function backfillExamplesForMessage(
     `${otherName}: "${targetText}"\n\n` +
     `Each numbered ${langName} word below appears somewhere in the ${langName} text above. For EACH one, find:\n` +
     `- "example": the ONE sentence from the ${langName} text — copied verbatim, character-for-character, never paraphrased — in which that word appears. Two consecutive sentences only if its sense is unrecoverable from one alone. Never the whole text.\n` +
-    `- "example_translation": the sentence from the ${otherName} text that corresponds to "example" — copied verbatim, never invented or back-translated. Return null if no sentence there actually contains a recognizable form of that word's dictionary translation.\n\n` +
+    `- "example_translation": the sentence from the ${otherName} text that corresponds to "example" — copied verbatim, never invented or back-translated. Give it even when the ${otherName} text renders that stretch idiomatically and the word's dictionary translation does not appear in it; return null only if the ${otherName} text has nothing corresponding to "example" at all.\n\n` +
     `If a word's only occurrence in the ${langName} text is inside source code, markup, a URL, or a similar non-prose span (e.g. a CSS/HTML/JSON snippet), that is not real ${langName} usage — return null for both "example" and "example_translation" for that word rather than quoting the code.\n\n` +
     `Words:\n${lines}\n\n` +
     `Output ONLY a raw JSON array, one object per word, in order: [{"n": 1, "example": "...", "example_translation": "..."|null}, ...]\n` +
@@ -4508,6 +4509,214 @@ async function backfillExamplesForMessage(
   return out;
 }
 
+// --- The other half of /backfill_examples: an example with no translation ----------
+// Both prompts above used to return a null example_translation whenever the
+// translated sentence didn't contain a recognizable form of the word's dictionary
+// translation. That is common going into Ukrainian, where the translation inflects
+// or rephrases, and it left 1,040 vocabulary rows (827 of them English) with an
+// example and nothing under it -- so 119 of the 731 cards in the English deck showed
+// a sentence the learner had no translation for, against 33 of 1,062 in the
+// Ukrainian one. The prompts now always give the sentence; this fills in the rows
+// written before that.
+//
+// A row that genuinely has no counterpart is written as "" rather than left null,
+// so it is not picked up again on every later run. Every reader already treats ""
+// and null alike.
+
+const EXAMPLE_TRANSLATION_FALLBACK_MAX_CHARS = 300;
+
+function collapseWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** The translation of `example`, when it can be known without asking a model: the
+ * example is the whole message, so its translation is the whole other side. */
+function wholeMessageTranslation(example: string, sourceText: string, targetText: string): string | null {
+  return collapseWhitespace(example) === collapseWhitespace(sourceText) ? targetText.trim() : null;
+}
+
+/** For each excerpt of `sourceText`, the stretch of `targetText` that translates it.
+ * An answer is only accepted if it is really in `targetText`: this is a lookup, and
+ * a sentence the model wrote itself would be a translation nobody ever accepted.
+ * A missing key means the call failed and the row should be retried; a null value
+ * means the model was asked and had nothing usable. */
+async function locateExampleTranslations(
+  sourceText: string, targetText: string, language: LangCode, otherLanguage: LangCode,
+  items: Array<{ id: string; example: string }>,
+): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  if (items.length === 0) return out;
+  const langName = langMeta(language).englishName;
+  const otherName = langMeta(otherLanguage).englishName;
+  const lines = items.map((it, i) => `${i + 1}. ${JSON.stringify(it.example)}`).join("\n");
+  const system =
+    `A ${langName} message was translated into ${otherName}:\n` +
+    `${langName}: "${sourceText}"\n` +
+    `${otherName}: "${targetText}"\n\n` +
+    `Each numbered excerpt below is copied from the ${langName} text. For EACH one, find the part of the ${otherName} text that translates it ` +
+    `— copied verbatim, character-for-character, never invented, paraphrased or back-translated. Usually one sentence; as much as the excerpt covers, no more. ` +
+    `Return null only if the ${otherName} text has nothing corresponding to that excerpt.\n\n` +
+    `Excerpts:\n${lines}\n\n` +
+    `Output ONLY a raw JSON array, one object per excerpt, in order: [{"n": 1, "translation": "..."|null}, ...]\n` +
+    `No markdown fences, no preamble.`;
+  let result;
+  try {
+    result = await withRetry(() => anthropic.messages.create({
+      model: CLAUDE_MODEL, max_tokens: 8192, thinking: { type: "disabled" },
+      system, messages: [{ role: "user", content: "Go." }],
+    }, { maxRetries: 0 }));
+  } catch (e) {
+    console.error("locateExampleTranslations API call failed:", e);
+    return out;
+  }
+  logApiUsage({
+    provider: "anthropic", model: CLAUDE_MODEL, feature: "backfill_examples",
+    inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0,
+  });
+  const block = result.content.find((b) => b.type === "text");
+  if (block?.type !== "text") return out;
+  let parsed: any;
+  try {
+    const cleaned = block.text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    parsed = JSON.parse(cleaned);
+  } catch {
+    console.error("locateExampleTranslations JSON parse failed (length " + block.text.length + ")");
+    return out;
+  }
+  if (!Array.isArray(parsed)) return out;
+  const haystack = collapseWhitespace(targetText);
+  for (const entry of parsed) {
+    if (typeof entry?.n !== "number") continue;
+    const idx = entry.n - 1;
+    if (idx < 0 || idx >= items.length) continue;
+    const found = typeof entry?.translation === "string" ? collapseWhitespace(entry.translation) : "";
+    out.set(items[idx].id, found && haystack.includes(found) ? found : null);
+  }
+  return out;
+}
+
+type TranslationFillResult = { filled: number; failed: number; groupsProcessed: number; totalGroups: number };
+
+/** Fills example_translation on vocabulary rows that have an example without one.
+ * Time-boxed against the same `startedAt` as the round that calls it. */
+async function fillMissingExampleTranslations(startedAt: number): Promise<TranslationFillResult> {
+  const { data: rows, error } = await supabase
+    .from("vocabulary")
+    .select("id, language, example, first_seen_message_id")
+    .not("example", "is", null)
+    .is("example_translation", null)
+    .not("first_seen_message_id", "is", null)
+    .order("created_at", { ascending: true });
+  if (error) {
+    console.error("backfill_examples: translation fetch failed:", error);
+    return { filled: 0, failed: 0, groupsProcessed: 0, totalGroups: 0 };
+  }
+  const pending = ((rows ?? []) as any[]).filter((v) => v.example);
+  if (pending.length === 0) return { filled: 0, failed: 0, groupsProcessed: 0, totalGroups: 0 };
+
+  const msgIds = [...new Set(pending.map((v) => v.first_seen_message_id))];
+  const msgById = new Map<string, any>();
+  for (let i = 0; i < msgIds.length; i += 100) {
+    const { data: ms } = await supabase.from("messages")
+      .select("id, original_text, translated_text, original_language, translated_language")
+      .in("id", msgIds.slice(i, i + 100));
+    for (const m of (ms ?? []) as any[]) msgById.set(m.id, m);
+  }
+
+  let filled = 0, failed = 0;
+  const write = async (id: string, translation: string) => {
+    const { error: uErr } = await supabase.from("vocabulary").update({ example_translation: translation }).eq("id", id);
+    if (uErr) { failed++; console.error("backfill_examples: translation update failed:", uErr); }
+    else if (translation) filled++;
+  };
+
+  // Known without a model call: the example is the whole message (well over half
+  // of these rows), or there is no translated message to look in at all.
+  type Group = { sourceText: string; targetText: string; language: LangCode; otherLanguage: LangCode; rows: any[] };
+  const groups = new Map<string, Group>();
+  const direct: Array<{ id: string; translation: string }> = [];
+  for (const v of pending) {
+    const m = msgById.get(v.first_seen_message_id);
+    const isOrig = m?.original_language === v.language;
+    const sourceText = m ? (isOrig ? m.original_text : m.translated_text) : null;
+    const targetText = m ? (isOrig ? m.translated_text : m.original_text) : null;
+    const otherLanguage = m ? (isOrig ? m.translated_language : m.original_language) : null;
+    if (!sourceText || !targetText || !otherLanguage) { direct.push({ id: v.id, translation: "" }); continue; }
+    const whole = wholeMessageTranslation(v.example, sourceText, targetText);
+    if (whole !== null) { direct.push({ id: v.id, translation: whole }); continue; }
+    const key = `${v.first_seen_message_id}:${v.language}`;
+    if (!groups.has(key)) groups.set(key, { sourceText, targetText, language: v.language, otherLanguage, rows: [] });
+    groups.get(key)!.rows.push(v);
+  }
+  for (let i = 0; i < direct.length; i += BACKFILL_CONCURRENCY) {
+    if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
+    await Promise.allSettled(direct.slice(i, i + BACKFILL_CONCURRENCY).map((d) => write(d.id, d.translation)));
+  }
+
+  const groupList = [...groups.values()];
+  let groupsProcessed = 0;
+  for (let i = 0; i < groupList.length; i += BACKFILL_CONCURRENCY) {
+    if (Date.now() - startedAt > BACKFILL_BUDGET_MS) break;
+    await Promise.allSettled(groupList.slice(i, i + BACKFILL_CONCURRENCY).map(async (g) => {
+      const map = await locateExampleTranslations(
+        g.sourceText, g.targetText, g.language, g.otherLanguage,
+        g.rows.map((v) => ({ id: v.id, example: v.example })),
+      );
+      groupsProcessed++;
+      for (const v of g.rows) {
+        if (!map.has(v.id)) { failed++; continue; } // call failed: stays null, retried next run
+        // Nothing locatable: a short message's whole translation still tells the
+        // learner what the sentence means; a long one would bury the card.
+        const whole = g.targetText.trim();
+        await write(v.id, map.get(v.id) ?? (whole.length <= EXAMPLE_TRANSLATION_FALLBACK_MAX_CHARS ? whole : ""));
+      }
+    }));
+  }
+  return { filled, failed, groupsProcessed, totalGroups: groupList.length };
+}
+
+/** Copies a filled-in example_translation onto study-app cards that were made before
+ * it existed. writeAnkiNotes never touches a card that is already there, so without
+ * this the vocabulary row would be repaired and the card someone is reviewing would
+ * not. Only a card still showing the SAME example gets it -- a card whose example
+ * was edited in the app, or imported with a different one, is left alone rather
+ * than given the translation of a sentence it no longer shows. Updates the two text
+ * columns only, so review history and scheduling are untouched. */
+async function syncExampleTranslationsToCards(): Promise<number> {
+  const { data: notes, error } = await supabase
+    .from("anki_notes")
+    .select("id, lemma, part_of_speech, language, example, example_translation, deck")
+    .eq("kind", "vocab")
+    .neq("deck", ANKI_GRAMMAR_DECK)
+    .not("example", "is", null)
+    // Filtered here, not after the read: a select returns at most 1000 rows and
+    // there are more vocabulary cards than that.
+    .or("example_translation.is.null,example_translation.eq.");
+  if (error) { console.error("syncExampleTranslationsToCards: read failed:", error); return 0; }
+  const missing = ((notes ?? []) as any[]).filter((n) => n.example && !(n.example_translation ?? "").trim());
+  if (missing.length === 0) return 0;
+
+  const vocabByKey = new Map<string, any>();
+  const lemmas = [...new Set(missing.map((n) => n.lemma))];
+  for (let i = 0; i < lemmas.length; i += 100) {
+    const { data: vs, error: vErr } = await supabase.from("vocabulary")
+      .select("lemma, part_of_speech, language, example, example_translation")
+      .in("lemma", lemmas.slice(i, i + 100));
+    if (vErr) { console.error("syncExampleTranslationsToCards: vocabulary read failed:", vErr); continue; }
+    for (const v of (vs ?? []) as any[]) vocabByKey.set(JSON.stringify([v.lemma, v.part_of_speech, v.language]), v);
+  }
+
+  let updated = 0;
+  for (const n of missing) {
+    const v = vocabByKey.get(JSON.stringify([n.lemma, n.part_of_speech, n.language]));
+    const translation = (v?.example_translation ?? "").trim();
+    if (!translation || collapseWhitespace(v.example ?? "") !== collapseWhitespace(n.example)) continue;
+    const { error: uErr } = await supabase.from("anki_notes").update({ example_translation: translation }).eq("id", n.id);
+    if (uErr) console.error("syncExampleTranslationsToCards: update failed:", uErr); else updated++;
+  }
+  return updated;
+}
+
 type ExampleBackfillResult = {
   filled: number; failed: number; skippedNoMessage: number;
   groupsProcessed: number; totalGroups: number; verifiedRemaining: number;
@@ -4527,10 +4736,6 @@ async function exampleBackfillGrind(chatId: number): Promise<ExampleBackfillResu
     return { filled: 0, failed: 0, skippedNoMessage: 0, groupsProcessed: 0, totalGroups: 0, verifiedRemaining: -1 };
   }
   const pending = (rows ?? []) as any[];
-  if (pending.length === 0) {
-    await sendMessage(chatId, "✅ No more rows to backfill.");
-    return { filled: 0, failed: 0, skippedNoMessage: 0, groupsProcessed: 0, totalGroups: 0, verifiedRemaining: 0 };
-  }
 
   const msgIds = [...new Set(pending.map((v) => v.first_seen_message_id))];
   const msgById = new Map<string, any>();
@@ -4591,20 +4796,46 @@ async function exampleBackfillGrind(chatId: number): Promise<ExampleBackfillResu
     .select("id", { count: "exact", head: true })
     .is("example", null)
     .not("first_seen_message_id", "is", null);
-  const verifiedRemaining = verifiedRemainingRaw ?? -1;
+
+  // Second half: rows that have an example but no translation under it (including
+  // any this round just wrote that way), then the cards already made from them.
+  const tr = await fillMissingExampleTranslations(startedAt);
+  const cardsUpdated = await syncExampleTranslationsToCards();
+  const { count: translationsRemainingRaw } = await supabase
+    .from("vocabulary")
+    .select("id", { count: "exact", head: true })
+    .not("example", "is", null)
+    .is("example_translation", null)
+    .not("first_seen_message_id", "is", null);
+  const verifiedRemaining = verifiedRemainingRaw == null || translationsRemainingRaw == null
+    ? -1
+    : verifiedRemainingRaw + translationsRemainingRaw;
+  failed += tr.failed;
+
+  if (pending.length === 0 && tr.filled === 0 && tr.failed === 0 && cardsUpdated === 0 && verifiedRemaining === 0) {
+    await sendMessage(chatId, "✅ No more rows to backfill.");
+    return { filled: 0, failed: 0, skippedNoMessage: 0, groupsProcessed: 0, totalGroups: 0, verifiedRemaining: 0 };
+  }
 
   await sendMessage(chatId,
     `✅ Example backfill round done.\n` +
-    `Messages processed: ${groupsProcessed}/${groupList.length}\n` +
-    `Filled: ${filled}\n` +
+    `Messages processed: ${groupsProcessed + tr.groupsProcessed}/${groupList.length + tr.totalGroups}\n` +
+    `Examples filled: ${filled}\n` +
+    `Example translations filled: ${tr.filled}\n` +
+    (cardsUpdated > 0 ? `Study-app cards updated: ${cardsUpdated}\n` : "") +
     (failed > 0 ? `Failed: ${failed}\n` : "") +
     (skippedNoMessage > 0 ? `Skipped (no usable linked message): ${skippedNoMessage}\n` : "") +
     `Rows still pending: ${verifiedRemaining}\n` +
     (verifiedRemaining > 0
       ? `\nContinuing automatically…`
-      : `\n🎉 Whole deck checked. Run /export and re-import into Anki (update existing notes when the first field matches) to refresh the cards — your study progress is kept.`));
+      : `\n🎉 Whole deck checked. Cards in the study app are already updated — your study progress is kept.`));
 
-  return { filled, failed, skippedNoMessage, groupsProcessed, totalGroups: groupList.length, verifiedRemaining };
+  return {
+    filled: filled + tr.filled + cardsUpdated, failed, skippedNoMessage,
+    groupsProcessed: groupsProcessed + tr.groupsProcessed,
+    totalGroups: groupList.length + tr.totalGroups,
+    verifiedRemaining,
+  };
 }
 
 // --- Self-chaining: /backfill_examples used to need ~25 manual taps (one per

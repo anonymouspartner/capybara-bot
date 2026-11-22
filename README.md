@@ -635,7 +635,7 @@ an existing corpus** — new instances can ignore them.
 | `/syncanki` | Write the whole existing corpus (both decks + both people's grammar corrections) into the study app. Safe to re-run: it never adds a card twice |
 | `/backfill_senses` | Re-derive flashcard translations so each matches its example sentence |
 | `/backfill_glosses` | Put each gloss back into the learner's own language, one batch |
-| `/backfill_examples` | Fill in the short verbatim example sentence pair for older vocabulary rows. **Self-chaining** — one tap runs it to completion; every other backfill still needs re-tapping |
+| `/backfill_examples` | Fill in the short verbatim example sentence pair for older vocabulary rows. Also fills a missing example *translation* on rows that already have an example, and copies it onto the study-app cards already made from them. **Self-chaining** — one tap runs it to completion; every other backfill still needs re-tapping |
 | `/backfill_grammar` | Fill in card fields (blank target, dictionary form, meaning) for older corrections |
 | `/recap_backfill` | Embed one batch of existing messages for `/recap` |
 | `/annotate_ab` | Compare annotation models on recent messages — reports quality, tokens, cost. Writes nothing (beyond its own cost-ledger rows) |
